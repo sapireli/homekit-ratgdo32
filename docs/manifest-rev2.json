@@ -1,0 +1,18 @@
+{
+  "version": "v.1.0.5",
+  "builds": {
+    "0": {
+      "parts": {
+        "0": {
+          "path": "firmware/homekit-grgdo1-rev2-v.1.0.5.bootloader.bin"
+        },
+        "1": {
+          "path": "firmware/homekit-grgdo1-rev2-v.1.0.5.partitions.bin"
+        },
+        "3": {
+          "path": "firmware/homekit-grgdo1-rev2-v.1.0.5.firmware.bin"
+        }
+      }
+    }
+  }
+}
