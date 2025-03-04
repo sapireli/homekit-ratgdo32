@@ -1,18 +1,29 @@
 {
+  "name": "homekit-grgdo1-rev2",
   "version": "v.1.0.5",
-  "builds": {
-    "0": {
-      "parts": {
-        "0": {
-          "path": "firmware/homekit-grgdo1-rev2-v.1.0.5.bootloader.bin"
+  "new_install_prompt_erase": true,
+  "new_install_improv_wait_time": 60,
+  "builds": [
+    {
+      "chipFamily": "ESP32",
+      "parts": [
+        {
+          "path": "firmware/homekit-grgdo1-rev2-v.1.0.5.bootloader.bin",
+          "offset": 4096
         },
-        "1": {
-          "path": "firmware/homekit-grgdo1-rev2-v.1.0.5.partitions.bin"
+        {
+          "path": "firmware/homekit-grgdo1-rev2-v.1.0.5.partitions.bin",
+          "offset": 32768
         },
-        "3": {
-          "path": "firmware/homekit-grgdo1-rev2-v.1.0.5.firmware.bin"
+        {
+          "path": "firmware/boot_app0.bin",
+          "offset": 57344
+        },
+        {
+          "path": "firmware/homekit-grgdo1-rev2-v.1.0.5.firmware.bin",
+          "offset": 65536
         }
-      }
+      ]
     }
-  }
+  ]
 }
