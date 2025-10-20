@@ -889,7 +889,11 @@ void comms_loop_sec2()
             case PacketCommand::Light:
             {
                 bool l = garage_door.light;
-                manual_recovery();
+                if (pkt.m_data.value.light.light == LightState::Toggle ||
+                    pkt.m_data.value.light.light == LightState::Toggle2)
+                {
+                    manual_recovery();
+                }
                 switch (pkt.m_data.value.light.light)
                 {
                 case LightState::Off:
@@ -953,7 +957,8 @@ void comms_loop_sec2()
             case PacketCommand::DoorAction:
             {
                 RINFO(TAG, "Door Action");
-                if (pkt.m_data.value.door_action.pressed)
+                if (pkt.m_data.value.door_action.pressed &&
+                    pkt.m_data.value.door_action.action == DoorAction::Toggle)
                 {
                     manual_recovery();
                 }
