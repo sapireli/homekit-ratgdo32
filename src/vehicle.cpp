@@ -52,6 +52,12 @@ void setup_vehicle()
     VL53L4CX_Error rc = VL53L4CX_ERROR_NONE;
     RINFO(TAG, "=== Setup VL53L4CX time-of-flight sensor ===");
 
+    if (vehicle_setup_done)
+    {
+        RINFO(TAG, "Vehicle setup already completed, skipping reinitialization");
+        return;
+    }
+
     Wire.begin(19, 18);
     distanceSensor.begin();
     rc = distanceSensor.InitSensor(0x59);

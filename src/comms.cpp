@@ -140,6 +140,12 @@ void obstruction_timer();
  */
 void setup_comms()
 {
+    if (comms_setup_done)
+    {
+        RINFO(TAG, "Comms setup already completed, skipping reinitialization");
+        return;
+    }
+
     // Create packet queue
     pkt_q = xQueueCreate(5, sizeof(PacketAction));
 

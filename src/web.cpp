@@ -231,6 +231,13 @@ void web_loop()
 void setup_web()
 {
     RINFO(TAG, "=== Starting HTTP web server ===");
+
+    if (web_setup_done)
+    {
+        RINFO(TAG, "Web server already started, skipping reinitialization");
+        return;
+    }
+
     IRAM_START
     // IRAM heap is used only for allocating globals, to leave as much regular heap
     // available during operations.  We need to carefully monitor useage so as not

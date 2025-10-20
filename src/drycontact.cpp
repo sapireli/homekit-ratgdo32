@@ -40,6 +40,12 @@ void setup_drycontact()
 {
     RINFO(TAG, "=== Setting up dry contact protocol");
 
+    if (drycontact_setup_done)
+    {
+        RINFO(TAG, "Dry contact setup already completed, skipping reinitialization");
+        return;
+    }
+
     if (doorControlType == 0)
         doorControlType = userConfig->getGDOSecurityType();
 
