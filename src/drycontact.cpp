@@ -117,8 +117,18 @@ void drycontact_loop()
     {
         if (dryContactDoorOpen)
         {
-            RINFO(TAG, "Dry-contact door command (toggle)");
-            door_command_toggle();
+            bool shouldClose = (garage_door.current_state == GarageDoorCurrentState::CURR_OPEN ||
+                                garage_door.current_state == GarageDoorCurrentState::CURR_OPENING);
+            if (shouldClose)
+            {
+                RINFO(TAG, "Dry-contact door command -> close");
+                close_door();
+            }
+            else
+            {
+                RINFO(TAG, "Dry-contact door command -> open");
+                open_door();
+            }
             dryContactDoorOpen = false;
         }
 

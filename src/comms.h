@@ -28,8 +28,6 @@ extern void comms_loop();
 
 extern void open_door();
 extern void close_door();
-extern void door_command_toggle();
-
 extern void set_lock(uint8_t value);
 extern void set_light(bool value);
 

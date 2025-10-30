@@ -1312,11 +1312,6 @@ void door_command_close()
     door_command(DoorAction::Close);
 }
 
-void door_command_toggle()
-{
-    door_command(DoorAction::Toggle);
-}
-
 void open_door()
 {
     RINFO(TAG, "open door request");
