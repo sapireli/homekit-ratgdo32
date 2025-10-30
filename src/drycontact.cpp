@@ -16,6 +16,7 @@
 #include "ratgdo.h"
 #include "config.h"
 #include "comms.h"
+#include "homekit.h"
 #include "drycontact.h"
 
 // Logger tag
@@ -119,18 +120,30 @@ void drycontact_loop()
     {
         if (dryContactDoorOpen)
         {
-            const bool shouldClose = (garage_door.current_state != GarageDoorCurrentState::CURR_CLOSED);
-            if (shouldClose)
+            const bool doorLooksOpen = (garage_door.current_state == GarageDoorCurrentState::CURR_OPEN ||
+                                        garage_door.current_state == GarageDoorCurrentState::CURR_OPENING ||
+                                        garage_door.target_state == GarageDoorTargetState::TGT_OPEN);
+
+            if (doorLooksOpen)
             {
-                RINFO(TAG, "Dry-contact door command -> close (state=%d)", garage_door.current_state);
+                RINFO(TAG, "Dry-contact door command -> close (curr=%d tgt=%d)",
+                      garage_door.current_state, garage_door.target_state);
+                garage_door.target_state = GarageDoorTargetState::TGT_CLOSED;
+                garage_door.current_state = GarageDoorCurrentState::CURR_CLOSING;
+                notify_homekit_target_door_state_change();
+                notify_homekit_current_door_state_change();
                 door_command_close();
             }
             else
             {
-                RINFO(TAG, "Dry-contact door command -> open (state=%d)", garage_door.current_state);
+                RINFO(TAG, "Dry-contact door command -> open (curr=%d tgt=%d)",
+                      garage_door.current_state, garage_door.target_state);
+                garage_door.target_state = GarageDoorTargetState::TGT_OPEN;
+                garage_door.current_state = GarageDoorCurrentState::CURR_OPENING;
+                notify_homekit_target_door_state_change();
+                notify_homekit_current_door_state_change();
                 open_door();
             }
-            // clear state flag (release handler sets false as well)
             dryContactDoorOpen = false;
         }
 
