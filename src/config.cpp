@@ -199,6 +199,7 @@ userSettings::userSettings()
         {cfg_rebootSeconds, {true, true, 0, NULL}},
         {cfg_LEDidle, {false, false, 0, helperLEDidle}},               // call fn to set LED object
         {cfg_motionTriggers, {false, false, 0, helperMotionTriggers}}, // call fn to enable HomeSpan service
+        {cfg_dcCommandEnable, {true, false, false, NULL}},
         {cfg_enableNTP, {true, false, false, NULL}},
         {cfg_doorUpdateAt, {false, false, 0, NULL}},
         // Will contain string of region/city and POSIX code separated by semicolon...

@@ -26,6 +26,7 @@
   "garageObstructed": false,
   "passwordRequired": true,
   "rebootSeconds": 0,
+  "dcCommandEnable": false,
   "freeHeap": 20000,
   "minHeap": 10000,
   "minStack": 2000,

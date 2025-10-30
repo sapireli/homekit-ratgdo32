@@ -168,6 +168,7 @@ void load_all_config_settings()
     RINFO(TAG, "   rebootSeconds:       %d", userConfig->getRebootSeconds());
     RINFO(TAG, "   LEDidle:             %d", userConfig->getLEDidle());
     RINFO(TAG, "   motionTriggers:      %d", userConfig->getMotionTriggers());
+    RINFO(TAG, "   dcCommandEnable:     %s", userConfig->getDcCommandEnable() ? "true" : "false");
 #ifdef NTP_CLIENT
     RINFO(TAG, "   enableNTP:           %s", userConfig->getEnableNTP() ? "true" : "false");
     RINFO(TAG, "   doorUpdateAt:        %d", userConfig->getDoorUpdateAt());

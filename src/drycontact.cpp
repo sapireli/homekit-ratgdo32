@@ -22,6 +22,7 @@
 static const char *TAG = "ratgdo-drycontact";
 
 static bool drycontact_setup_done = false;
+static bool dryContactCommandsEnabled = false;
 
 void onOpenSwitchPress();
 void onCloseSwitchPress();
@@ -49,6 +50,9 @@ void setup_drycontact()
     if (doorControlType == 0)
         doorControlType = userConfig->getGDOSecurityType();
 
+    dryContactCommandsEnabled = userConfig->getDcCommandEnable();
+    RINFO(TAG, "Dry-contact command mode %s", dryContactCommandsEnabled ? "enabled" : "disabled");
+
     doorState = DoorState::Unknown;
 
     pinMode(DRY_CONTACT_OPEN_PIN, INPUT_PULLUP);
@@ -71,6 +75,9 @@ void drycontact_loop()
     // Poll OneButton objects
     buttonOpen.tick();
     buttonClose.tick();
+
+    const bool secMode = (doorControlType == 1 || doorControlType == 2);
+    const bool commandMode = dryContactCommandsEnabled && secMode;
 
     if (doorControlType == 3)
     {
@@ -106,22 +113,28 @@ void drycontact_loop()
             previousDryContactDoorClose = dryContactDoorClose;
         }
     }
-    else
+    else if (commandMode)
     {
-        // Dry contacts are repurposed as optional door open/close when we
-        // are using Sec+ 1.0 or Sec+ 2.0 door control type
         if (dryContactDoorOpen)
         {
-            open_door();
+            RINFO(TAG, "Dry-contact door command (toggle)");
+            door_command_toggle();
             dryContactDoorOpen = false;
         }
 
         if (dryContactDoorClose)
         {
-
-            close_door();
+            bool targetLightState = !garage_door.light;
+            RINFO(TAG, "Dry-contact light command -> %s", targetLightState ? "on" : "off");
+            set_light(targetLightState);
             dryContactDoorClose = false;
         }
+    }
+    else
+    {
+        // Dry contacts unused in this mode; clear latched state so presses do not accumulate.
+        dryContactDoorOpen = false;
+        dryContactDoorClose = false;
     }
 }
 

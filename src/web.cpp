@@ -472,6 +472,7 @@ void handle_status()
     ADD_BOOL(json, "garageObstructed", garage_door.obstructed);
     ADD_BOOL(json, cfg_passwordRequired, userConfig->getPasswordRequired());
     ADD_INT(json, cfg_rebootSeconds, userConfig->getRebootSeconds());
+    ADD_BOOL(json, cfg_dcCommandEnable, userConfig->getDcCommandEnable());
     ADD_INT(json, "freeHeap", free_heap);
     ADD_INT(json, "minHeap", min_heap);
     // TODO monitor stack... ADD_INT(json, "minStack", 0);

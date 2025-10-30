@@ -191,6 +191,7 @@ function setElementsFromStatus(status) {
                 document.getElementById("gdosec1").checked = (value == 1);
                 document.getElementById("gdosec2").checked = (value == 2);
                 document.getElementById("gdodrycontact").checked = (value == 3);
+                updateDryContactControlsVisibility(value);
                 break;
             case "deviceName":
                 document.getElementById(key).innerHTML = value;
@@ -202,6 +203,10 @@ function setElementsFromStatus(status) {
                 break;
             case "passwordRequired":
                 document.getElementById("pwreq").checked = value;
+                break;
+            case "dcCommandEnable":
+                document.getElementById("dcCommandEnable").checked = value;
+                updateDryContactControlsVisibility();
                 break;
             case "LEDidle":
                 document.getElementById("LEDidle0").checked = (value == 0) ? true : false;
@@ -323,6 +328,32 @@ function setElementsFromStatus(status) {
                 } catch (error) {
                     console.warn(`Server sent unrecognized status key: ${key}`);
                 }
+        }
+    }
+}
+
+function currentSecurityType() {
+    if (document.getElementById("gdosec1").checked) {
+        return 1;
+    }
+    if (document.getElementById("gdosec2").checked) {
+        return 2;
+    }
+    return 3;
+}
+
+function updateDryContactControlsVisibility(selectedType) {
+    const securityType = (typeof selectedType === "number") ? selectedType : currentSecurityType();
+    const showControls = (securityType === 1 || securityType === 2);
+    const row = document.getElementById("dcCommandRow");
+    const checkbox = document.getElementById("dcCommandEnable");
+    if (row) {
+        row.style.display = showControls ? "table-row" : "none";
+    }
+    if (checkbox) {
+        checkbox.disabled = !showControls;
+        if (!showControls) {
+            checkbox.checked = false;
         }
     }
 }
@@ -798,6 +829,7 @@ async function saveSettings() {
         : (document.getElementById("gdosec2").checked) ? '2' : '3';
     const pwReq = (document.getElementById("pwreq").checked) ? '1' : '0';
     const motionTriggers = getMotionTriggers();
+    const dcCommandEnable = (document.getElementById("dcCommandEnable").checked) ? '1' : '0';
     const LEDidle = (document.getElementById("LEDidle2").checked) ? 2
         : (document.getElementById("LEDidle1").checked) ? 1 : 0;
     let rebootHours = Math.max(Math.min(parseInt(document.getElementById("rebootHours").value), 72), 0);
@@ -856,6 +888,7 @@ async function saveSettings() {
         "TTCseconds", TTCseconds,
         "vehicleThreshold", vehicleThreshold,
         "motionTriggers", motionTriggers,
+        "dcCommandEnable", dcCommandEnable,
         "LEDidle", LEDidle,
         "staticIP", staticIP,
         "localIP", localIP,

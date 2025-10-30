@@ -24,6 +24,7 @@
 #include <driver/gpio.h>
 
 // RATGDO project includes
+#include "esp32_arduino_compat.h"
 #include "HomeSpan.h"
 #include "log.h"
 
