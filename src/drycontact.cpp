@@ -119,16 +119,15 @@ void drycontact_loop()
     {
         if (dryContactDoorOpen)
         {
-            bool shouldClose = (garage_door.current_state == GarageDoorCurrentState::CURR_OPEN ||
-                                garage_door.current_state == GarageDoorCurrentState::CURR_OPENING);
+            const bool shouldClose = (garage_door.current_state != GarageDoorCurrentState::CURR_CLOSED);
             if (shouldClose)
             {
-                RINFO(TAG, "Dry-contact door command -> close");
-                close_door();
+                RINFO(TAG, "Dry-contact door command -> close (state=%d)", garage_door.current_state);
+                door_command_close();
             }
             else
             {
-                RINFO(TAG, "Dry-contact door command -> open");
+                RINFO(TAG, "Dry-contact door command -> open (state=%d)", garage_door.current_state);
                 open_door();
             }
             // clear state flag (release handler sets false as well)
