@@ -60,8 +60,10 @@ void setup_drycontact()
 
     // Attach OneButton handlers
     buttonOpen.attachPress(onOpenSwitchPress);
-    buttonClose.attachPress(onCloseSwitchPress);
+    buttonOpen.attachClick(onOpenSwitchRelease);
     buttonOpen.attachLongPressStop(onOpenSwitchRelease);
+    buttonClose.attachPress(onCloseSwitchPress);
+    buttonClose.attachClick(onCloseSwitchRelease);
     buttonClose.attachLongPressStop(onCloseSwitchRelease);
 
     drycontact_setup_done = true;
@@ -129,6 +131,7 @@ void drycontact_loop()
                 RINFO(TAG, "Dry-contact door command -> open");
                 open_door();
             }
+            // clear state flag (release handler sets false as well)
             dryContactDoorOpen = false;
         }
 
