@@ -62,7 +62,7 @@ When you first add the device to HomeKit a number of accessories are added:
 - Vehicle departing _motion_ sensor. Only on ratgdo32-disco boards, triggers motion if it detects departure of a vehicle.
 - Vehicle presence _occupancy_ sensor. Only on ratgdo32-disco boards, set if the distance sensor detects presence of a vehicle.
 - Parking assist laser _light switch_. Only on ratgdo32-disco boards.
-- _contact_ sensor. Only when rotary encoder enable on ratgdo32 boards, triggers open condition when door manually operated
+- _contact_ sensor. Only when rotary encoder is enabled on ratgdo32 boards, triggers open condition when door manually operated
 
 Vehicle arrival and departing sensors are only triggered if vehicle motion is detected within 5 minutes of door opening or closing. The parking assist laser is activated when vehicle arrival is detected.
 
@@ -272,9 +272,21 @@ By default ratgdo obtains obstruction state by monitoring signals on the sensor 
 
 #### Enable rotary encoder _(ratgdo32 boards only)_
 
-The [rotary encoder](https://ratcloud.llc/products/ratgdo-encoder) is an optional accessory for ratgdo32 boards that provided additional function or security.  Once calibrated it can ensure that ragtdo knows correct door status even if Sec+2.0 status messages are missed/corrupted.  It can also alert you to a door being manually operated (when the release handle is pulled and door is opened without using the door opener).  A HomeKit contact sensor will open allowing you to trigger an automation or alert.
+The [ratgdo encoder](https://ratcloud.llc/products/ratgdo-encoder) is a magnetic sensor that tracks your garage door's physical position and direction of travel in real time. Its primary use is providing accurate door status and position tracking for **Dry Contact** control doors (including Security+ 1.0 openers converted to dry contact) without needing separate open/close limit switches. When mounted to the overhead spring shaft, it can also detect manual door operation (such as when the emergency release handle is pulled), triggering a HomeKit contact sensor for alerts or automations.
 
-Test that the door opening/closing status is correctly reported and select _Reverse encoder direction_ if necessary.
+For physical installation and wiring instructions, see [Mounting & Wiring ratgdo Encoder](https://ratcloud.llc/pages/mounting-wiring-encoder).
+
+##### Calibrating the rotary encoder
+
+1. On the ratgdo **Settings** page, check **Enable rotary encoder** and click **Save** (this will reboot the device).
+2. Using your garage door opener's **physical wall button or remote**, fully cycle the door in both directions (**one complete open and one complete close**) without stopping it mid-travel. _(Do not use the ratgdo web UI or Apple Home app for this step, as the firmware ignores close commands while the door state is `Unknown`, and may ignore open/close commands before the encoder direction is verified.)_
+   - Verify on the **Settings** page that the **Steps** counter increments or decrements each time the rotor passes the encoder. If the counter does not change (or misses counts), verify the [encoder mounting alignment, air gap, and wiring](https://ratcloud.llc/pages/mounting-wiring-encoder), then click **Reset Calibration** and repeat the full open/close cycle.
+   - The firmware automatically records each travel limit once the door stops moving for 2 seconds and saves the calibration to non-volatile memory.
+3. Verify that the door state on the main status page matches the actual door position:
+   - If the firmware reports the wrong state (e.g., _Open_ when the door is closed, or _Closing_ while opening), check **Reverse encoder direction** on the Settings page and click **Save** (this will reboot the device and invert the learned limits without needing to re-calibrate).
+4. Once calibrated, the main status page will also display the door's open percentage (`1%`–`99%`) next to the door state while moving or stopped partially open.
+
+If you need to re-calibrate (for example, if the encoder or rotor is repositioned, or the door was stopped mid-travel during initial calibration), click **Reset Calibration** next to the **Steps** counter on the Settings page and then run the door through a full open and close cycle using your wall button or remote.
 
 > [!NOTE]
 > When this option is selected, you cannot use hardwired open/close controls as described above, because the same GPIO connections are used.
