@@ -19,6 +19,10 @@
 #include <tuple>
 #include <unordered_map>
 #include <time.h>
+#ifdef ESP32
+#include <shared_mutex>
+#include "../lib/ratgdo/update_poll_guard.h"
+#endif
 
 // Third-party sensor libraries
 #include <DHT.h>
@@ -1916,7 +1920,9 @@ void handle_firmware_upload()
     HTTPUpload &upload = server.upload();
     static bool verify = false;
     static size_t size = 0;
-    static const char *md5 = NULL;
+#ifdef ESP32
+    static UpdatePollGuard<std::shared_mutex> homekitUpdateGuard(homeSpan.getMutex());
+#endif
 
     if (upload.status == UPLOAD_FILE_START)
     {
@@ -1930,12 +1936,13 @@ void handle_firmware_upload()
         ESP_LOGI(TAG, "Update: %s", upload.filename.c_str());
         verify = !strcmp(server.arg("action").c_str(), "verify");
         size = atoi(server.arg("size").c_str());
-        md5 = server.arg("md5").c_str();
+        // arg() returns a String by value; keep it alive until the hash is copied.
+        const String md5 = server.arg("md5");
 
         // We are updating.  If size and MD5 provided, save them
         firmwareSize = size;
-        if (strlen(md5) > 0)
-            strlcpy(firmwareMD5, md5, sizeof(firmwareMD5));
+        if (md5.length() > 0)
+            strlcpy(firmwareMD5, md5.c_str(), sizeof(firmwareMD5));
 
         uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
         ESP_LOGI(TAG, "Available space for upload: %lu", maxSketchSpace);
@@ -1953,6 +1960,10 @@ void handle_firmware_upload()
         }
         else if (!verify)
         {
+#ifdef ESP32
+            // Wait for HomeSpan's polling boundary instead of deleting its task.
+            homekitUpdateGuard.pause();
+#endif
             // Close services so we don't have to handle network traffic during update
             // Only if not verifying as either will have been shutdown on immediately prior upload, or we
             // just want to verify without disrupting operation of the HomeKit service.
@@ -1969,9 +1980,6 @@ void handle_firmware_upload()
             // Shutdown HomeKit
             homekit_setup_done = false;
             arduino_homekit_close();
-#else
-            // Shutdown HomeSpan server
-            vTaskDelete(homeSpan.getAutoPollTask());
 #endif
         }
 
@@ -2051,4 +2059,8 @@ void handle_firmware_upload()
         ESP_LOGI(TAG, "%s was aborted", verify ? "Verify" : "Update");
         firmwareUpdateSub = NULL;
     }
+#ifdef ESP32
+    if (upload.status == UPLOAD_FILE_END || upload.status == UPLOAD_FILE_ABORTED)
+        homekitUpdateGuard.resume();
+#endif
 }

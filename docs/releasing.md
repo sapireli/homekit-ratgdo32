@@ -18,6 +18,21 @@ UART restoration path. That code copied `HardwareSerial` objects, including
 their driver pointers, mutexes, and task ownership. Those copies are removed.
 The exact cause of the observed freeze still needs confirmation on the device.
 
+A failed restore produced a core dump from the exact `fc26ab2` binary. Its
+backtrace resolves to `uxListRemove -> vTaskDelete -> handle_firmware_upload`,
+before `Update.begin()` writes flash. The updater now pauses HomeSpan through
+its own polling mutex, retains the polling task, and resumes it after upload
+completion or abort. Repeated upload attempts cannot delete a stale task handle.
+The MD5 query argument also keeps its owning String alive until the checksum is
+copied. `tests/update_poll_guard.cpp` covers repeated starts, completion/abort,
+and an idle/no-task case.
+
+A subsequent clean OTA attempt restored the official Rev1 v1.3.0 image. Its
+SHA256 matched the Gelidus release asset. Running version 1.3.0, retained pairing,
+increasing uptime, and restoration of the original log level were checked on the
+device. That recovery confirms the rollback; it does not validate the corrected
+candidate on hardware.
+
 Rev1 now stops Improv and HomeSpan serial clients, disables automatic serial
 startup in the logger, and releases UART0 before I2C takes GPIO1/3. Logs remain
 available over the network. If no sensor is detected, `Wire.end()` releases the

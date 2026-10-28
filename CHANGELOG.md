@@ -6,6 +6,7 @@ All notable changes to `homekit-ratgdo32` will be documented in this file. This 
 
 ## v1.4.0 (proposed, unreleased) - Gelidus Research
 
+* Fix the OTA crash captured on the Rev1: pause HomeSpan using its polling mutex instead of deleting its task, and release the pause on upload completion/abort. This avoids stale task handles on retries and preserves the task's lock ownership. Keep the uploaded MD5 argument alive until copied instead of retaining a pointer to a temporary String.
 * Fix the Rev1 serial/I2C ownership path exercised by a runtime freeze report: remove all `HardwareSerial` object copies, stop UART0 clients before using GPIO1/3 for I2C, and restore the original UART only after `Wire.end()` when the sensor is absent. Prevent recursive UART initialization from logging and remove the unbounded wait for serial startup. Physical validation of the corrected build is pending.
 * Address the UART defect linked from [Gelidus #19](https://github.com/GelidusResearch/homekit-ratgdo32/issues/19): restore RX pull-up after inverted UART initialization, require byte-at-a-time reception, check initialization failures, and allow a full 1200-baud character plus scheduling margin for its echo.
 * Replace the TX GPIO pull-up reset in shutdown/panic handling with an explicit inactive LOW output disconnected from UART. Cover startup and ESP restart callbacks too. Add regression tests for broken RX bias, stale output latches, failed initialization, and late UART output; check the compiled panic disconnect has no flash dependencies.
