@@ -29,6 +29,7 @@
 #include "utilities.h"
 #include "web.h"
 #include "comms.h"
+#include "log_snapshot.h"
 
 // Logger tag
 static const char *TAG = "ratgdo-logger";
@@ -451,66 +452,70 @@ void LOG::printSavedLog(Print &outputDev)
 
 void LOG::printMessageLog(Print &outputDev, bool slow)
 {
-    TAKE_MUTEX();
-    if (clockSet)
+    auto printLog = [&](const logBuffer *buffer)
     {
-        time_t now = time(NULL);
-        outputDev.printf_P(PSTR("Server boot time: %llu (%s)\n"), lastRebootAt, timeString(lastRebootAt));
-        outputDev.printf_P(PSTR("Server log time: %llu (%s)\n"), now, timeString(now));
-    }
-    int64_t upTime = (int64_t)_millis();
-    outputDev.printf_P(PSTR("Server uptime: %llu ms (%s)\n"), upTime, toHHMMSSmmm((_millis_t)upTime));
-    outputDev.println("Firmware version: " AUTO_VERSION);
-    outputDev.printf_P(PSTR("Free heap: %d\n"), free_heap);
-    outputDev.printf_P(PSTR("Minimum heap: %d\n"), min_heap);
-    if (doorControlType == DOOR_CONTROL_SEC_PLUS_V2)
-    {
-        outputDev.printf_P(PSTR("GDO Firmware version: %s\n"), gdoFirmwareVersion);
-    }
-    outputDev.printf_P(PSTR("\n"));
-    outputDev.flush();
-
-    if (msgBuffer)
-    {
-        // +1 head points to a zero (null terminator of previous log line) which we need to skip.
-        // +3 want to round up to multiple of 4
-        size_t start = ((msgBuffer->head + 1 + 3) & ~0x03) % sizeof(msgBuffer->buffer);
-        size_t len = sizeof(msgBuffer->buffer) - start;
-        // On slow output devices (e.g. network), chunk up to protect against buffer overflow
-        size_t CHUNK = (slow) ? TCP_SND_BUF / 2 : sizeof(msgBuffer->buffer);
-        size_t chunk;
-        SERIAL_PRINT("Send message log.");
-        if (msgBuffer->wrapped != 0)
+        if (clockSet)
         {
+            time_t now = time(NULL);
+            outputDev.printf_P(PSTR("Server boot time: %llu (%s)\n"), lastRebootAt, timeString(lastRebootAt));
+            outputDev.printf_P(PSTR("Server log time: %llu (%s)\n"), now, timeString(now));
+        }
+        int64_t upTime = (int64_t)_millis();
+        outputDev.printf_P(PSTR("Server uptime: %llu ms (%s)\n"), upTime, toHHMMSSmmm((_millis_t)upTime));
+        outputDev.println("Firmware version: " AUTO_VERSION);
+        outputDev.printf_P(PSTR("Free heap: %d\n"), free_heap);
+        outputDev.printf_P(PSTR("Minimum heap: %d\n"), min_heap);
+        if (doorControlType == DOOR_CONTROL_SEC_PLUS_V2)
+        {
+            outputDev.printf_P(PSTR("GDO Firmware version: %s\n"), gdoFirmwareVersion);
+        }
+        outputDev.printf_P(PSTR("\n"));
+        outputDev.flush();
+
+        if (buffer)
+        {
+            // +1 head points to a zero (null terminator of previous log line) which we need to skip.
+            // +3 want to round up to multiple of 4
+            size_t start = ((buffer->head + 1 + 3) & ~0x03) % sizeof(buffer->buffer);
+            size_t len = sizeof(buffer->buffer) - start;
+            // On slow output devices (e.g. network), chunk up to protect against buffer overflow
+            size_t CHUNK = (slow) ? TCP_SND_BUF / 2 : sizeof(buffer->buffer);
+            size_t chunk;
+            if (buffer->wrapped != 0)
+            {
+                while (len)
+                {
+                    chunk = std::min(len, CHUNK);
+                    YIELD();
+                    outputDev.write(&buffer->buffer[start], chunk);
+                    if (slow)
+                        outputDev.flush();
+                    len -= chunk;
+                    start += chunk;
+                }
+            }
+            start = 0;
+            len = strlen(buffer->buffer); // must be null terminated
             while (len)
             {
                 chunk = std::min(len, CHUNK);
-                // Progress dot dot dot
-                SERIAL_PRINT(".");
                 YIELD();
-                outputDev.write(&msgBuffer->buffer[start], chunk);
-                if (slow)
-                    outputDev.flush();
+                outputDev.write(&buffer->buffer[start], chunk);
+                outputDev.flush();
                 len -= chunk;
                 start += chunk;
             }
         }
-        start = 0;
-        len = strlen(msgBuffer->buffer); // must be null terminated
-        while (len)
-        {
-            chunk = std::min(len, CHUNK);
-            // Progress dot dot dot
-            SERIAL_PRINT(".");
-            YIELD();
-            outputDev.write(&msgBuffer->buffer[start], chunk);
-            outputDev.flush();
-            len -= chunk;
-            start += chunk;
-        }
-        SERIAL_PRINT("\n");
-    }
-    GIVE_MUTEX();
+    };
+#ifdef ESP8266
+    // Single threaded; preserve the allocation-free path on the smaller heap.
+    printLog(msgBuffer);
+#else
+    // Network writes and flushes can block. Only copying the ring may hold
+    // logMutex, so other tasks (including the TCP/IP task) can keep logging.
+    if (!withLogSnapshot(msgBuffer, [this]() { TAKE_MUTEX(); }, [this]() { GIVE_MUTEX(); }, printLog))
+        outputDev.println("Log snapshot unavailable: insufficient memory");
+#endif
 }
 
 /****************************************************************************
