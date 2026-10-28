@@ -197,6 +197,7 @@ struct SSESubscription
     IPAddress clientIP;
     WiFiClient client;
     Ticker heartbeatTimer;
+    std::atomic<bool> heartbeatPending{false};
     uint32_t heartbeatInterval;
     std::atomic<bool> active{false};
     bool SSEconnected;
@@ -204,10 +205,13 @@ struct SSESubscription
     String clientUUID;
     bool logViewer;
 };
+void SSEheartbeat(SSESubscription *s);
 SSESubscription subscription[SSE_MAX_CHANNELS];
 // During firmware update note which subscribed client is updating
-SSESubscription *firmwareUpdateSub = NULL;
+std::atomic<SSESubscription *> firmwareUpdateSub{nullptr};
 std::atomic<uint32_t> subscriptionCount{0};
+
+#include "sse_lock.h"
 
 // Performance monitoring
 static uint32_t request_count = 0;
@@ -356,6 +360,21 @@ void web_loop()
 {
     if (!web_setup_done)
         return;
+
+    // Timer callbacks only signal work; client access stays in the web loop.
+    for (uint32_t i = 0; i < SSE_MAX_CHANNELS; ++i)
+    {
+        if (takeSSEHeartbeat(subscription[i].heartbeatPending))
+        {
+            TAKE_MUTEX(); // JSON must always precede the SSE lock.
+            {
+                SSELock lock;
+                if (lock && subscription[i].active)
+                    SSEheartbeat(&subscription[i]);
+            }
+            GIVE_MUTEX();
+        }
+    }
 
     static char *json = status_json;
     _millis_t upTime = _millis();
@@ -582,6 +601,7 @@ void setup_web()
 #ifndef ESP8266
     // We allocated json as a global block.  We are on dual core CPU.  We need to serialize access to the resource.
     jsonMutex = xSemaphoreCreateMutex();
+    sseMutex = xSemaphoreCreateMutex();
 #endif
     last_reported_paired = homekit_is_paired();
 
@@ -1298,6 +1318,8 @@ bool helperUpdateUnderway(const std::string &key, const char *value, configSetti
     // save values...
     strlcpy(firmwareMD5, md5, sizeof(firmwareMD5));
     firmwareSize = (size_t)atoi(size);
+    SSELock lock;
+    if (!lock) return false;
     for (uint32_t channel = 0; channel < SSE_MAX_CHANNELS; channel++)
     {
         if (subscription[channel].SSEconnected && subscription[channel].clientUUID == uuid && subscription[channel].client.connected())
@@ -1480,8 +1502,11 @@ void removeSSEsubscription(SSESubscription *s)
 {
     retireSSESubscription(s->active, subscriptionCount, [&]() {
         // Retire before any call that can log and reenter SSEBroadcastState.
+        SSESubscription *expected = s;
+        firmwareUpdateSub.compare_exchange_strong(expected, nullptr);
         s->SSEconnected = false;
         s->heartbeatTimer.detach();
+        s->heartbeatPending = false;
         s->client.stop();
         s->clientIP = INADDR_NONE;
         s->clientUUID.clear();
@@ -1518,7 +1543,6 @@ void SSEheartbeat(SSESubscription *s)
     {
         static int8_t lastRSSI = 0;
         static char *json = status_json;
-        TAKE_MUTEX();
         JSON_START(json);
         JSON_ADD_INT("upTime", _millis());
         JSON_ADD_INT("freeHeap", free_heap);
@@ -1549,7 +1573,6 @@ void SSEheartbeat(SSESubscription *s)
         JSON_REMOVE_NL(json);
         // retry needed to before event:
         sendSSEEvent(s->client, "message", json);
-        GIVE_MUTEX();
         YIELD();
     }
     else
@@ -1562,6 +1585,8 @@ void SSEheartbeat(SSESubscription *s)
 
 void SSEHandler(uint32_t channel)
 {
+    SSELock lock;
+    if (!lock) return;
     if (server.args() != 1)
     {
         ESP_LOGE(TAG, "Sending %s, for: %s", response400missing, server.uri().c_str());
@@ -1584,26 +1609,17 @@ void SSEHandler(uint32_t channel)
     s.SSEfailCount = 0;
     if (s.heartbeatInterval)
     {
-        s.heartbeatTimer.attach_ms(s.heartbeatInterval * 1000, [&s]
-                                   {
-#ifdef ESP8266
-                                       schedule_recurrent_function_us([&s]()
-                                                                      {
-                                                                          SSEheartbeat(&s);
-                                                                          return false; // run the fn only once
-                                                                      },
-                                                                      0); // zero micro seconds (run asap)
-#else
-                                       SSEheartbeat(&s);
-                                       return;
-#endif
-                                   });
+        s.heartbeatTimer.attach_ms(s.heartbeatInterval * 1000, [&s] {
+            requestSSEHeartbeat(s.heartbeatPending);
+        });
     }
     ESP_LOGD(TAG, "Client %s (%s) listening for SSE events on channel %d", s.client.remoteIP().toString().c_str(), s.clientUUID.c_str(), channel);
 }
 
 void handle_subscribe()
 {
+    SSELock lock;
+    if (!lock) return;
     uint32_t channel;
     IPAddress clientIP = server.client().remoteIP(); // get IP address of client
     std::string SSEurl = restEvents;
@@ -1808,6 +1824,9 @@ void SSEBroadcastState(const char *data, BroadcastType type)
     if (!web_setup_done)
         return;
 
+    SSELock lock(type == LOG_MESSAGE);
+    if (!lock) return;
+
     // Flash LED to signal activity
     // led.flash(FLASH_MS);
 
@@ -2003,15 +2022,21 @@ void handle_firmware_upload()
                 ESP_LOGI(TAG, "%s progress: %d", verify ? "Verify" : "Update", uploadPercent);
                 nextPrintPercent += 5;
                 // Report percentage to browser client if it is listening
-                if (firmwareUpdateSub && firmwareUpdateSub->client.connected())
                 {
                     static char *json = status_json;
                     TAKE_MUTEX();
-                    JSON_START(json);
-                    JSON_ADD_INT("uploadPercent", uploadPercent);
-                    JSON_END();
-                    JSON_REMOVE_NL(json);
-                    sendSSEEvent(firmwareUpdateSub->client, "uploadStatus", json);
+                    {
+                        SSELock lock;
+                        SSESubscription *updateSub = firmwareUpdateSub.load();
+                        if (lock && updateSub && updateSub->active && updateSub->client.connected())
+                        {
+                            JSON_START(json);
+                            JSON_ADD_INT("uploadPercent", uploadPercent);
+                            JSON_END();
+                            JSON_REMOVE_NL(json);
+                            sendSSEEvent(updateSub->client, "uploadStatus", json);
+                        }
+                    }
                     GIVE_MUTEX();
                 }
             }
