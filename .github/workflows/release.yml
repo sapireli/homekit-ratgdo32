@@ -79,10 +79,16 @@ jobs:
           node --test tests/firmware-selection.test.cjs
           c++ -std=c++17 -Wall -Wextra -Isrc tests/json_float.cpp -o /tmp/json-test
           /tmp/json-test
+          c++ -std=c++17 -Wall -Wextra -Isrc tests/gdo_uart.cpp -o /tmp/uart-test
+          /tmp/uart-test
       - name: Install PlatformIO Core
         run: pip install platformio==6.2.0
       - name: Build firmware
         run: pio run -e ${{ matrix.environment }}
+      - name: Check panic transmitter disconnect
+        run: |
+          python scripts/check_uart_iram.py --elf .pio/build/${{ matrix.environment }}/firmware.elf \
+            --toolchain "$HOME/.platformio/packages/toolchain-xtensa-esp-elf"
       - name: Package exact build artifacts
         env:
           TAG: ${{ needs.metadata.outputs.tag }}

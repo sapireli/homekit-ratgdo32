@@ -6,7 +6,9 @@ All notable changes to `homekit-ratgdo32` will be documented in this file. This 
 
 ## v1.4.0 (proposed, unreleased) - Gelidus Research
 
-* Release prerequisite: validate Security+ 1.0 operation against [Gelidus #19](https://github.com/GelidusResearch/homekit-ratgdo32/issues/19). This integration includes upstream #192's UART RX pull-up fix, but does not establish that the Gelidus regression is resolved. Keep the installer on v1.3.0 pending validation. The proposed version must be coordinated with Gelidus's separate GDOLIB release plan.
+* Address the UART defect linked from [Gelidus #19](https://github.com/GelidusResearch/homekit-ratgdo32/issues/19): restore RX pull-up after inverted UART initialization, require byte-at-a-time reception, check initialization failures, and allow a full 1200-baud character plus scheduling margin for its echo.
+* Replace the TX GPIO pull-up reset in shutdown/panic handling with an explicit inactive LOW output disconnected from UART. Cover startup and ESP restart callbacks too. Add regression tests for broken RX bias, stale output latches, failed initialization, and late UART output; check the compiled panic disconnect has no flash dependencies.
+* Validate the affected Security+ 1.0 wall panel before declaring #19 resolved. Keep the published installer on v1.3.0 until release. The proposed version must be coordinated with Gelidus's separate GDOLIB release plan.
 * Merge `ratgdo/homekit-ratgdo32` through commit `5ab633c166a367fd48303eca37bc9e086d2bfb6d` (October 18, 2026), including `v3.5.5` and the subsequent authentication/OTA fixes. Retain the Gelidus `v1.3.1` release fixes.
 * Preserve GRGDO1 Rev1/Rev2 pin assignments, VL53L1X vehicle sensing, DHT22 temperature/humidity support, and separate HomeKit controls for vehicle sensors.
 * Add upstream encoder support, the optional HomeKit stop switch, door reversal settings, configurable NTP, and door/light/lock command fixes. Encoder support and the stop switch are off by default.

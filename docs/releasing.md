@@ -21,10 +21,28 @@ withdrawn installer assets.
 The integration includes the fix for the linked
 [upstream issue #192](https://github.com/ratgdo/homekit-ratgdo32/issues/192): after
 starting the ESP32 Security+ 1.0 hardware UART, it explicitly disables RX
-pull-down and enables RX pull-up. A successful build cannot establish that
-Gelidus issue #19 is resolved. Test the affected wall panel, cold boots,
-reboots, wall-panel detection, and repeated open/close/stop/TTC operations, and
-observe for uncommanded movement before publishing.
+pull-down and enables RX pull-up. The initialization now checks driver/bias
+failures, forces byte-at-a-time reception, and allows 20 ms for an echo (an 8E1
+character at 1200 baud alone takes 9.17 ms). Failed initialization leaves TX
+inactive and the communications loop stopped.
+
+The old shutdown and panic paths called `gpio_reset_pin()` on TX. ESP-IDF
+specifies that reset enables a pull-up; this project's inverted transmitter
+uses LOW to release the door bus. The replacement preloads LOW before switching
+the GPIO mux, disconnects the UART signal and its output-enable, disables the
+pull-up, and drives the inactive level. It runs at startup, before/after normal
+communications teardown, through the ESP restart callback, and first in the
+panic handler. The panic path uses only inlined register operations and the
+DRAM pin-offset table; CI checks the built machine code is in IRAM with no
+function calls or flash references.
+
+The host UART regression test models the broken framework initialization and
+verifies that RX echoes recover. It also checks stale TX latches, late UART
+output after shutdown, repeated cleanup, and UART/RX/FIFO initialization
+failures. These tests establish the source-level behavior; they do not measure
+the electrical waveform on a GRGDO1. Test the affected wall panel, cold boots,
+reboots, wall-panel detection, repeated open/close/stop/TTC operations, and
+observe for uncommanded movement before declaring issue #19 resolved.
 
 Gelidus also describes separate GDOLIB migration and TTC work in issue #19,
 with v1.4.0 planned for that work. This upstream integration retains the current
@@ -42,6 +60,8 @@ python -m unittest discover -s tests -v
 node --test tests/firmware-selection.test.cjs
 c++ -std=c++17 -Wall -Wextra -Isrc tests/json_float.cpp -o /tmp/json-test
 /tmp/json-test
+c++ -std=c++17 -Wall -Wextra -Isrc tests/gdo_uart.cpp -o /tmp/uart-test
+/tmp/uart-test
 pio run -e ratgdo_esp32dev
 pio run -e ratgdo_esp32dev_rev1
 ```
