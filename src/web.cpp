@@ -22,6 +22,7 @@
 #ifdef ESP32
 #include <shared_mutex>
 #include "../lib/ratgdo/update_poll_guard.h"
+#include "../lib/ratgdo/sse_write.h"
 #endif
 
 // Third-party sensor libraries
@@ -38,6 +39,9 @@
 #else
 #include "esp_core_dump.h"
 #include <ESPmDNS.h>
+#include <lwip/sockets.h>
+// Preserve Arduino's IPAddress constant rather than lwIP's integer macro.
+#undef INADDR_NONE
 #endif
 
 // RATGDO project includes
@@ -203,9 +207,6 @@ SSESubscription subscription[SSE_MAX_CHANNELS];
 SSESubscription *firmwareUpdateSub = NULL;
 uint32_t subscriptionCount = 0;
 
-// Performance management - removed redundant connection tracking
-#define MIN_REQUEST_INTERVAL_MS 100
-
 // Performance monitoring
 static uint32_t request_count = 0;
 static uint32_t max_response_time = 0;
@@ -248,20 +249,33 @@ int activeRequestCount = 0;
 static char writeBuffer[512];
 bool clientWrite(WiFiClient client, const char *data)
 {
-    size_t len = strlen(data);
-    size_t written = 0;
-#ifdef ESP8266
-    client.flush(); // make sure previous data all sent.
+    const size_t len = strlen(data);
+#ifdef ESP32
+    // NetworkClient::write() retries select() for seconds even when its stream
+    // timeout is short. Never let a stalled browser block the GDO/HTTP loop,
+    // the timer task, or a HomeKit task emitting a log message.
+    return write_sse_frame(data, len,
+        [&](const char *p, size_t n) -> long {
+            return send(client.fd(), p, n, MSG_DONTWAIT);
+        }, [&] { client.stop(); });
+#else
+    if (client.write(data, len) == len)
+        return true;
+    client.stop();
+    return false;
 #endif
-    written = client.write(data, len);
-    if (written == 0)
-    {
-        YIELD();
-        client.stop();
-        ESP_LOGW(TAG, "Failed writing to WiFi Client (%d of %d), connection closed.", written, len);
-        return false;
-    }
-    return true;
+}
+
+// Build each event in its own buffer: logger callbacks and heartbeat timers
+// can run concurrently with web_loop(). Send a whole event in one operation.
+static bool sendSSEEvent(WiFiClient client, const char *event, const char *data)
+{
+    std::string frame = "event: ";
+    frame += event;
+    frame += "\ndata: ";
+    frame += data;
+    frame += "\n\n";
+    return clientWrite(client, frame.c_str());
 }
 
 // Helper functions for connection throttling
@@ -343,7 +357,6 @@ void web_loop()
 
     static char *json = status_json;
     _millis_t upTime = _millis();
-    static _millis_t last_request_time = 0;
 
     // manage frequency of mDNS updates
     if (mdnsUpdatePending)
@@ -539,16 +552,9 @@ void web_loop()
         mdnsDoorUpdateAt = lastDoorUpdateAt;
         mdnsUpdatePending = true;
     }
-    // Rate limiting - minimum interval between requests
-    _millis_t current_time = _millis();
-    if (current_time - last_request_time < MIN_REQUEST_INTERVAL_MS)
-    {
-        return; // Skip this cycle to enforce rate limit
-    }
-
+    // WebServer::handleClient() advances a connection state machine. Delaying
+    // every step adds latency even to an idle server; it is not request limiting.
     server.handleClient();
-    // Update last request time after handling client
-    last_request_time = current_time;
 }
 
 void setup_web()
@@ -1538,8 +1544,7 @@ void SSEheartbeat(SSESubscription *s)
         JSON_END();
         JSON_REMOVE_NL(json);
         // retry needed to before event:
-        snprintf_P(writeBuffer, sizeof(writeBuffer), PSTR("event: message\ndata: %s\n\n"), json);
-        clientWrite(s->client, writeBuffer);
+        sendSSEEvent(s->client, "message", json);
         GIVE_MUTEX();
         YIELD();
     }
@@ -1816,18 +1821,7 @@ void SSEBroadcastState(const char *data, BroadcastType type)
                 {
                     if (subscription[i].logViewer)
                     {
-                        if (snprintf_P(writeBuffer, sizeof(writeBuffer), PSTR("event: logger\ndata: %s\n\n"), data) >= (int)sizeof(writeBuffer))
-                        {
-                            // Will not fit in our write buffer, let system printf handle
-#ifdef ESP8266
-                            subscription[i].client.flush(); // make sure previous data all sent.
-#endif
-                            subscription[i].client.printf("event: logger\ndata: %s\n\n", data);
-                        }
-                        else
-                        {
-                            clientWrite(subscription[i].client, writeBuffer);
-                        }
+                        sendSSEEvent(subscription[i].client, "logger", data);
                     }
                 }
                 else if (type == RATGDO_STATUS)
@@ -1835,18 +1829,7 @@ void SSEBroadcastState(const char *data, BroadcastType type)
                     ESP_LOGV(TAG, "Client %s (%s) send status SSE on channel %d, data: %s",
                              IPAddress(subscription[i].clientIP).toString().c_str(),
                              subscription[i].clientUUID.c_str(), i, data);
-                    if (snprintf_P(writeBuffer, sizeof(writeBuffer), PSTR("event: message\ndata: %s\n\n"), data) >= (int)sizeof(writeBuffer))
-                    {
-                        // Will not fit in our write buffer, let system printf handle
-#ifdef ESP8266
-                        subscription[i].client.flush(); // make sure previous data all sent.
-#endif
-                        subscription[i].client.printf("event: message\ndata: %s\n\n", data);
-                    }
-                    else
-                    {
-                        clientWrite(subscription[i].client, writeBuffer);
-                    }
+                    sendSSEEvent(subscription[i].client, "message", data);
                 }
             }
             else
@@ -2023,8 +2006,7 @@ void handle_firmware_upload()
                     JSON_ADD_INT("uploadPercent", uploadPercent);
                     JSON_END();
                     JSON_REMOVE_NL(json);
-                    snprintf_P(writeBuffer, sizeof(writeBuffer), PSTR("event: uploadStatus\ndata: %s\n\n"), json);
-                    clientWrite(firmwareUpdateSub->client, writeBuffer);
+                    sendSSEEvent(firmwareUpdateSub->client, "uploadStatus", json);
                     GIVE_MUTEX();
                 }
             }
