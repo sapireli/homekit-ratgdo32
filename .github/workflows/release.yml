@@ -91,6 +91,10 @@ jobs:
           /tmp/ipv4-test
           c++ -std=c++11 -Wall -Wextra -Werror -pthread tests/log_snapshot_test.cpp -o /tmp/log-snapshot-test
           /tmp/log-snapshot-test
+          c++ -std=c++17 -Wall -Wextra -Werror -pthread tests/sse_lifecycle_test.cpp -o /tmp/sse-lifecycle-test
+          /tmp/sse-lifecycle-test
+          c++ -std=c++17 -Wall -Wextra -Werror -pthread tests/sse_lock_test.cpp -o /tmp/sse-lock-test
+          /tmp/sse-lock-test
       - name: Install PlatformIO Core
         run: pip install platformio==6.2.0
       - name: Build firmware
