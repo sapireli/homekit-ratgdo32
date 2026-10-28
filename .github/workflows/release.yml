@@ -100,7 +100,9 @@ jobs:
       - name: Build firmware
         run: pio run -e ${{ matrix.environment }}
       - name: Test installed HomeSpan transport
-        run: python .pio/libdeps/${{ matrix.environment }}/HomeSpan/tests/test_hap_output.py
+        run: |
+          python .pio/libdeps/${{ matrix.environment }}/HomeSpan/tests/test_hap_output.py
+          python .pio/libdeps/${{ matrix.environment }}/HomeSpan/tests/test_hap_input.py
       - name: Check panic transmitter disconnect
         run: |
           python scripts/check_uart_iram.py --elf .pio/build/${{ matrix.environment }}/firmware.elf \
