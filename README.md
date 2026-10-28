@@ -4,7 +4,7 @@
 > This firmware is based on the ESP32-based ratgdo32 and ratgdo32-disco series boards firmware. HomeKit support for the original ESP8266-based v2.5xi devices can be found [here](https://github.com/ratgdo/homekit-ratgdo)
 
 > [!NOTE]
-> The next Gelidus release, `v1.4.0`, incorporates upstream through commit `5ab633c` (October 18, 2026), including fixes after `v3.5.5`. GRGDO1 Rev1/Rev2 builds retain the VL53L1X and DHT22 support. See [release preparation](docs/releasing.md) for validation and publishing instructions.
+> This integration proposes `v1.4.0` and incorporates upstream through commit `5ab633c` (October 18, 2026), including fixes after `v3.5.5`. GRGDO1 Rev1/Rev2 builds retain the VL53L1X and DHT22 support. See [release preparation](docs/releasing.md) for validation and publishing instructions.
 >
 > The default GRGDO1 builds disable the ratgdo32-disco status and laser outputs because those pins are used for I2C and obstruction sensing on Gelidus hardware.
 

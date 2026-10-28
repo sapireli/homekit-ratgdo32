@@ -1,6 +1,6 @@
 # GRGDO1 releases
 
-The next Gelidus release is `v1.4.0`. Its source includes
+This integration proposes source version `v1.4.0`. It includes
 [`ratgdo/homekit-ratgdo32` commit `5ab633c166a367fd48303eca37bc9e086d2bfb6d`](https://github.com/ratgdo/homekit-ratgdo32/commit/5ab633c166a367fd48303eca37bc9e086d2bfb6d)
 from October 18, 2026, plus the Gelidus `v1.3.1` release history. That upstream
 commit includes the fixes following `v3.5.5`; upstream calls it the unreleased
