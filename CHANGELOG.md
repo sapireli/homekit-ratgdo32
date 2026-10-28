@@ -108,6 +108,19 @@ All notable changes to `homekit-ratgdo32` will be documented in this file. This 
 * Bugfix: Fix setting keyname mismatch between browser and server (homekitLight / lightHomeKit)
 * Feature: Allow user to set NTP server URL
 * Other: ESP32 only, update HomeSpan library to version 2.1.7
+## v1.3.1 (2026-07-16) - Gelidus Research
+
+### What's Changed
+* Bugfix: `lightHomeKit`/`homekitLight` key name mismatch between browser and server. (upstream [#146](https://github.com/ratgdo/homekit-ratgdo32/issues/146))
+* Bugfix: Debounce door open/close commands to prevent duplicate commands. (upstream [#177](https://github.com/ratgdo/homekit-ratgdo32/issues/177))
+* Bugfix: Sec+1.0 — don't stop door on open/close request if already opening/closing. (upstream [#159](https://github.com/ratgdo/homekit-ratgdo32/issues/159))
+* Bugfix: Free-slot scan misses free slots. (upstream [#170](https://github.com/ratgdo/homekit-ratgdo32/issues/170))
+* Bugfix: Make setting timezone more robust — reject invalid/whitespace timezone values. (upstream [#158](https://github.com/ratgdo/homekit-ratgdo32/issues/158))
+* Bugfix: Not all Security 2.0 doors have time-to-close (README update).
+* Bugfix: Fix `viewlog.sh` — log arg silently dropped without a value.
+* Feature: NTP Server Configuration Enhancement — user-configurable NTP server, defaults to `pool.ntp.org`. (upstream PR [#146](https://github.com/ratgdo/homekit-ratgdo32/pull/146))
+
+---
 
 ## v1.3.0 (2026-02-09) - Gelidus Research
 
