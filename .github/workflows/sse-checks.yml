@@ -1,0 +1,50 @@
+name: SSE backpressure checks
+
+on:
+  pull_request:
+    paths:
+      - src/web.cpp
+      - lib/ratgdo/sse_write.h
+      - tests/sse_write.cpp
+      - platformio.ini
+      - .github/workflows/sse-checks.yml
+  push:
+    paths:
+      - src/web.cpp
+      - lib/ratgdo/sse_write.h
+      - tests/sse_write.cpp
+      - platformio.ini
+      - .github/workflows/sse-checks.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sse-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regression:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test single-attempt SSE writes under backpressure
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror tests/sse_write.cpp -o /tmp/sse-write-test
+          /tmp/sse-write-test
+
+  firmware:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [ratgdo_esp32dev, MJS_dev32]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install platformio==6.2.0
+      - run: pio run -e ${{ matrix.environment }}
