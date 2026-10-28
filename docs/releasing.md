@@ -7,8 +7,30 @@ commit includes the fixes following `v3.5.5`; upstream calls it the unreleased
 `v3.5.6` development version.
 
 `VERSION` sets the firmware version. The installer manifests describe the last
-published binaries, so they stay at `v1.3.1` until the release workflow publishes
+published binaries, so they stay at `v1.3.0` until the release workflow publishes
 the new artifacts.
+
+## Security+ 1.0 regression and release status
+
+[Gelidus issue #19](https://github.com/GelidusResearch/homekit-ratgdo32/issues/19)
+reports uncommanded door movement with v1.3.1 and recovery after reverting to
+v1.3.0. The published installer therefore stays on the v1.3.0 files from the
+current Gelidus main branch. Merging the v1.3.1 history must not restore its
+withdrawn installer assets.
+
+The integration includes the fix for the linked
+[upstream issue #192](https://github.com/ratgdo/homekit-ratgdo32/issues/192): after
+starting the ESP32 Security+ 1.0 hardware UART, it explicitly disables RX
+pull-down and enables RX pull-up. A successful build cannot establish that
+Gelidus issue #19 is resolved. Test the affected wall panel, cold boots,
+reboots, wall-panel detection, and repeated open/close/stop/TTC operations, and
+observe for uncommanded movement before publishing.
+
+Gelidus also describes separate GDOLIB migration and TTC work in issue #19,
+with v1.4.0 planned for that work. This upstream integration retains the current
+non-GDOLIB backend (`USE_GDOLIB` is off); it does not implement that migration.
+Version 1.4.0 is a proposed integration version and needs maintainer agreement
+with that release plan. Issue #19 remains open pending device validation.
 
 ## Build and review
 
