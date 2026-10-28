@@ -11,6 +11,7 @@ class SerialConsoleState
 public:
     bool isEnabled() const { return enabled.load(); }
     bool isReady() const { return enabled.load() && !starting.load(); }
+    void disable() { enabled.store(false); }
 
     template <class Port> void ensureStarted(Port &port)
     {
@@ -25,7 +26,7 @@ public:
 
     template <class Port> void releaseForI2C(Port &port)
     {
-        enabled.store(false); // Must precede end(): teardown itself may emit a log.
+        disable(); // Must precede end(): teardown itself may emit a log.
         port.end();
     }
 

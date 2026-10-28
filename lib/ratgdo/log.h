@@ -142,6 +142,7 @@ public:
     void clearCrashLog();
     void printCrashLog(Print &outDevice = Serial);
     void saveMessageLog();
+    void disableSerialConsole();
 };
 extern LOG *ratgdoLogger;
 

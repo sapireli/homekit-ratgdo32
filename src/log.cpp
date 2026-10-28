@@ -202,6 +202,16 @@ LOG::LOG()
     msgBuffer->head = 0;
 }
 
+void LOG::disableSerialConsole()
+{
+    // Drain any in-flight logger serial write before UART teardown. Release the
+    // log lock before end(), which can itself emit framework log messages.
+    TAKE_MUTEX();
+    serialConsole.disable();
+    suppressSerialLog = true;
+    GIVE_MUTEX();
+}
+
 void LOG::logToBuffer(const char *fmt, va_list args)
 {
     TAKE_MUTEX();

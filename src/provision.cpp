@@ -85,11 +85,11 @@ void release_serial_console_for_i2c()
 {
     improv_setup_done = false;
     serial_log_suppressed_before_i2c = suppressSerialLog;
-    suppressSerialLog = true;
 #ifdef USE_HOMESPAN
     homeSpan.setSerialInputDisable(true);
     homeSpan.setLogLevel(-1);
 #endif
+    ratgdoLogger->disableSerialConsole();
     serialConsole.releaseForI2C(Serial);
 }
 
