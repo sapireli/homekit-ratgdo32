@@ -11,6 +11,7 @@ All notable changes to `homekit-ratgdo32` will be documented in this file. This 
 * Add upstream encoder support, the optional HomeKit stop switch, door reversal settings, configurable NTP, and door/light/lock command fixes. Encoder support and the stop switch are off by default.
 * Keep the existing DHT22 HomeKit accessory ID; assign a separate ID to the stop switch.
 * Disable conflicting upstream status and laser outputs on GRGDO1. GPIO25/26 belong to Rev2 I2C; GPIO23 is the obstruction input. Hide the unsupported controls unless separate output pins are configured.
+* Restore upstream door-change timestamps and status events alongside DHT22 readings; the previous Gelidus sensor code had displaced that block.
 * Port DHT22 settings to upstream's array-based configuration storage and add bounded JSON serialization for sensor readings.
 * Select OTA firmware for the correct board revision and exclude checksum, bootloader, and partition files from firmware selection.
 * Update HomeSpan to 2.1.8 and pin the ESP32 platform to upstream's 55.03.311 version.

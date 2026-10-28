@@ -408,7 +408,54 @@ void web_loop()
         }
     }
 #endif // USE_DHT22
-    // ...existing code...
+    if (garage_door.active && garage_door.current_state != lastDoorState)
+    {
+        ESP_LOGD(TAG, "Current Door State changing from %s to %s", DOOR_STATE(lastDoorState), DOOR_STATE(garage_door.current_state));
+        if (enableNTP && clockSet)
+        {
+            time_t timeNow = time(NULL);
+            if (lastDoorState == 0xff)
+            {
+                // initialize with saved time.
+                // lastDoorUpdateAt is milliseconds relative to system reboot time.
+                lastDoorUpdateAt = (userConfig->getDoorUpdateAt() != 0) ? ((userConfig->getDoorUpdateAt() - timeNow) * 1000) + upTime : 0;
+                lastDoorOpenAt = (userConfig->getDoorOpenAt() != 0) ? ((userConfig->getDoorOpenAt() - timeNow) * 1000) + upTime : 0;
+                lastDoorCloseAt = (userConfig->getDoorCloseAt() != 0) ? ((userConfig->getDoorCloseAt() - timeNow) * 1000) + upTime : 0;
+            }
+            else
+            {
+                // first state change after a reboot, so really is a state change.
+                lastDoorUpdateAt = upTime;
+                userConfig->set(cfg_doorUpdateAt, (int)timeNow);
+                if (garage_door.current_state == GarageDoorCurrentState::CURR_OPEN)
+                {
+                    lastDoorOpenAt = upTime;
+                    userConfig->set(cfg_doorOpenAt, (int)timeNow);
+                }
+                if (garage_door.current_state == GarageDoorCurrentState::CURR_CLOSED)
+                {
+                    lastDoorCloseAt = upTime;
+                    userConfig->set(cfg_doorCloseAt, (int)timeNow);
+                }
+                ESP8266_SAVE_CONFIG();
+            }
+        }
+        else
+        {
+            // No realtime set, use upTime.
+            lastDoorUpdateAt = (lastDoorState == 0xff) ? 0 : upTime;
+            if (garage_door.current_state == GarageDoorCurrentState::CURR_OPEN)
+                lastDoorOpenAt = lastDoorUpdateAt;
+            if (garage_door.current_state == GarageDoorCurrentState::CURR_CLOSED)
+                lastDoorCloseAt = lastDoorUpdateAt;
+        }
+        lastDoorState = garage_door.current_state;
+        // We send milliseconds relative to current time... ie updated X milliseconds ago
+        // First time through, zero offset from upTime, which is when we last rebooted)
+        JSON_ADD_INT(cfg_doorUpdateAt, (upTime - lastDoorUpdateAt));
+        JSON_ADD_INT(cfg_doorOpenAt, (upTime - lastDoorOpenAt));
+        JSON_ADD_INT(cfg_doorCloseAt, (upTime - lastDoorCloseAt));
+    }
 #ifdef RATGDO32_DISCO
     // Feature not available on ESP8266
     if (garage_door.has_distance_sensor)
