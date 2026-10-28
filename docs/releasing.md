@@ -10,6 +10,27 @@ commit includes the fixes following `v3.5.5`; upstream calls it the unreleased
 published binaries, so they stay at `v1.3.0` until the release workflow publishes
 the new artifacts.
 
+## Rev1 runtime correction
+
+The `fc26ab2` test build became unresponsive on a physical GRGDO1 Rev1 using
+Security+ 2.0. Boot logs show that the VL53L1X probe failed and entered the old
+UART restoration path. That code copied `HardwareSerial` objects, including
+their driver pointers, mutexes, and task ownership. Those copies are removed.
+The exact cause of the observed freeze still needs confirmation on the device.
+
+Rev1 now stops Improv and HomeSpan serial clients, disables automatic serial
+startup in the logger, and releases UART0 before I2C takes GPIO1/3. Logs remain
+available over the network. If no sensor is detected, `Wire.end()` releases the
+pins before the original UART0 is restarted and its clients restored. When the
+sensor is present, those pins remain dedicated to I2C. No UART1 remapping or
+serial object assignment occurs. Serial startup also has a re-entry guard and
+returns on failure instead of spinning forever.
+
+`tests/serial_console.cpp` uses a noncopyable serial-port model and exercises
+logging during begin/end, missing-sensor restoration, attempted pin reclamation
+while I2C is active, and serial-start failure. The original Rev1 test build is
+withdrawn, and PR #21 remains draft pending corrected-build device validation.
+
 ## Security+ 1.0 regression and release status
 
 [Gelidus issue #19](https://github.com/GelidusResearch/homekit-ratgdo32/issues/19)
@@ -62,6 +83,8 @@ c++ -std=c++17 -Wall -Wextra -Isrc tests/json_float.cpp -o /tmp/json-test
 /tmp/json-test
 c++ -std=c++17 -Wall -Wextra -Isrc tests/gdo_uart.cpp -o /tmp/uart-test
 /tmp/uart-test
+c++ -std=c++17 -Wall -Wextra tests/serial_console.cpp -o /tmp/console-test
+/tmp/console-test
 pio run -e ratgdo_esp32dev
 pio run -e ratgdo_esp32dev_rev1
 ```

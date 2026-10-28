@@ -16,6 +16,8 @@
 
 #include <Arduino.h>
 #include <IPAddress.h>
+#include "serial_console.h"
+extern SerialConsoleState serialConsole;
 #ifdef ESP8266
 #include <LittleFS.h>
 #include "EspSaveCrash.h"

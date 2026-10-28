@@ -6,6 +6,7 @@ All notable changes to `homekit-ratgdo32` will be documented in this file. This 
 
 ## v1.4.0 (proposed, unreleased) - Gelidus Research
 
+* Fix the Rev1 serial/I2C ownership path exercised by a runtime freeze report: remove all `HardwareSerial` object copies, stop UART0 clients before using GPIO1/3 for I2C, and restore the original UART only after `Wire.end()` when the sensor is absent. Prevent recursive UART initialization from logging and remove the unbounded wait for serial startup. Physical validation of the corrected build is pending.
 * Address the UART defect linked from [Gelidus #19](https://github.com/GelidusResearch/homekit-ratgdo32/issues/19): restore RX pull-up after inverted UART initialization, require byte-at-a-time reception, check initialization failures, and allow a full 1200-baud character plus scheduling margin for its echo.
 * Replace the TX GPIO pull-up reset in shutdown/panic handling with an explicit inactive LOW output disconnected from UART. Cover startup and ESP restart callbacks too. Add regression tests for broken RX bias, stale output latches, failed initialization, and late UART output; check the compiled panic disconnect has no flash dependencies.
 * Validate the affected Security+ 1.0 wall panel before declaring #19 resolved. Keep the published installer on v1.3.0 until release. The proposed version must be coordinated with Gelidus's separate GDOLIB release plan.

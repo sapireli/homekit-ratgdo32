@@ -32,6 +32,7 @@
 
 // Logger tag
 static const char *TAG = "ratgdo-logger";
+SerialConsoleState serialConsole;
 
 // Construct the singleton object for logger access
 LOG *LOG::instancePtr = new LOG();
@@ -49,26 +50,19 @@ esp_log_level_t logLevel = ESP_LOG_VERBOSE;
 #define SERIAL_PRINT(x)         \
     do                          \
     {                           \
-        if (!suppressSerialLog) \
+        if (serialConsole.isReady() && !suppressSerialLog && Serial) \
             Serial.print(x);    \
     } while (0)
 
 // Allows us to intercept all ESP_LOGx() even outside our code.
 void esp_log_hook(const char *fmt, va_list args)
 {
-    if (!Serial)
-    {
-        // Before we can log anything, we need to initialize the serial port.
-        Serial.begin(115200);
-        while (!Serial)
-            ; // Wait for serial port to open
-        Serial.print("\n\n\n");
-    }
+    serialConsole.ensureStarted(Serial);
     if (ratgdoLogger)
     {
         ratgdoLogger->logToBuffer(fmt, args);
     }
-    else if (!suppressSerialLog)
+    else if (serialConsole.isReady() && !suppressSerialLog && Serial)
     {
         // We should only ever come here if ratgdoLogger has not been constructed
         // which would only be in very early part of booting the system

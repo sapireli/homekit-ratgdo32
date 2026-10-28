@@ -23,6 +23,7 @@
 #include "vehicle.h"
 #include "homekit.h"
 #include "config.h"
+#include "provision.h"
 
 // Logger tag
 static const char *TAG = "ratgdo-vehicle";
@@ -64,22 +65,19 @@ void setup_vehicle()
     ESP_LOGI(TAG, "=== Setup VL53L1X time-of-flight sensor ===");
 
 #ifdef GRGDO1_V1
-    // GRGDO1 v1: Serial pins conflict with I2C pins, redirect to Serial1
-    Serial1.begin(115200);
-    Serial.end();
-    Serial = Serial1;
+    // GPIO1/3 are shared with UART0. Release its clients and driver before
+    // Wire claims those pins; never copy HardwareSerial driver ownership.
+    release_serial_console_for_i2c();
 #endif
 
     if (!Wire.begin(SENSOR_SDA_PIN, SENSOR_SCL_PIN))
     {
         ESP_LOGE(TAG, "VL53L1X I2C pin setup failed");
-        vehicle_setup_error = true;
+        Wire.end();
 #ifdef GRGDO1_V1
-        // Restore Serial to UART0 for Improv
-        Serial1.end();
-        Serial0.begin(115200);
-        Serial = Serial0;
+        restore_serial_console_after_i2c();
 #endif
+        vehicle_setup_error = true;
         return;
     }
 
@@ -89,13 +87,10 @@ void setup_vehicle()
     {
         ESP_LOGE(TAG, "VL53L1X ToF not detected at address 0x29");
         Wire.end();
-        vehicle_setup_error = true;
 #ifdef GRGDO1_V1
-        // Restore Serial to UART0 for Improv
-        Serial1.end();
-        Serial0.begin(115200);
-        Serial = Serial0;
+        restore_serial_console_after_i2c();
 #endif
+        vehicle_setup_error = true;
         return;
     }
     ESP_LOGI(TAG, "VL53L1X ToF detected at address 0x29");
@@ -117,13 +112,10 @@ void setup_vehicle()
     {
         ESP_LOGE(TAG, "VL53L1X failed to initialize error: %d", status);
         Wire.end();
-        vehicle_setup_error = true;
 #ifdef GRGDO1_V1
-        // Restore Serial to UART0 for Improv
-        Serial1.end();
-        Serial0.begin(115200);
-        Serial = Serial0;
+        restore_serial_console_after_i2c();
 #endif
+        vehicle_setup_error = true;
         return;
     }
 

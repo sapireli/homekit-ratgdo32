@@ -81,6 +81,8 @@ jobs:
           /tmp/json-test
           c++ -std=c++17 -Wall -Wextra -Isrc tests/gdo_uart.cpp -o /tmp/uart-test
           /tmp/uart-test
+          c++ -std=c++17 -Wall -Wextra -Isrc tests/serial_console.cpp -o /tmp/console-test
+          /tmp/console-test
       - name: Install PlatformIO Core
         run: pip install platformio==6.2.0
       - name: Build firmware
