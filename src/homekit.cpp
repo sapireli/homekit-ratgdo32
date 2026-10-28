@@ -214,16 +214,39 @@ void setup_homekit()
     config.on_event = homekit_event;
 
     garage_door.has_motion_sensor = (bool)read_door_int(nvram_has_motion);
-    if (!garage_door.has_motion_sensor && (userConfig->getMotionTriggers() == 0))
+    bool show_motion = garage_door.has_motion_sensor || (userConfig->getMotionTriggers() != 0);
+    if (!show_motion)
     {
         ESP_LOGI(TAG, "Motion Sensor not detected.  Disabling Service");
-        config.accessories[0]->services[3] = NULL;
     }
+
+    bool show_light = true;
     if (userConfig->getGDOSecurityType() == 3)
     {
         ESP_LOGI(TAG, "Dry contact does not support light control.  Disabling Service");
-        config.accessories[0]->services[2] = NULL;
+        show_light = false;
     }
+    else if (!userConfig->getLightHomeKit())
+    {
+        ESP_LOGI(TAG, "Light HomeKit accessory disabled in settings.  Disabling Service");
+        show_light = false;
+    }
+
+    // Rebuild the null-terminated service list in-place so that disabling one service does
+    // not truncate the list and accidentally hide any enabled services that follow it.
+    homekit_service_t **services = config.accessories[0]->services;
+    homekit_service_t *light_service = services[2];
+    homekit_service_t *motion_service = services[3];
+    int index = 2; // services[0] (Accessory Information) and services[1] (Garage Door) are always present
+    if (show_light)
+    {
+        services[index++] = light_service;
+    }
+    if (show_motion)
+    {
+        services[index++] = motion_service;
+    }
+    services[index] = NULL;
 
     arduino_homekit_setup(&config);
     homekit_setup_done = true;
@@ -332,6 +355,10 @@ static DEV_Occupancy *roomOccupancy;
 #ifdef USE_DHT22
 DEV_TempHumidity *tempHumidity;
 #endif
+static DEV_Stop *stopDoor;
+#ifdef RATGDO_ENCODER
+static DEV_ManuallyOperated *manuallyOperatedSensor;
+#endif
 
 // Buffer to hold all IPv6 addresses as a single string
 char ipv6_addresses[LWIP_IPV6_NUM_ADDRESSES * IP6ADDR_STRLEN_MAX] = {0};
@@ -420,6 +447,7 @@ void connectionCallback(int count)
     userConfig->set(cfg_subnetMask, WiFi.subnetMask().toString().c_str());
 
     // Only update cfg_nameserverIP if it is an IPv4 address. .dnsIP() can return an IPv6 address if we have one from SLAAC
+    // but our user interface only allows for IPv4 DNS server configuration.
     if (WiFi.dnsIP().type() == IPv4)
         userConfig->set(cfg_nameserverIP, WiFi.dnsIP().toString().c_str());
 
@@ -431,6 +459,7 @@ void connectionCallback(int count)
     setup_comms();
 #endif
     wifi_got_ip = true;
+    notify_new_ipv4_address();
 }
 
 void WiFiGotIP(WiFiEvent_t event, WiFiEventInfo_t info)
@@ -459,6 +488,7 @@ void WiFiGotIP(WiFiEvent_t event, WiFiEventInfo_t info)
                 }
                 strlcat(ipv6_addresses, addrStr.c_str(), sizeof(ipv6_addresses));
             }
+            notify_new_ipv6_address();
         }
     }
     else if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP)
@@ -606,7 +636,8 @@ void enable_service_homekit_vehicle(bool enable)
 
     bool databaseChanged = false;
 
-    auto ensureMotionSensor = [&](DEV_Motion *&sensor, uint16_t aid, const char *name, bool shouldExist) {
+    auto ensureMotionSensor = [&](DEV_Motion *&sensor, uint16_t aid, const char *name, bool shouldExist)
+    {
         if (shouldExist)
         {
             if (!sensor)
@@ -628,7 +659,8 @@ void enable_service_homekit_vehicle(bool enable)
         }
     };
 
-    auto ensureOccupancySensor = [&](DEV_Occupancy *&sensor, uint16_t aid, const char *name, bool shouldExist) {
+    auto ensureOccupancySensor = [&](DEV_Occupancy *&sensor, uint16_t aid, const char *name, bool shouldExist)
+    {
         if (shouldExist)
         {
             if (!sensor)
@@ -673,6 +705,9 @@ bool enable_service_homekit_laser(bool enable)
             new SpanAccessory(HOMEKIT_AID_LASER);
             new DEV_Info("Laser");
             assistLaser = new DEV_Light(Light_t::ASSIST_LASER);
+            // Keep HomeKit in sync with the physical laser regardless of what
+            // triggers a state change (web UI, vehicle presence, flash() auto-off).
+            laser.onChange(notify_homekit_laser);
             homeSpan.updateDatabase();
             return true;
         }
@@ -793,6 +828,66 @@ bool enable_service_homekit_motion_sensor(bool enable)
     return false;
 }
 
+bool enable_service_homekit_stop(bool enable)
+{
+    if (enable)
+    {
+        if (!stopDoor)
+        {
+            // Define the Stop accessory...
+            ESP_LOGI(TAG, "Creating HomeKit Stop Service");
+            new SpanAccessory(HOMEKIT_AID_STOP);
+            new DEV_Info("Stop");
+            stopDoor = new DEV_Stop();
+            homeSpan.updateDatabase();
+            return true;
+        }
+    }
+    else if (stopDoor)
+    {
+        // Delete the accessory, if it exists
+        ESP_LOGI(TAG, "Deleting HomeKit Stop Service");
+        if (homeSpan.deleteAccessory(HOMEKIT_AID_STOP))
+        {
+            stopDoor = nullptr;
+            homeSpan.updateDatabase();
+            return true;
+        }
+    }
+    return false;
+}
+
+#ifdef RATGDO_ENCODER
+bool enable_service_homekit_manually_operated(bool enable)
+{
+    if (enable)
+    {
+        if (!manuallyOperatedSensor)
+        {
+            // Define the Manually Operated accessory...
+            ESP_LOGI(TAG, "Creating HomeKit Manually Operated Service");
+            new SpanAccessory(HOMEKIT_AID_MANUALLY_OPERATED);
+            new DEV_Info("Manually Operated");
+            manuallyOperatedSensor = new DEV_ManuallyOperated();
+            homeSpan.updateDatabase();
+            return true;
+        }
+    }
+    else if (manuallyOperatedSensor)
+    {
+        // Delete the accessory, if it exists
+        ESP_LOGI(TAG, "Deleting HomeKit Manually Operated Service");
+        if (homeSpan.deleteAccessory(HOMEKIT_AID_MANUALLY_OPERATED))
+        {
+            manuallyOperatedSensor = nullptr;
+            homeSpan.updateDatabase();
+            return true;
+        }
+    }
+    return false;
+}
+#endif
+
 /****************************************************************************
  * Setup HomeKit, HomeSpan version.
  */
@@ -912,9 +1007,11 @@ void setup_homekit()
 #endif
     // Create a room occupancy sensor if timer for it is greater than 0
     enable_service_homekit_room_occupancy(userConfig->getOccupancyDuration() > 0);
+    // Create a stop service if enabled in settings
+    enable_service_homekit_stop(userConfig->getStopDoorHomeKit());
 
 #ifdef USE_DHT22
-    int dht22Pin = userConfig->contains(cfg_dht22Pin) ? std::get<int>(userConfig->get(cfg_dht22Pin)) : -1;
+    int dht22Pin = userConfig->getDHT22Pin();
     if (dht22Pin >= 0) {
         ESP_LOGI(TAG, "Creating Temperature and Humidity Sensor accessory (DHT22 on pin %d)", dht22Pin);
         new SpanAccessory(HOMEKIT_AID_TEMP_HUMIDITY);
@@ -1000,12 +1097,17 @@ DEV_GarageDoor::DEV_GarageDoor() : Service::GarageDoorOpener()
 
 boolean DEV_GarageDoor::update()
 {
-    ESP_LOGI(TAG, "Garage Door Characteristics Update, door target: %s", DOOR_STATE(target->getNewVal()));
-    GarageDoorCurrentState state = (target->getNewVal() == target->OPEN) ? open_door() : close_door();
-    obstruction->setVal(false);
-    current->setVal(state);
+    // HomeSpan calls update() when any characteristic in this service changes.
+    // Only act on the characteristic(s) that were actually written.
+    if (target->updated())
+    {
+        ESP_LOGD(TAG, "Garage Door Characteristics Update, door target: %s", DOOR_STATE(target->getNewVal()));
+        GarageDoorCurrentState state = (target->getNewVal() == target->OPEN) ? open_door() : close_door();
+        obstruction->setVal(false);
+        current->setVal(state);
+    }
 
-    if (userConfig->getGDOSecurityType() != 3)
+    if (userConfig->getGDOSecurityType() != 3 && lockTarget && lockTarget->updated())
     {
         // Dry contact cannot control lock
         set_lock(lockTarget->getNewVal() == lockTarget->LOCK);
@@ -1165,6 +1267,65 @@ void DEV_TempHumidity::loop()
 #endif // USE_DHT22
 
 /****************************************************************************
+ * Switch Service Handler
+ */
+DEV_Stop::DEV_Stop() : Service::Switch()
+{
+    ESP_LOGI(TAG, "Configuring HomeKit Switch Service for stop door action");
+    event_q = xQueueCreate(10, sizeof(GDOEvent));
+    DEV_Stop::on = new Characteristic::On(DEV_Stop::on->OFF);
+}
+
+boolean DEV_Stop::update()
+{
+    if (on->getNewVal<bool>())
+    {
+        ESP_LOGD(TAG, "Stop door action triggered from HomeKit");
+        stop_door();
+        // Now immediately reset the switch to off, so it can be triggered again for the next stop action.
+        GDOEvent e;
+        e.c = nullptr;
+        e.value.b = false;
+        queueSendHelper(this->event_q, e, "stop switch");
+    }
+    return true;
+}
+
+void DEV_Stop::loop()
+{
+    if (uxQueueMessagesWaiting(event_q) > 0)
+    {
+        GDOEvent e;
+        xQueueReceive(event_q, &e, 0);
+        ESP_LOGD(TAG, "Stop switch has turned %s", e.value.b ? "on" : "off");
+        DEV_Stop::on->setVal(e.value.b);
+    }
+}
+
+#ifdef RATGDO_ENCODER
+/****************************************************************************
+ * Manually Operated Contact Sensor Service Handler
+ */
+DEV_ManuallyOperated::DEV_ManuallyOperated() : Service::ContactSensor()
+{
+    ESP_LOGI(TAG, "Configuring HomeKit Contact Sensor Service for manually operated state");
+    event_q = xQueueCreate(10, sizeof(GDOEvent));
+    DEV_ManuallyOperated::state = new Characteristic::ContactSensorState(state->DETECTED);
+}
+
+void DEV_ManuallyOperated::loop()
+{
+    if (uxQueueMessagesWaiting(event_q) > 0)
+    {
+        GDOEvent e;
+        xQueueReceive(event_q, &e, 0);
+        ESP_LOGD(TAG, "Manually Operated contact sensor has turned %s", e.value.b ? "open" : "closed");
+        DEV_ManuallyOperated::state->setVal(e.value.b ? state->NOT_DETECTED : state->DETECTED);
+    }
+}
+#endif
+
+/****************************************************************************
  * HomeKit notification functions only for ESP32
  */
 void notify_homekit_vehicle_occupancy(bool vehicleDetected)
@@ -1232,6 +1393,18 @@ void notify_homekit_temperature_humidity(float temp, float hum)
     tempHumidity->setValues(temp, hum);
 }
 #endif // USE_DHT22
+#ifdef RATGDO_ENCODER
+void notify_homekit_manually_operated(bool state)
+{
+    if (!isPaired || !manuallyOperatedSensor)
+        return;
+
+    GDOEvent e;
+    e.c = nullptr;
+    e.value.b = state;
+    queueSendHelper(manuallyOperatedSensor->event_q, e, "manually operated");
+}
+#endif
 
 // on ESP8266 this is provided by the Arduino HomeKit library
 bool homekit_is_paired()
@@ -1406,8 +1579,8 @@ void enable_service_homekit_motion(bool reboot)
 void notify_homekit_motion(bool state)
 {
     garage_door.motion = state;
-#ifdef ESP32
     garage_door.motion_timer = (!state) ? 0 : _millis() + MOTION_TIMER_DURATION;
+#ifdef ESP32
     if (!isPaired || !motion)
         return;
 
@@ -1416,7 +1589,6 @@ void notify_homekit_motion(bool state)
     e.value.b = garage_door.motion;
     queueSendHelper(motion->event_q, e, "motion");
 #else
-    garage_door.motion_timer = (!state) ? 0 : _millis() + MOTION_TIMER_DURATION;
     if (!arduino_homekit_get_running_server())
         return;
 

@@ -45,6 +45,9 @@
 #ifndef USE_GDOLIB
 #include "drycontact.h"
 #endif
+#ifdef RATGDO_ENCODER
+#include "encoder.h"
+#endif
 
 // Logger tag
 static const char *TAG = "ratgdo-main";
@@ -76,6 +79,16 @@ GarageDoor garage_door = {
     .builtInTTC = 0,
     .builtInTTCremaining = 0,
     .builtInTTChold = false,
+#ifndef ESP8266
+    .room_occupancy_timeout = 0,
+    .room_occupied = false,
+#endif
+#ifdef RATGDO_ENCODER
+    .manuallyOperated = false,
+    .protocol_door_state = (GarageDoorCurrentState)0xFF,
+    .encoder_door_state = (GarageDoorCurrentState)0xFF,
+    .encoder_door_position = 0xFF, // unknown
+#endif
 };
 
 // Some initialization is postponed until after we have an IP address
@@ -114,7 +127,6 @@ _millis_t next_heap_check = 0;
 
 // Buffer to hold our status as JSON string
 char *status_json = NULL;
-char *loop_json = NULL;
 
 // Forward declare functions
 bool suspend_service_loop = false;
@@ -229,14 +241,6 @@ void setup()
         return;
     }
     ESP_LOGI(TAG, "Allocated buffer for status JSON, size: %d", STATUS_JSON_BUFFER_SIZE);
-
-    loop_json = static_cast<char *>(malloc(LOOP_JSON_BUFFER_SIZE));
-    if (!loop_json)
-    {
-        ESP_LOGE(TAG, "Failed to allocated buffer for loop JSON, size: %d", LOOP_JSON_BUFFER_SIZE);
-        return;
-    }
-    ESP_LOGI(TAG, "Allocated buffer for loop JSON, size: %d", LOOP_JSON_BUFFER_SIZE);
     IRAM_END(TAG);
 
     if (softAPmode)
@@ -275,6 +279,9 @@ void setup()
 #endif
 #ifndef USE_GDOLIB
     setup_drycontact();
+#endif
+#ifdef RATGDO_ENCODER
+    setup_encoder();
 #endif
 
     // Finally initialize WiFi and HomeKit
@@ -333,7 +340,7 @@ void loop()
         ESP_LOGI(TAG, "Free sys stack at boot:     %d", free_sys_stack_at_boot);
         ESP_LOGI(TAG, "Current minimum sys stack:  %d", free_sys_stack);
 #endif
-        if (doorControlType == 2)
+        if (doorControlType == DOOR_CONTROL_SEC_PLUS_V2)
         {
             ESP_LOGI(TAG, "Our ID code %lu (0x%02lX)", id_code, id_code);
             ESP_LOGI(TAG, "Our rolling code %lu (0x%02X)", rolling_code, rolling_code);
@@ -353,6 +360,9 @@ void loop()
     comms_loop();
 #ifndef USE_GDOLIB
     drycontact_loop();
+#endif
+#ifdef RATGDO_ENCODER
+    encoder_loop();
 #endif
 #ifdef ESP8266
     // On ESP8266 we handle WiFi and HomeKit ourselves
@@ -374,7 +384,7 @@ void loop()
 void service_timer_loop()
 {
     _millis_t current_millis = _millis();
-    static time_t lastSNTP = 0;
+    static time_t lastTimeLogged = 0;
     static _millis_t lastLEDblink = 0;
 
     if (current_millis - lastLEDblink >= LED_BLINK_INTERVAL)
@@ -397,15 +407,15 @@ void service_timer_loop()
 
     if (enableNTP && clockSet)
     {
-        if (clockSet != lastSNTP)
+        time_t timeNow = time(NULL);
+        if (timeNow - lastTimeLogged > 60 * 60 * 3) // log time every 3 hours
         {
-            lastSNTP = clockSet;
+            lastTimeLogged = timeNow;
             ESP_LOGI(TAG, "Current System time: %s", timeString());
         }
 
         if (lastRebootAt == 0)
         {
-            time_t timeNow = time(NULL);
             lastRebootAt = timeNow - (current_millis / 1000);
             ESP_LOGI(TAG, "System boot time:    %s", timeString(lastRebootAt));
             // Need to also set when last door open/close was

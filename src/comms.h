@@ -22,12 +22,15 @@ extern void shutdown_comms();
 extern void comms_loop();
 
 extern GarageDoorCurrentState open_door();
+extern GarageDoorCurrentState stop_door();
+extern GarageDoorCurrentState open_door_partial(int timePercentage);
 extern GarageDoorCurrentState close_door(bool bypass_ttc = false);
 #if defined(ESP8266) || !defined(USE_GDOLIB)
 extern GarageDoorCurrentState toggle_door(bool bypass_ttc = false);
 #endif
 extern void delayFnCall(uint32_t ms, void (*callback)());
 #ifndef USE_GDOLIB
+extern void send_get_version();
 extern void send_get_status();
 extern void send_get_openings();
 extern void send_get_battery();
@@ -42,15 +45,26 @@ extern void sec1_light_release(uint8_t howManyReleases = 2, uint32_t delay = 0);
 
 extern void save_rolling_code();
 extern void reset_door();
+extern void update_door_state(GarageDoorCurrentState current_state);
 
 extern uint32_t is_ttc_active();
 
+typedef enum
+{
+    DOOR_CONTROL_UNKNOWN = 0,
+    DOOR_CONTROL_SEC_PLUS_V1 = 1,
+    DOOR_CONTROL_SEC_PLUS_V2 = 2,
+    DOOR_CONTROL_DRY_CONTACT = 3,
+    DOOR_CONTROL_MAX,
+} door_control_type_t;
+
 extern uint32_t id_code;
 extern uint32_t rolling_code;
-extern uint32_t doorControlType;
+extern door_control_type_t doorControlType;
 extern GarageDoorCurrentState doorState;
 extern bool comms_setup_done;
 extern bool comms_status_done;
+extern char gdoFirmwareVersion[];
 
 struct __attribute__((aligned(4))) ForceRecover
 {
