@@ -4,6 +4,21 @@
 
 All notable changes to `homekit-ratgdo32` will be documented in this file. This project tries to adhere to [Semantic Versioning](http://semver.org/).
 
+## v1.4.0 (unreleased) - Gelidus Research
+
+* Merge `ratgdo/homekit-ratgdo32` through commit `5ab633c166a367fd48303eca37bc9e086d2bfb6d` (October 18, 2026), including `v3.5.5` and the subsequent authentication/OTA fixes. Retain the Gelidus `v1.3.1` release fixes and installer assets.
+* Preserve GRGDO1 Rev1/Rev2 pin assignments, VL53L1X vehicle sensing, DHT22 temperature/humidity support, and separate HomeKit controls for vehicle sensors.
+* Add upstream encoder support, the optional HomeKit stop switch, door reversal settings, configurable NTP, and door/light/lock command fixes. Encoder support and the stop switch are off by default.
+* Keep the existing DHT22 HomeKit accessory ID; assign a separate ID to the stop switch.
+* Disable conflicting upstream status and laser outputs on GRGDO1. GPIO25/26 belong to Rev2 I2C; GPIO23 is the obstruction input. Hide the unsupported controls unless separate output pins are configured.
+* Port DHT22 settings to upstream's array-based configuration storage and add bounded JSON serialization for sensor readings.
+* Select OTA firmware for the correct board revision and exclude checksum, bootloader, and partition files from firmware selection.
+* Update HomeSpan to 2.1.8 and pin the ESP32 platform to upstream's 55.03.311 version.
+* Build and check both revisions in CI. Package revision-specific artifacts with checksums and source provenance; publish installer manifests from the same artifacts as the release.
+* Read the firmware version from `VERSION`, independently of the published installer manifests. Replace the old release branch and force push with a checked tag build and a normal default-branch documentation commit.
+
+Thanks to David Kerr and the ratgdo contributors for the upstream work, and to Gelidus Research and its contributors for GRGDO1 support. See the upstream entries below for individual changes and contributor credits, and [releasing.md](docs/releasing.md) for build and publication steps.
+
 ## v3.5.6 (2026-10-xx)
 
 **NOTE** If updating from version 3.5.5 you must disable password required setting (if set).  You can re-enable it after update completes.
@@ -65,7 +80,7 @@ All notable changes to `homekit-ratgdo32` will be documented in this file. This 
 
 ### What's Changed
 
-* Bugfix: Fix false encoder-stopped watchdog trigger from stale timestamp in encoder.cpp, https://github.com/ratgdo/homekit-ratgdo32/pull/184 
+* Bugfix: Fix false encoder-stopped watchdog trigger from stale timestamp in encoder.cpp, https://github.com/ratgdo/homekit-ratgdo32/pull/184
 * Bugfix: Fix regression that accidentally removed option to remove light switch from HomeKit, https://github.com/ratgdo/homekit-ratgdo/pull/350
 * Other: Move more Info-level log messages to Debug-level so that once in stable run mode, Info-level only logs actual activity.
 
@@ -329,7 +344,7 @@ While source files have been merged there remain significant differences between
 * Other: Add console CLI command to allow setting debug message log level
 * Other: Add console CLI command to facilitate testing moving door to position between 0% and 100%
 * Other: Update to use version 2.1.2 of upstream HomeSpan library
-  
+
 ## v3.1.8 (2025-04-27)
 
 ### What's Changed
@@ -528,4 +543,3 @@ Note: The built-in TTC feature operates slightly differently than ratgdo's timer
 ### Known Issues
 
 * THIS IS PRE-RELEASE FIRMWARE for testing purposes. Future updates MAY include breaking changes requiring a flash erase and re-upload.
-

@@ -166,6 +166,19 @@ const gpio_num_t SENSOR_SDA_PIN = (gpio_num_t)SENSOR_SDA_GPIO;
 #endif
 const gpio_num_t SENSOR_SCL_PIN = (gpio_num_t)SENSOR_SCL_GPIO;
 const gpio_num_t SENSOR_SHUTDOWN_PIN = GPIO_NUM_32;
+#if defined(GRGDO1_V1) || defined(GRGDO1_V2)
+constexpr bool grgdo_output_pin_available(gpio_num_t pin)
+{
+    return pin < 0 || (pin != SENSOR_SDA_PIN && pin != SENSOR_SCL_PIN &&
+                       pin != INPUT_OBST_PIN && pin != UART_RX_PIN &&
+                       pin != UART_TX_PIN && pin != DRY_CONTACT_OPEN_PIN &&
+                       pin != DRY_CONTACT_CLOSE_PIN && pin != DRY_CONTACT_LIGHT_PIN &&
+                       pin != LED_BUILTIN);
+}
+static_assert(grgdo_output_pin_available(STATUS_DOOR_PIN), "Door status output overlaps a GRGDO1 input or I2C pin");
+static_assert(grgdo_output_pin_available(STATUS_OBST_PIN), "Obstruction status output overlaps a GRGDO1 input or I2C pin");
+static_assert(grgdo_output_pin_available(LASER_PIN), "Laser output overlaps a GRGDO1 input or I2C pin");
+#endif
 #endif
 
 enum GarageDoorCurrentState : uint8_t

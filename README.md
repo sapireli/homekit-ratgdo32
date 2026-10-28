@@ -4,9 +4,9 @@
 > This firmware is based on the ESP32-based ratgdo32 and ratgdo32-disco series boards firmware. HomeKit support for the original ESP8266-based v2.5xi devices can be found [here](https://github.com/ratgdo/homekit-ratgdo)
 
 > [!NOTE]
-> Version 3.3.0 is a minor upgrade for ESP32-based ratgdo boards. Almost all source files for the ESP8266 and ESP32 versions of ratgdo have been merged which results in minor changes to the underlying features and function for ESP32 versions. The main benefit is for the original ESP8266-based ratgdo boards.
+> The next Gelidus release, `v1.4.0`, incorporates upstream through commit `5ab633c` (October 18, 2026), including fixes after `v3.5.5`. GRGDO1 Rev1/Rev2 builds retain the VL53L1X and DHT22 support. See [release preparation](docs/releasing.md) for validation and publishing instructions.
 >
-> While source files have been merged there remain significant differences between the two board types, most notably in the library used to communicate with HomeKit which are completely different.
+> The default GRGDO1 builds disable the ratgdo32-disco status and laser outputs because those pins are used for I2C and obstruction sensing on Gelidus hardware.
 
 # What is HomeKit-RATGDO?
 
@@ -29,7 +29,7 @@ This firmware supports Security+, Security+ 2.0 and Dry Contact enabled garage d
 
 Check the [GitHub Issues](https://github.com/gelidusresearch/homekit-ratgdo32/issues) for planned features, or to suggest your own.
 
-For full history please see [CHANGELOG.md](https://github.com/ratgdo/homekit-ratgdo32/blob/main/CHANGELOG.md)
+For Gelidus and upstream release history, see [CHANGELOG.md](CHANGELOG.md).
 
 ### Known Issues
 

@@ -86,7 +86,7 @@ void LED::flash(uint64_t ms)
     if (!LEDtimer.active())
     {
         if (pin != UINT8_MAX)
-        digitalWrite(pin, activeState);
+            digitalWrite(pin, activeState);
         currentState = activeState;
         if (stateChangeCallback)
             stateChangeCallback(state());

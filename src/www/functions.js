@@ -24,6 +24,17 @@ var setGDOcmds = {              // setGDO commands that are not sent from server
 var gitUser = "gelidusresearch";         // default git user.
 var gitRepo = "homekit-ratgdo32"; // default git repository.
 
+function selectFirmwareAsset(assets, revision) {
+    const firmware = assets.filter(asset => asset.name.endsWith(".firmware.bin"));
+    if (gitRepo !== "homekit-ratgdo32") {
+        return firmware.find(asset => asset.name.startsWith(gitRepo + "-"));
+    }
+    if (!["rev1", "rev2"].includes(revision)) return undefined;
+    // Prefer the exact board even if a legacy generic asset appears first.
+    return firmware.find(asset => asset.name.startsWith(`homekit-grgdo1-${revision}-`)) ||
+        firmware.find(asset => /^homekit-grgdo1-v\d+\./.test(asset.name));
+}
+
 var passwordHash = undefined;
 const www_realm = "RATGDO Login Required";
 
@@ -156,7 +167,7 @@ function toggleDCOpenClose(radio) {
     document.getElementById("dcDebounceDuration").disabled = (value != 3);
     document.getElementById("motionMotion").disabled = (value != 2);
     // document.getElementById("encoderEnabled").disabled = (value != 3);
-    document.getElementById("wpDisconnectOnTx").disabled = (value != 1);
+    document.getElementById("wpDisconnectOnTx").disabled = (value != 1) || serverStatus.wpDisconnectSupported === false;
     toggleEncoderOptions();
     toggleHardwiredBypassRow();
 }
@@ -428,7 +439,7 @@ function setElementsFromStatus(status) {
                 document.getElementById("motionMotion").disabled = (value != 2);
                 //document.getElementById("encoderEnabled").disabled = (value != 3);
                 document.getElementById("gdoFirmwareRow").style.display = (value == 2) ? "table-row" : "none";
-                document.getElementById("wpDisconnectOnTx").disabled = (value != 1);
+                document.getElementById("wpDisconnectOnTx").disabled = (value != 1) || serverStatus.wpDisconnectSupported === false;
                 toggleEncoderOptions();
                 toggleHardwiredBypassRow();
                 break;
@@ -500,8 +511,8 @@ function setElementsFromStatus(status) {
                 document.getElementById("vehicleSetting").style.display = (value) ? "table-row" : "none";
                 document.getElementById("vehicleSettingsSpacer").style.display = (value) ? "table-row" : "none";
                 setVehicleConfigVisibility(value);
-                document.getElementById("laserSetting").style.display = (value) ? "table-row" : "none";
-                document.getElementById("laserOnDoorOpenRow").style.display = (value) ? "table-row" : "none";
+                document.getElementById("laserSetting").style.display = (value && serverStatus.laserSupported !== false) ? "table-row" : "none";
+                document.getElementById("laserOnDoorOpenRow").style.display = (value && serverStatus.laserSupported !== false) ? "table-row" : "none";
                 break;
             case "vehicleThreshold":
                 document.getElementById(key).value = value;
@@ -511,6 +522,14 @@ function setElementsFromStatus(status) {
             case "vehicleDist":
                 document.getElementById(key).innerHTML = value;
                 document.getElementById("vehicleDistInch").innerHTML = Math.round(value / .254) / 10;
+                break;
+            case "laserSupported":
+                document.getElementById("laserSetting").style.display = value && serverStatus.distanceSensor ? "table-row" : "none";
+                document.getElementById("laserOnDoorOpenRow").style.display = value && serverStatus.distanceSensor ? "table-row" : "none";
+                break;
+            case "wpDisconnectSupported":
+                document.getElementById("wpDisconnectOnTxRow").style.display = value ? "table-row" : "none";
+                document.getElementById("wpDisconnectOnTx").disabled = !value || serverStatus.GDOSecurityType != 1;
                 break;
             case "laserEnabled":
                 document.getElementById(key).checked = value;
@@ -996,30 +1015,7 @@ async function checkVersion(progress = "dotdot1") {
     serverStatus.latestVersion = latest;
     if (latest) {
         console.log("Newest version: " + latest.tag_name);
-        const asset = latest.assets.find((obj) => {
-            if (gitRepo == "homekit-ratgdo32") {
-                // Filter by hardware revision (default to rev2 if not set)
-                const hwRev = serverStatus.hardwareRevision || "rev2";
-                console.log(`Searching for firmware matching hardware revision: ${hwRev}`);
-
-                // Check for firmware with hardware revision in name (new format)
-                const hasRevisionMatch = (obj.content_type === "application/octet-stream") &&
-                       (obj.name.startsWith("homekit-grgdo1") &&
-                        obj.name.includes("firmware") &&
-                        obj.name.includes(hwRev));
-
-                // Fallback: Check for firmware without hardware revision (old format)
-                const hasGenericMatch = (obj.content_type === "application/octet-stream") &&
-                       (obj.name.startsWith("homekit-grgdo1") &&
-                        obj.name.includes("firmware") &&
-                        !obj.name.includes("rev1") &&
-                        !obj.name.includes("rev2"));
-
-                return hasRevisionMatch || hasGenericMatch;
-            } else {
-                return (obj.content_type === "application/octet-stream") && (obj.name.startsWith(gitRepo));
-            }
-        });
+        const asset = selectFirmwareAsset(latest.assets, serverStatus.hardwareRevision || "rev2");
         if (latest?.body) {
             document.getElementById("firmwareDescription").innerHTML = marked.parse(latest.body);
         }
