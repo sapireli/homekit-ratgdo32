@@ -27,9 +27,11 @@ namespace {
 constexpr unsigned MAX_PCBS = 16;
 constexpr unsigned MAX_SEGMENTS = 64;
 constexpr uint32_t SAMPLE_MS = 5000;
-static_assert(ATOMIC_INT_LOCK_FREE == 2 && ATOMIC_POINTER_LOCK_FREE == 2, "Diagnostic hooks must not lock");
 std::atomic<uint32_t> phase{0}, phaseAt{0}, loops{0}, homekitAt{0}, homekitLoops{0};
-std::atomic<uint32_t> failures{0}, failedSize{0}, failedCaps{0}, firstBadHeap{0};
+std::atomic<uint32_t> firstBadHeap{0};
+struct AllocationFailures { uint32_t count, size, caps; };
+DRAM_ATTR portMUX_TYPE allocationMux = portMUX_INITIALIZER_UNLOCKED;
+DRAM_ATTR AllocationFailures allocationFailures{};
 struct HeapLatch { uint32_t magic, at, phase, phaseAge, loops, homekitAge, failures; };
 RTC_NOINIT_ATTR HeapLatch retainedHeapFailure;
 constexpr uint32_t LATCH_MAGIC = 0x52444941;
@@ -62,11 +64,23 @@ QueueHandle_t tcpQueue, sampleQueue;
 StaticTask_t observerStorage, emitterStorage;
 StackType_t observerStack[4096 / sizeof(StackType_t)], emitterStack[4096 / sizeof(StackType_t)];
 
-// No allocation, logging, locks, WiFi calls or formatted output in this hook.
+// ESP32's ISR/task critical-section primitives share the same implementation.
+// This dedicated lock is held for three writes only. Readers release it before
+// any heap or socket call, so it cannot form a lock cycle with the allocator.
+// No allocation, logging, WiFi calls or formatted output in this hook.
 void IRAM_ATTR allocationFailed(size_t size, uint32_t caps, const char *) {
-    failedSize.store(static_cast<uint32_t>(size), std::memory_order_relaxed);
-    failedCaps.store(caps, std::memory_order_relaxed);
-    failures.fetch_add(1, std::memory_order_relaxed);
+    portENTER_CRITICAL_ISR(&allocationMux);
+    allocationFailures.size = static_cast<uint32_t>(size);
+    allocationFailures.caps = caps;
+    ++allocationFailures.count;
+    portEXIT_CRITICAL_ISR(&allocationMux);
+}
+
+AllocationFailures allocationSnapshot() {
+    portENTER_CRITICAL(&allocationMux);
+    const AllocationFailures snapshot = allocationFailures;
+    portEXIT_CRITICAL(&allocationMux);
+    return snapshot;
 }
 
 uint32_t segmentBytes(const tcp_seg *segment, uint32_t &truncated) {
@@ -133,6 +147,7 @@ void observe(void *) {
         Sample sample{};
         sample.at = milliseconds();
         sample.sample = ++count;
+        const AllocationFailures allocation = allocationSnapshot();
         sample.observerLowStack = uxTaskGetStackHighWaterMark(nullptr);
         sample.emitterLowStack = emitterLowStack.load(std::memory_order_relaxed);
         sample.phase = phase.load(std::memory_order_relaxed);
@@ -161,7 +176,7 @@ void observe(void *) {
                 retainedHeapFailure.phaseAge = sample.phaseAge;
                 retainedHeapFailure.loops = sample.loops;
                 retainedHeapFailure.homekitAge = sample.homekitAge;
-                retainedHeapFailure.failures = failures.load(std::memory_order_relaxed);
+                retainedHeapFailure.failures = allocation.count;
                 retainedHeapFailure.magic = LATCH_MAGIC;
             }
         }
@@ -175,9 +190,9 @@ void observe(void *) {
             sample.largest = heap_caps_get_largest_free_block(caps);
             sample.minimum = heap_caps_get_minimum_free_size(caps);
         }
-        sample.failures = failures.load(std::memory_order_relaxed);
-        sample.failedSize = failedSize.load(std::memory_order_relaxed);
-        sample.failedCaps = failedCaps.load(std::memory_order_relaxed);
+        sample.failures = allocation.count;
+        sample.failedSize = allocation.size;
+        sample.failedCaps = allocation.caps;
         xQueuePeek(tcpQueue, &sample.tcp, 0);
         if (tcpPending.load(std::memory_order_acquire)) {
             const uint32_t requestedAt = tcpRequestedAt.load(std::memory_order_relaxed);
