@@ -22,12 +22,12 @@
 #ifdef ESP32
 #include <shared_mutex>
 #include <mutex>
-#include "../lib/ratgdo/sse_write.h"
 #endif
 
 // Third-party sensor libraries
 #include <DHT.h>
-#include "sse_lifecycle.h"
+#include <atomic>
+#include <cstdint>
 
 // ESP system includes
 #include <Ticker.h>
@@ -192,6 +192,37 @@ constexpr char gitTaggedURL[] = "https://raw.githubusercontent.com/" _GITUSER "/
 // Just reloading page causes register on new channel.  So we need a reasonable number
 // to accommodate "extra" until old one is detected as disconnected.
 #define SSE_MAX_CHANNELS 8
+// SSE lifecycle helpers are local to the HTTP implementation.
+// Claim removal before cleanup or diagnostics, either of which may log and
+// synchronously reenter the broadcaster. Only the winning caller owns cleanup.
+template <typename Cleanup, typename Notify>
+bool retireSSESubscription(std::atomic<bool> &active,
+                           std::atomic<uint32_t> &count,
+                           Cleanup cleanup, Notify notify)
+{
+    if (!active.exchange(false))
+        return false;
+    const uint32_t remaining = count.fetch_sub(1) - 1;
+    cleanup();
+    notify(remaining);
+    return true;
+}
+
+// Ticker callbacks never touch clients or wait for the lifecycle lock.
+inline void requestSSEHeartbeat(std::atomic<bool> &pending) { pending.store(true); }
+inline bool takeSSEHeartbeat(std::atomic<bool> &pending) { return pending.exchange(false); }
+
+// The caller holds the lifecycle lock while checking and assigning the client.
+template <typename UUID, typename Client>
+bool bindSSEClient(bool active, const UUID &registeredUUID,
+                   const UUID &requestedUUID, Client &current, const Client &incoming)
+{
+    if (!active || registeredUUID != requestedUUID)
+        return false;
+    current = incoming;
+    return true;
+}
+
 struct SSESubscription
 {
     IPAddress clientIP;
@@ -211,7 +242,40 @@ SSESubscription subscription[SSE_MAX_CHANNELS];
 std::atomic<SSESubscription *> firmwareUpdateSub{nullptr};
 std::atomic<uint32_t> subscriptionCount{0};
 
-#include "sse_lock.h"
+// All subscription fields and clients are protected by this lock. Logger
+// broadcasts must never wait: callers can hold the logger's own mutex.
+#ifdef ESP8266
+static bool sseLocked = false;
+#else
+static SemaphoreHandle_t sseMutex = NULL;
+#endif
+class SSELock
+{
+public:
+    explicit SSELock(bool tryOnly = false)
+    {
+#ifdef ESP8266
+        (void)tryOnly;
+        acquired = !sseLocked;
+        if (acquired) sseLocked = true;
+#else
+        acquired = sseMutex && xSemaphoreTake(sseMutex, tryOnly ? 0 : portMAX_DELAY) == pdTRUE;
+#endif
+    }
+    ~SSELock()
+    {
+        if (!acquired) return;
+#ifdef ESP8266
+        sseLocked = false;
+#else
+        xSemaphoreGive(sseMutex);
+#endif
+    }
+    explicit operator bool() const { return acquired; }
+private:
+    bool acquired;
+};
+
 
 // Performance monitoring
 static uint32_t request_count = 0;
@@ -260,10 +324,10 @@ bool clientWrite(WiFiClient client, const char *data)
     // NetworkClient::write() retries select() for seconds even when its stream
     // timeout is short. Never let a stalled browser block the GDO/HTTP loop,
     // the timer task, or a HomeKit task emitting a log message.
-    return write_sse_frame(data, len,
-        [&](const char *p, size_t n) -> long {
-            return send(client.fd(), p, n, MSG_DONTWAIT);
-        }, [&] { client.stop(); });
+    if (send(client.fd(), data, len, MSG_DONTWAIT) == static_cast<ssize_t>(len))
+        return true;
+    client.stop();
+    return false;
 #else
     if (client.write(data, len) == len)
         return true;

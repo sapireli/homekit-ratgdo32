@@ -1,4 +1,23 @@
-#include "../src/log_snapshot.h"
+#!/usr/bin/env python3
+"""Exercise the source logger snapshot helper under ASan and UBSan."""
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCE = Path(os.environ.get("LOG_SNAPSHOT_TEST_SOURCE", ROOT / "src/log.cpp"))
+
+
+class LogSnapshotTest(unittest.TestCase):
+    def test_slow_output_preserves_concurrent_logging_and_snapshot(self):
+        source = SOURCE.read_text()
+        helper_start = source.index("// Keep allocation and output outside the logger lock.")
+        helper_end = source.index("// Logger tag", helper_start)
+        helper = source[helper_start:helper_end]
+        harness = "#include <cstdlib>\n#include <cstring>\n#include <memory>\n" + helper + r'''
+
 
 #include <cassert>
 #include <chrono>
@@ -75,3 +94,17 @@ int main()
         [&](const Ring *snapshot) { assert(snapshot == nullptr); wrote = true; }));
     assert(!locked && wrote);
 }
+'''
+        with tempfile.TemporaryDirectory() as tmp:
+            cpp = Path(tmp) / "log-snapshot.cpp"
+            executable = Path(tmp) / "log-snapshot"
+            cpp.write_text(harness)
+            subprocess.run([os.environ.get("CXX", "c++"), "-std=c++11", "-pthread",
+                            "-Wall", "-Wextra", "-Werror", "-g", "-O1",
+                            "-fsanitize=address,undefined", "-fno-omit-frame-pointer",
+                            str(cpp), "-o", str(executable)], check=True)
+            subprocess.run([str(executable)], check=True)
+
+
+if __name__ == "__main__":
+    unittest.main()

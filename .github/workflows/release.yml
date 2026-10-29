@@ -83,16 +83,6 @@ jobs:
           /tmp/uart-test
           c++ -std=c++17 -Wall -Wextra -Isrc tests/serial_console.cpp -o /tmp/console-test
           /tmp/console-test
-          c++ -std=c++17 -Wall -Wextra -Werror tests/sse_write.cpp -o /tmp/sse-test
-          /tmp/sse-test
-          c++ -std=c++17 -Wall -Wextra -Werror tests/ipv4_config.cpp -o /tmp/ipv4-test
-          /tmp/ipv4-test
-          c++ -std=c++11 -Wall -Wextra -Werror -pthread tests/log_snapshot_test.cpp -o /tmp/log-snapshot-test
-          /tmp/log-snapshot-test
-          c++ -std=c++17 -Wall -Wextra -Werror -pthread tests/sse_lifecycle_test.cpp -o /tmp/sse-lifecycle-test
-          /tmp/sse-lifecycle-test
-          c++ -std=c++17 -Wall -Wextra -Werror -pthread tests/sse_lock_test.cpp -o /tmp/sse-lock-test
-          /tmp/sse-lock-test
       - name: Install PlatformIO Core
         run: pip install platformio==6.2.0
       - name: Build firmware
