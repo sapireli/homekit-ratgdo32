@@ -1,4 +1,4 @@
-#include "../src/sse_lifecycle.h"
+// SOURCE_LIFECYCLE_HELPERS
 
 #include <cassert>
 #include <functional>

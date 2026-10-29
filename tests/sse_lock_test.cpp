@@ -17,8 +17,8 @@ int xSemaphoreTake(SemaphoreHandle_t mutex, int wait) {
     return pdTRUE;
 }
 void xSemaphoreGive(SemaphoreHandle_t mutex) { ownedMutex = nullptr; mutex->unlock(); }
-#include "../src/sse_lock.h"
-#include "../src/sse_lifecycle.h"
+// SOURCE_SSE_LOCK
+// SOURCE_LIFECYCLE_HELPERS
 
 int main() {
     std::mutex mutex;
