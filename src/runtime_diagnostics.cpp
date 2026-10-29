@@ -63,7 +63,7 @@ StaticTask_t observerStorage, emitterStorage;
 StackType_t observerStack[4096 / sizeof(StackType_t)], emitterStack[4096 / sizeof(StackType_t)];
 
 // No allocation, logging, locks, WiFi calls or formatted output in this hook.
-void allocationFailed(size_t size, uint32_t caps, const char *) {
+void IRAM_ATTR allocationFailed(size_t size, uint32_t caps, const char *) {
     failedSize.store(static_cast<uint32_t>(size), std::memory_order_relaxed);
     failedCaps.store(caps, std::memory_order_relaxed);
     failures.fetch_add(1, std::memory_order_relaxed);
@@ -113,6 +113,17 @@ void snapshotTcp(void *) {
     if (pcb) snapshot.truncated = 1;
     xQueueOverwrite(tcpQueue, &snapshot);
     tcpPending.store(0, std::memory_order_release);
+}
+
+void requestTcpSnapshot() {
+    if (!tcpQueue || firstBadHeap.load(std::memory_order_relaxed)) return;
+    uint32_t idle = 0;
+    if (!tcpPending.compare_exchange_strong(idle, 1, std::memory_order_acq_rel)) return;
+    tcpRequestedAt.store(milliseconds(), std::memory_order_relaxed);
+    if (tcpip_try_callback(snapshotTcp, nullptr) != ERR_OK) {
+        tcpPending.store(0, std::memory_order_release);
+        tcpRejected.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 void observe(void *) {
@@ -169,14 +180,10 @@ void observe(void *) {
         sample.failedCaps = failedCaps.load(std::memory_order_relaxed);
         xQueuePeek(tcpQueue, &sample.tcp, 0);
         if (tcpPending.load(std::memory_order_acquire)) {
-            sample.tcpPendingAge = sample.at - tcpRequestedAt.load(std::memory_order_relaxed);
+            const uint32_t requestedAt = tcpRequestedAt.load(std::memory_order_relaxed);
+            sample.tcpPendingAge = milliseconds() - requestedAt;
         } else if (sample.integrity) {
-            tcpRequestedAt.store(sample.at, std::memory_order_relaxed);
-            tcpPending.store(1, std::memory_order_release);
-            if (tcpip_try_callback(snapshotTcp, nullptr) != ERR_OK) {
-                tcpPending.store(0, std::memory_order_release);
-                tcpRejected.fetch_add(1, std::memory_order_relaxed);
-            }
+            requestTcpSnapshot();
         }
         sample.tcpRejected = tcpRejected.load(std::memory_order_relaxed);
         sample.sendErrors = sendErrors.load(std::memory_order_relaxed);
@@ -252,6 +259,9 @@ void runtime_diagnostics_homekit_progress() {
     homekitTask.store(xTaskGetCurrentTaskHandle(), std::memory_order_relaxed);
     homekitAt.store(milliseconds(), std::memory_order_relaxed);
     homekitLoops.fetch_add(1, std::memory_order_relaxed);
+}
+void runtime_diagnostics_capture_tcp() {
+    requestTcpSnapshot();
 }
 void runtime_diagnostics_setup() {
     mainTask.store(xTaskGetCurrentTaskHandle(), std::memory_order_relaxed);
