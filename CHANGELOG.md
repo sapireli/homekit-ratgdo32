@@ -10,7 +10,7 @@ All notable changes to `homekit-ratgdo32` will be documented in this file. This 
 * Fix Rev1 UART/I2C ownership, conflicting GPIO outputs, and inactive-LOW transmitter handling during startup, shutdown, restart, and panic.
 * Include Security+ 1.0 RX bias, initialization, and echo-timing corrections. The affected wall panel in Gelidus #19 still needs hardware validation.
 * Pause HomeSpan safely during OTA and retain the checksum argument until copied.
-* Fix slow-client browser/log handling, SSE lifecycle races, IPv6-first IPv4 reporting, and HomeSpan partial transport I/O.
+* Keep browser event writes nonblocking and stream ESP32 log downloads in bounded chunks outside the logger lock, without allocating a second log buffer. Fix SSE lifecycle races, IPv6-first IPv4 reporting, and HomeSpan partial transport I/O.
 * Correct stop/reverse state ordering and avoid close timers for ignored or rejected commands.
 * Fix the log ring's exact-fill overflow.
 * Include upstream's discrete dry-contact outputs, obstruction-triggered parking assist, longer door-duration support, and larger status JSON buffer. Keep unsupported GRGDO1 outputs disconnected by default.
