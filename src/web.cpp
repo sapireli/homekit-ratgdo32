@@ -36,10 +36,6 @@
 #undef INADDR_NONE
 #endif
 
-#ifdef ESP32
-#include "../lib/ratgdo/sse_write.h"
-#endif
-
 // RATGDO project includes
 #ifdef USE_GDOLIB
 #include "gdo.h"
@@ -250,10 +246,10 @@ bool clientWrite(WiFiClient client, const char *data)
     // NetworkClient::write() retries select() for seconds even when its stream
     // timeout is short. Never let a stalled browser block the GDO/HTTP loop,
     // the timer task, or a HomeKit task emitting a log message.
-    return write_sse_frame(data, len,
-        [&](const char *p, size_t n) -> long {
-            return send(client.fd(), p, n, MSG_DONTWAIT);
-        }, [&] { client.stop(); });
+    if (send(client.fd(), data, len, MSG_DONTWAIT) == static_cast<ssize_t>(len))
+        return true;
+    client.stop();
+    return false;
 #else
     if (client.write(data, len) == len)
         return true;
