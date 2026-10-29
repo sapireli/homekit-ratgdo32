@@ -102,10 +102,17 @@ void SSEHandler(uint32_t channel);
 void add_static_mdns();
 void add_dynamic_mdns();
 
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+void handle_http_lifecycle();
+#endif
+
 // Built in URI handlers
 const char restEvents[] = "/rest/events/";
 const std::unordered_map<std::string, std::pair<const HTTPMethod, void (*)()>> builtInUri = {
     {"/status.json", {HTTP_GET, handle_status}},
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+    {"/diag/http.json", {HTTP_GET, handle_http_lifecycle}},
+#endif
     {"/reset", {HTTP_POST, handle_reset}},
     {"/reboot", {HTTP_POST, handle_reboot}},
     {"/setgdo", {HTTP_POST, handle_setgdo}},
@@ -161,6 +168,25 @@ struct tcpip_callback_msg *httpOwnedMessage = nullptr;
 std::atomic<bool> httpOwnedDone{false};
 bool httpOwnedPending = false;
 uint32_t httpOwnedNow = 0, httpOwnedPolledAt = 0, httpOwnedPayload = 0;
+// Main-only evidence: never read callback-owned entries/payload from a handler.
+uint32_t httpOwnedCurrentPayload = 0, httpOwnedLastPayload = 0;
+constexpr size_t HTTP_OWNED_JSON_SIZE = 384;
+
+int httpOwnedEvidence(char *json, size_t capacity)
+{
+    return snprintf(json, capacity,
+                    "{\"tracked\":%lu,\"released\":%lu,\"aborted\":%lu,\"quarantined\":%lu,"
+                    "\"callbackPostFailures\":%lu,\"maximumRetainedPayload\":%lu,"
+                    "\"currentRetainedPayload\":%lu,\"lastRetainedPayload\":%lu}",
+                    static_cast<unsigned long>(httpOwnedCounters.tracked),
+                    static_cast<unsigned long>(httpOwnedCounters.released),
+                    static_cast<unsigned long>(httpOwnedCounters.aborted),
+                    static_cast<unsigned long>(httpOwnedCounters.quarantined),
+                    static_cast<unsigned long>(httpOwnedCounters.postFailures),
+                    static_cast<unsigned long>(httpOwnedCounters.maximumRetainedPayload),
+                    static_cast<unsigned long>(httpOwnedCurrentPayload),
+                    static_cast<unsigned long>(httpOwnedLastPayload));
+}
 
 // Core callback: no application logging, sockets, owner methods or pointer
 // retention beyond the retained owner. Main cannot touch owners while pending.
@@ -280,6 +306,7 @@ bool httpOwnedPoll()
         if (!httpOwnedDone.load(std::memory_order_acquire))
             return false;
         httpOwnedPending = false;
+        httpOwnedLastPayload = httpOwnedPayload;
         httpOwnedCounters.maximumRetainedPayload = std::max(httpOwnedCounters.maximumRetainedPayload, httpOwnedPayload);
         for (auto &entry : httpOwned)
         {
@@ -343,6 +370,10 @@ bool httpOwnedPoll()
         }
         active = true;
     }
+    httpOwnedCurrentPayload = 0;
+    for (const auto &entry : httpOwned)
+        if (entry.state == HttpOwnedState::Active)
+            httpOwnedCurrentPayload += entry.retained;
     if (active && static_cast<uint32_t>(now - httpOwnedPolledAt) >= HTTP_OWNED_POLL_MS)
     {
         httpOwnedPolledAt = now;
@@ -933,6 +964,25 @@ static bool requestAuthenticated()
     }
     return true;
 }
+
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+void handle_http_lifecycle()
+{
+    if (!requestAuthenticated())
+        return;
+    // Separate bounded output: status.json already approaches its capacity.
+    // This runs on the web loop; all values below are published by main only.
+    char json[HTTP_OWNED_JSON_SIZE];
+    const int length = httpOwnedEvidence(json, sizeof(json));
+    if (length < 0 || static_cast<size_t>(length) >= sizeof(json))
+    {
+        server.send(500, "text/plain", "HTTP diagnostic overflow");
+        return;
+    }
+    server.sendHeader(F("Cache-Control"), F("no-cache, no-store"));
+    server.send(200, type_json, json);
+}
+#endif
 
 void handle_auth()
 {
