@@ -29,31 +29,13 @@
 #include "utilities.h"
 #include "web.h"
 #include "comms.h"
-#include <cstdlib>
 #include <cstring>
-#include <memory>
 
-// Keep allocation and output outside the logger lock. The ring is copied as a
-// whole so its head, wrap flag, and bytes describe the same instant.
-template <typename Buffer, typename Lock, typename Unlock, typename Output>
-static bool withLogSnapshot(const Buffer *source, Lock lock, Unlock unlock, Output output,
-                            void *(*allocate)(size_t) = std::malloc)
-{
-    if (!source)
-    {
-        output(source);
-        return true;
-    }
-    std::unique_ptr<Buffer, decltype(&std::free)> snapshot(
-        static_cast<Buffer *>(allocate(sizeof(Buffer))), &std::free);
-    if (!snapshot)
-        return false;
-    lock();
-    std::memcpy(snapshot.get(), source, sizeof(Buffer));
-    unlock();
-    output(snapshot.get());
-    return true;
-}
+#ifndef ESP8266
+// Protected by logMutex. Absolute byte positions let a reader detect when
+// newer messages have overwritten bytes it has not copied yet.
+static uint64_t logAppendBytes = 0;
+#endif
 
 // Logger tag
 static const char *TAG = "ratgdo-logger";
@@ -277,6 +259,9 @@ void LOG::logToBuffer(const char *fmt, va_list args)
         msgBuffer->head += len;
     }
     msgBuffer->buffer[msgBuffer->head] = 0; // null terminate
+#ifndef ESP8266
+    logAppendBytes += len;
+#endif
 
     static bool inFn = false;
     if (!inFn)
@@ -474,69 +459,120 @@ void LOG::printSavedLog(Print &outputDev)
 
 void LOG::printMessageLog(Print &outputDev, bool slow)
 {
-    auto printLog = [&](const logBuffer *buffer)
+#ifndef ESP8266
+    uint64_t end = 0;
+    uint64_t next = 0;
+    size_t index = 0;
+    char chunk[256];
+    size_t length = 0;
+    // Called only with logMutex held; the stack chunk remains stable during I/O.
+    auto copyChunk = [&]()
     {
-        if (clockSet)
-        {
-            time_t now = time(NULL);
-            outputDev.printf_P(PSTR("Server boot time: %llu (%s)\n"), lastRebootAt, timeString(lastRebootAt));
-            outputDev.printf_P(PSTR("Server log time: %llu (%s)\n"), now, timeString(now));
-        }
-        int64_t upTime = (int64_t)_millis();
-        outputDev.printf_P(PSTR("Server uptime: %llu ms (%s)\n"), upTime, toHHMMSSmmm((_millis_t)upTime));
-        outputDev.println("Firmware version: " AUTO_VERSION);
-        outputDev.printf_P(PSTR("Free heap: %d\n"), free_heap);
-        outputDev.printf_P(PSTR("Minimum heap: %d\n"), min_heap);
-        if (doorControlType == DOOR_CONTROL_SEC_PLUS_V2)
-        {
-            outputDev.printf_P(PSTR("GDO Firmware version: %s\n"), gdoFirmwareVersion);
-        }
-        outputDev.printf_P(PSTR("\n"));
-        outputDev.flush();
+        const size_t capacity = sizeof(msgBuffer->buffer);
+        length = static_cast<size_t>(std::min<uint64_t>(sizeof(chunk), end - next));
+        const size_t first = std::min(length, capacity - index);
+        memcpy(chunk, msgBuffer->buffer + index, first);
+        if (first < length)
+            memcpy(chunk + first, msgBuffer->buffer, length - first);
+        index = (index + length) % capacity;
+        next += length;
+    };
+    TAKE_MUTEX();
+    if (msgBuffer)
+    {
+        end = logAppendBytes;
+        const size_t capacity = sizeof(msgBuffer->buffer);
+        const size_t saved = msgBuffer->wrapped ? capacity - 1 : msgBuffer->head;
+        next = end - saved;
+        index = msgBuffer->wrapped ? (msgBuffer->head + 1) % capacity : 0;
+        if (next < end)
+            copyChunk();
+    }
+    GIVE_MUTEX();
+#endif
 
-        if (buffer)
+    if (clockSet)
+    {
+        time_t now = time(NULL);
+        outputDev.printf_P(PSTR("Server boot time: %llu (%s)\n"), lastRebootAt, timeString(lastRebootAt));
+        outputDev.printf_P(PSTR("Server log time: %llu (%s)\n"), now, timeString(now));
+    }
+    int64_t upTime = (int64_t)_millis();
+    outputDev.printf_P(PSTR("Server uptime: %llu ms (%s)\n"), upTime, toHHMMSSmmm((_millis_t)upTime));
+    outputDev.println("Firmware version: " AUTO_VERSION);
+    outputDev.printf_P(PSTR("Free heap: %d\n"), free_heap);
+    outputDev.printf_P(PSTR("Minimum heap: %d\n"), min_heap);
+    if (doorControlType == DOOR_CONTROL_SEC_PLUS_V2)
+    {
+        outputDev.printf_P(PSTR("GDO Firmware version: %s\n"), gdoFirmwareVersion);
+    }
+    outputDev.printf_P(PSTR("\n"));
+    outputDev.flush();
+
+#ifdef ESP8266
+    // Single threaded; preserve the existing IRAM output path.
+    const logBuffer *buffer = msgBuffer;
+    if (buffer)
+    {
+        // +1 head points to a zero (null terminator of previous log line) which we need to skip.
+        // +3 want to round up to multiple of 4
+        size_t start = ((buffer->head + 1 + 3) & ~0x03) % sizeof(buffer->buffer);
+        size_t len = sizeof(buffer->buffer) - start;
+        // On slow output devices (e.g. network), chunk up to protect against buffer overflow
+        size_t CHUNK = (slow) ? TCP_SND_BUF / 2 : sizeof(buffer->buffer);
+        size_t chunk;
+        if (buffer->wrapped != 0)
         {
-            // +1 head points to a zero (null terminator of previous log line) which we need to skip.
-            // +3 want to round up to multiple of 4
-            size_t start = ((buffer->head + 1 + 3) & ~0x03) % sizeof(buffer->buffer);
-            size_t len = sizeof(buffer->buffer) - start;
-            // On slow output devices (e.g. network), chunk up to protect against buffer overflow
-            size_t CHUNK = (slow) ? TCP_SND_BUF / 2 : sizeof(buffer->buffer);
-            size_t chunk;
-            if (buffer->wrapped != 0)
-            {
-                while (len)
-                {
-                    chunk = std::min(len, CHUNK);
-                    YIELD();
-                    outputDev.write(&buffer->buffer[start], chunk);
-                    if (slow)
-                        outputDev.flush();
-                    len -= chunk;
-                    start += chunk;
-                }
-            }
-            start = 0;
-            len = strlen(buffer->buffer); // must be null terminated
             while (len)
             {
                 chunk = std::min(len, CHUNK);
                 YIELD();
                 outputDev.write(&buffer->buffer[start], chunk);
-                outputDev.flush();
+                if (slow)
+                    outputDev.flush();
                 len -= chunk;
                 start += chunk;
             }
         }
-    };
-#ifdef ESP8266
-    // Single threaded; preserve the allocation-free path on the smaller heap.
-    printLog(msgBuffer);
+        start = 0;
+        len = strlen(buffer->buffer); // must be null terminated
+        while (len)
+        {
+            chunk = std::min(len, CHUNK);
+            YIELD();
+            outputDev.write(&buffer->buffer[start], chunk);
+            outputDev.flush();
+            len -= chunk;
+            start += chunk;
+        }
+    }
 #else
-    // Network writes and flushes can block. Only copying the ring may hold
-    // logMutex, so other tasks (including the TCP/IP task) can keep logging.
-    if (!withLogSnapshot(msgBuffer, [this]() { TAKE_MUTEX(); }, [this]() { GIVE_MUTEX(); }, printLog))
-        outputDev.println("Log snapshot unavailable: insufficient memory");
+    while (length)
+    {
+        YIELD();
+        if (outputDev.write(reinterpret_cast<const uint8_t *>(chunk), length) != length)
+            return;
+        if (slow)
+            outputDev.flush();
+
+        bool overwritten = false;
+        TAKE_MUTEX();
+        length = 0;
+        if (next < end)
+        {
+            if (logAppendBytes - next > sizeof(msgBuffer->buffer) - 1)
+                overwritten = true;
+            else
+                copyChunk();
+        }
+        GIVE_MUTEX();
+        if (overwritten)
+        {
+            outputDev.print("\nLog truncated: newer messages overwrote unread log data.\n");
+            return;
+        }
+    }
+    outputDev.flush();
 #endif
 }
 
