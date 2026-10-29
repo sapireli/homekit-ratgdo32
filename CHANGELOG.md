@@ -6,7 +6,7 @@ All notable changes to `homekit-ratgdo32` will be documented in this file. This 
 
 ## v1.4.3 (unreleased) - Gelidus Research
 
-* Merge upstream through `0e1fe84` (v3.5.6 development), preserving GRGDO1 Rev1/Rev2 pin assignments, sensors, and HomeKit vehicle controls.
+* Merge upstream through `20c1dfd` (v3.5.6 development), preserving GRGDO1 Rev1/Rev2 pin assignments, sensors, and HomeKit vehicle controls.
 * Fix Rev1 UART/I2C ownership, conflicting GPIO outputs, and inactive-LOW transmitter handling during startup, shutdown, restart, and panic.
 * Include Security+ 1.0 RX bias, initialization, and echo-timing corrections. The affected wall panel in Gelidus #19 still needs hardware validation.
 * Pause HomeSpan safely during OTA and retain the checksum argument until copied.
