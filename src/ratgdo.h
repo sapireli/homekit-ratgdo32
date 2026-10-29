@@ -56,6 +56,8 @@
 #define DRY_CONTACT_OPEN_PIN D5  // dry contact for open door limit switch
 #define DRY_CONTACT_CLOSE_PIN D6 // dry contact for close door limit switch
 #define DRY_CONTACT_LIGHT_PIN D3 // dry contact for light toggle switch
+#define DISCRETE_OPEN_PIN D0     // alternative (or in addition) to toggle, can use discrete open control
+#define DISCRETE_CLOSE_PIN D8    // alternative (or in addition) to toggle, can use discrete close control
 
 #ifndef LED_BUILTIN_ON_STATE
 #define LED_BUILTIN_ON_STATE LOW
@@ -141,11 +143,15 @@ const gpio_num_t STATUS_DOOR_PIN = (gpio_num_t)STATUS_DOOR_GPIO;
 #endif
 const gpio_num_t STATUS_OBST_PIN = (gpio_num_t)STATUS_OBST_GPIO;
 
-// !!! this is conflicting with above status pins
-#ifdef USE_GDOLIB
-const gpio_num_t DISCRETE_OPEN_PIN = GPIO_NUM_26;  // alternative (or in addition) to toggle, can use discrete open control
-const gpio_num_t DISCRETE_CLOSE_PIN = GPIO_NUM_25; // alternative (or in addition) to toggle, can use discrete close control
+// Shares GPIO with STATUS_DOOR_PIN / STATUS_OBST_PIN when in dry contact mode
+#ifndef DISCRETE_OPEN_GPIO
+#define DISCRETE_OPEN_GPIO STATUS_DOOR_GPIO
 #endif
+const gpio_num_t DISCRETE_OPEN_PIN = (gpio_num_t)DISCRETE_OPEN_GPIO; // alternative (or in addition) to toggle, can use discrete open control
+#ifndef DISCRETE_CLOSE_GPIO
+#define DISCRETE_CLOSE_GPIO STATUS_OBST_GPIO
+#endif
+const gpio_num_t DISCRETE_CLOSE_PIN = (gpio_num_t)DISCRETE_CLOSE_GPIO; // alternative (or in addition) to toggle, can use discrete close control
 
 #ifdef RATGDO32_DISCO
 const gpio_num_t BEEPER_PIN = GPIO_NUM_33;
@@ -178,6 +184,8 @@ constexpr bool grgdo_output_pin_available(gpio_num_t pin)
 static_assert(grgdo_output_pin_available(STATUS_DOOR_PIN), "Door status output overlaps a GRGDO1 input or I2C pin");
 static_assert(grgdo_output_pin_available(STATUS_OBST_PIN), "Obstruction status output overlaps a GRGDO1 input or I2C pin");
 static_assert(grgdo_output_pin_available(LASER_PIN), "Laser output overlaps a GRGDO1 input or I2C pin");
+static_assert(grgdo_output_pin_available(DISCRETE_OPEN_PIN), "Discrete open output overlaps a GRGDO1 input or I2C pin");
+static_assert(grgdo_output_pin_available(DISCRETE_CLOSE_PIN), "Discrete close output overlaps a GRGDO1 input or I2C pin");
 #endif
 #endif
 
@@ -222,7 +230,32 @@ inline void write_status_pin(int pin, uint8_t state)
 inline void setup_status_pin(int pin)
 {
     if (pin >= 0)
+    {
+#ifdef ESP32
+        gpio_set_level(static_cast<gpio_num_t>(pin), 0);
+#else
+        digitalWrite(pin, LOW);
+#endif
         pinMode(pin, OUTPUT);
+    }
+}
+
+inline void configure_dry_contact_output(int pin)
+{
+    if (pin < 0)
+        return;
+#ifdef ESP32
+    gpio_set_level(static_cast<gpio_num_t>(pin), 0);
+    gpio_config_t config = {
+        .pin_bit_mask = (1ULL << pin),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+        .intr_type = GPIO_INTR_DISABLE};
+    gpio_config(&config);
+#endif
+    pinMode(pin, OUTPUT);
+    digitalWrite(pin, LOW);
 }
 
 #define DOOR_STATE(s) (s == 0) ? "Open" : (s == 1) ? "Closed"  \
@@ -292,6 +325,6 @@ extern GarageDoor last_reported_garage_door;
 #ifdef ESP8266
 #define STATUS_JSON_BUFFER_SIZE (256 * 8)
 #else
-#define STATUS_JSON_BUFFER_SIZE (256 * 10)
+#define STATUS_JSON_BUFFER_SIZE (256 * 12)
 #endif
 extern char *status_json;

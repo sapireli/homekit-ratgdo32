@@ -4,26 +4,19 @@
 
 All notable changes to `homekit-ratgdo32` will be documented in this file. This project tries to adhere to [Semantic Versioning](http://semver.org/).
 
-## v1.4.0 (proposed, unreleased) - Gelidus Research
+## v1.4.2 (unreleased) - Gelidus Research
 
-* Fix the OTA crash captured on the Rev1: pause HomeSpan using its polling mutex instead of deleting its task, and release the pause on upload completion/abort. This avoids stale task handles on retries and preserves the task's lock ownership. Keep the uploaded MD5 argument alive until copied instead of retaining a pointer to a temporary String.
-* Fix the Rev1 serial/I2C ownership path exercised by a runtime freeze report: remove all `HardwareSerial` object copies, stop UART0 clients before using GPIO1/3 for I2C, and restore the original UART only after `Wire.end()` when the sensor is absent. Prevent recursive UART initialization from logging and remove the unbounded wait for serial startup. Physical validation of the corrected build is pending.
-* Address the UART defect linked from [Gelidus #19](https://github.com/GelidusResearch/homekit-ratgdo32/issues/19): restore RX pull-up after inverted UART initialization, require byte-at-a-time reception, check initialization failures, and allow a full 1200-baud character plus scheduling margin for its echo.
-* Replace the TX GPIO pull-up reset in shutdown/panic handling with an explicit inactive LOW output disconnected from UART. Cover startup and ESP restart callbacks too. Add regression tests for broken RX bias, stale output latches, failed initialization, and late UART output; check the compiled panic disconnect has no flash dependencies.
-* Validate the affected Security+ 1.0 wall panel before declaring #19 resolved. Keep the published installer on v1.3.0 until release. The proposed version must be coordinated with Gelidus's separate GDOLIB release plan.
-* Merge `ratgdo/homekit-ratgdo32` through commit `5ab633c166a367fd48303eca37bc9e086d2bfb6d` (October 18, 2026), including `v3.5.5` and the subsequent authentication/OTA fixes. Retain the Gelidus `v1.3.1` release fixes.
-* Preserve GRGDO1 Rev1/Rev2 pin assignments, VL53L1X vehicle sensing, DHT22 temperature/humidity support, and separate HomeKit controls for vehicle sensors.
-* Add upstream encoder support, the optional HomeKit stop switch, door reversal settings, configurable NTP, and door/light/lock command fixes. Encoder support and the stop switch are off by default.
-* Keep the existing DHT22 HomeKit accessory ID; assign a separate ID to the stop switch.
-* Disable conflicting upstream status and laser outputs on GRGDO1. GPIO25/26 belong to Rev2 I2C; GPIO23 is the obstruction input. Hide the unsupported controls unless separate output pins are configured.
-* Restore upstream door-change timestamps and status events alongside DHT22 readings; the previous Gelidus sensor code had displaced that block.
-* Port DHT22 settings to upstream's array-based configuration storage and add bounded JSON serialization for sensor readings.
-* Select OTA firmware for the correct board revision and exclude checksum, bootloader, and partition files from firmware selection.
-* Update HomeSpan to 2.1.8 and pin the ESP32 platform to upstream's 55.03.311 version.
-* Build and check both revisions in CI. Package revision-specific artifacts with checksums and source provenance; publish installer manifests from the same artifacts as the release.
-* Read the firmware version from `VERSION`, independently of the published installer manifests. Replace the old release branch and force push with a checked tag build and a normal default-branch documentation commit.
+* Merge upstream through `0e1fe84` (v3.5.6 development), preserving GRGDO1 Rev1/Rev2 pin assignments, sensors, and HomeKit vehicle controls.
+* Fix Rev1 UART/I2C ownership, conflicting GPIO outputs, and inactive-LOW transmitter handling during startup, shutdown, restart, and panic.
+* Include Security+ 1.0 RX bias, initialization, and echo-timing corrections. The affected wall panel in Gelidus #19 still needs hardware validation.
+* Pause HomeSpan safely during OTA and retain the checksum argument until copied.
+* Fix slow-client browser/log handling, SSE lifecycle races, IPv6-first IPv4 reporting, and HomeSpan partial transport I/O.
+* Correct stop/reverse state ordering and avoid close timers for ignored or rejected commands.
+* Fix the log ring's exact-fill overflow.
+* Include upstream's discrete dry-contact outputs, obstruction-triggered parking assist, longer door-duration support, and larger status JSON buffer. Keep unsupported GRGDO1 outputs disconnected by default.
+* Package revision-specific firmware with checksums and source records; validate builds and installer updates in CI. Keep the published installer at v1.3.0 until release.
 
-Thanks to David Kerr and the ratgdo contributors for the upstream work, and to Gelidus Research and its contributors for GRGDO1 support. See the upstream entries below for individual changes and contributor credits, and [releasing.md](docs/releasing.md) for build and publication steps.
+Thanks to David Kerr, MitchJS, the ratgdo contributors, and Gelidus Research and its contributors.
 
 ## v3.5.6 (2026-10-xx)
 
@@ -33,6 +26,8 @@ Thanks to David Kerr and the ratgdo contributors for the upstream work, and to G
 
 * Bugfix: Add the autocomplete tags to html that are required for password managers to trigger autofill. https://github.com/ratgdo/homekit-ratgdo32/issues/200
 * Bugfix: Firmware OTA update failing when password required, fixed by add X-API-Key HTML header. https://github.com/ratgdo/homekit-ratgdo32/issues/200
+* Bugfix: Discrete Open/Close status pins not implemented correctly. https://github.com/ratgdo/homekit-ratgdo32/issues/206
+* Bugfix: Parking assist laser not triggered if door has been open longer than 5 minutes. https://github.com/ratgdo/homekit-ratgdo32/issues/203
 
 ### Known Issues
 
