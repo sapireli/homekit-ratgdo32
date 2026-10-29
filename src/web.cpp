@@ -374,8 +374,12 @@ void setupHttpOwnedExperiment()
         // that could have lost its SSE exclusion during that allocation.
         if (!uri || uri.length() == 0)
             return false;
-        if (web.method() != HTTP_GET || uri.startsWith("/rest/events/") ||
-            uri == "/update" || uri == "/reboot" || uri == "/reset")
+        // Only GET event-channel handlers retain a long-lived client. The
+        // subscribe endpoint returns a normal short response. Other suffixes
+        // stay excluded too: existing dispatch converts them with atoi().
+        const bool eventStream = web.method() == HTTP_GET &&
+                                 uri.startsWith("/rest/events/") && uri != "/rest/events/subscribe";
+        if (eventStream || uri == "/update" || uri == "/reboot" || uri == "/reset")
             return next();
         HttpOwnedResponse *slot = nullptr;
         for (auto &entry : httpOwned)
