@@ -21,7 +21,7 @@
 #include <time.h>
 #ifdef ESP32
 #include <shared_mutex>
-#include "../lib/ratgdo/update_poll_guard.h"
+#include <mutex>
 #include "../lib/ratgdo/sse_write.h"
 #endif
 
@@ -1026,7 +1026,7 @@ void build_status_json(char *json)
         JSON_ADD_INT("openDuration", garage_door.openDuration);
         snprintf_P(writeBuffer, sizeof(writeBuffer), PSTR("{ \"max\": %d, \"count\": %d, \"duration\": [ %d, %d, %d, %d, %d, %d ] }"),
                    openHistory.max, openHistory.count,
-                   openHistory(1), openHistory(2), openHistory(3), openHistory(4), openHistory(5), openHistory(6));
+                   OPEN_HISTORY(1), OPEN_HISTORY(2), OPEN_HISTORY(3), OPEN_HISTORY(4), OPEN_HISTORY(5), OPEN_HISTORY(6));
         JSON_ADD_RAW("openHistory", writeBuffer);
     }
     if (garage_door.closeDuration)
@@ -1034,7 +1034,7 @@ void build_status_json(char *json)
         JSON_ADD_INT("closeDuration", garage_door.closeDuration);
         snprintf_P(writeBuffer, sizeof(writeBuffer), PSTR("{ \"max\": %d, \"count\": %d, \"duration\": [ %d, %d, %d, %d, %d, %d ] }"),
                    closeHistory.max, closeHistory.count,
-                   closeHistory(1), closeHistory(2), closeHistory(3), closeHistory(4), closeHistory(5), closeHistory(6));
+                   CLOSE_HISTORY(1), CLOSE_HISTORY(2), CLOSE_HISTORY(3), CLOSE_HISTORY(4), CLOSE_HISTORY(5), CLOSE_HISTORY(6));
         JSON_ADD_RAW("closeHistory", writeBuffer);
     }
 #ifdef ESP8266
@@ -1929,7 +1929,8 @@ void handle_firmware_upload()
     static bool verify = false;
     static size_t size = 0;
 #ifdef ESP32
-    static UpdatePollGuard<std::shared_mutex> homekitUpdateGuard(homeSpan.getMutex());
+    // Use the same mutex as homeSpanPAUSE, retaining it across upload callbacks.
+    static std::shared_lock<std::shared_mutex> homekitUpdateLock(homeSpan.getMutex(), std::defer_lock);
 #endif
 
     if (upload.status == UPLOAD_FILE_START)
@@ -1969,8 +1970,9 @@ void handle_firmware_upload()
         else if (!verify)
         {
 #ifdef ESP32
-            // Wait for HomeSpan's polling boundary instead of deleting its task.
-            homekitUpdateGuard.pause();
+            // Pause at HomeSpan's own polling boundary; retain the task and its locks.
+            if (!homekitUpdateLock.owns_lock())
+                homekitUpdateLock.lock();
 #endif
             // Close services so we don't have to handle network traffic during update
             // Only if not verifying as either will have been shutdown on immediately prior upload, or we
@@ -2073,7 +2075,9 @@ void handle_firmware_upload()
         firmwareUpdateSub = NULL;
     }
 #ifdef ESP32
-    if (upload.status == UPLOAD_FILE_END || upload.status == UPLOAD_FILE_ABORTED)
-        homekitUpdateGuard.resume();
+    // Release polling after success, write/authentication errors, or disconnect.
+    if ((upload.status == UPLOAD_FILE_END || upload.status == UPLOAD_FILE_ABORTED) &&
+        homekitUpdateLock.owns_lock())
+        homekitUpdateLock.unlock();
 #endif
 }

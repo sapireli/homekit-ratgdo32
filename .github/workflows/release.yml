@@ -83,8 +83,6 @@ jobs:
           /tmp/uart-test
           c++ -std=c++17 -Wall -Wextra -Isrc tests/serial_console.cpp -o /tmp/console-test
           /tmp/console-test
-          c++ -std=c++17 -Wall -Wextra tests/update_poll_guard.cpp -o /tmp/update-test
-          /tmp/update-test
           c++ -std=c++17 -Wall -Wextra -Werror tests/sse_write.cpp -o /tmp/sse-test
           /tmp/sse-test
           c++ -std=c++17 -Wall -Wextra -Werror tests/ipv4_config.cpp -o /tmp/ipv4-test
