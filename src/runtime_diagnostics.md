@@ -1,0 +1,19 @@
+# Opt-in runtime evidence capture
+
+This module is disabled unless `RATGDO_RUNTIME_DIAGNOSTICS` is defined. Normal builds keep inline no-op hooks and no diagnostic tasks or storage. Do not silently enable it in a production release.
+
+Enable the flag while preserving all existing environment build flags. The raw UDP destination defaults to 192.168.23.158:5515, overridden at compile time by RATGDO_DIAGNOSTIC_HOST and RATGDO_DIAGNOSTIC_PORT. Packets contain no credentials, request contents, pairing keys, or actuator commands. Frames are at most 239 bytes; worst-case current formats are 206 bytes. UDP has no delivery guarantee. `seq` detects gaps; `s` links multiple packets to one sample; `up` is monotonic uptime in milliseconds, wrapping after about 49 days.
+
+The independent observer samples every five seconds. A separate emitter uses direct BSD UDP with MSG_DONTWAIT. This avoids the application's log mutex and keeps observing if the emitter blocks inside the network stack. Both tasks and length-one queues use static storage, about 11 KiB in total. Instrumentation changes memory layout, scheduling, and network traffic and is not a zero-impact probe.
+
+The observer records:
+
+- Main-loop phase and completed loops: 0=end, 1=deferred initialization, 2=comms plus auxiliary sensor loops, 3=web, 4=Improv, 5=soft AP, 6=service timers. `age` is time since phase last changed.
+- Last entry into DEV_GarageDoor::loop() in HomeSpan, entry count, and observed FreeRTOS states. A stalled age localizes lack of progress; it does not identify the lock or instruction.
+- Full heap integrity with the existing framework's CONFIG_HEAP_POISONING_LIGHT; internal byte-addressable free/minimum/largest block, silent allocation-failure count and most recently requested size/capabilities. The failure hook only writes lock-free atomics. A heap-check failure latches once, saves a small RTC record before any further network operation, and skips further heap traversal and callback allocation. UINT32_MAX means an unavailable heap metric after corruption.
+- Observer, emitter and TCP/IP callback stack low-water marks in bytes. Task state UINT32_MAX and HK age UINT32_MAX mean no task/progress observed yet.
+- One bounded TCP/IP callback at a time, recording its queue delay, active/TIME_WAIT counts, and up to 16 connections. Each connection reports ports, TCP state, send buffer space, send-queue pbuf count, retransmit count/timer/RTO, queued-unsent and unacknowledged payload byte counts, and sequence numbers. Segment traversal is capped at 64 per list. Truncation is explicit. Snapshots run only in lwIP's core context; no logging, socket or heap APIs run in the callback. No application thread accesses PCB lists.
+
+`core at` timestamps the TCP snapshot, which normally trails the current observer sample by one interval. A pending callback whose age grows while loop/observer packets continue is evidence of a stalled or starved core path. A growing queue with retransmissions and missing packets in external capture is evidence of delivery/acknowledgment failure, not by itself proof of its cause. lwIP statistics are disabled in this framework, so no invented per-driver retry/drop metrics are exposed.
+
+The observer can still block on a stuck allocator lock. UDP emission can fail or stop entirely. The RTC first-bad record survives supported software resets, not physical power loss; it is repeated as `kind=prior` after reboot. Heap light poisoning cannot detect every possible in-bounds corruption. A USB serial capture or core dump remains necessary when both application and network evidence cease. No automatic reboot, door operation, settings change, or pairing operation is performed.

@@ -21,6 +21,7 @@
 
 // RATGDO project includes
 #include "ratgdo.h"
+#include "runtime_diagnostics.h"
 #include "config.h"
 #include "comms.h"
 #include "homekit.h"
@@ -1121,6 +1122,7 @@ boolean DEV_GarageDoor::update()
 
 void DEV_GarageDoor::loop()
 {
+    runtime_diagnostics_homekit_progress();
     if (uxQueueMessagesWaiting(event_q) > 0)
     {
         GDOEvent e;
