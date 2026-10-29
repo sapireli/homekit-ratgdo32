@@ -1,4 +1,5 @@
 #include "runtime_diagnostics.h"
+#include "wifi_tx_evidence.h"
 
 #if defined(ESP32) && defined(RATGDO_RUNTIME_DIAGNOSTICS)
 #include <atomic>
@@ -281,6 +282,22 @@ void emit(void *) {
                      c.unsent, c.unacked, c.acknowledged, c.next, c.buffered);
             send(line);
         }
+#if defined(RATGDO_WIFI_TX_EVIDENCE)
+        wifi_tx_evidence::Counters counts;
+        wifi_tx_evidence_counters(counts);
+        snprintf(line, sizeof(line), "RDIAG seq=%lu s=%lu up=%lu kind=txstat calls=%lu captured=%lu bad=%lu unsupported=%lu unreadable=%lu overwritten=%lu",
+                 ++sequence, sample.sample, sample.at, counts.calls, counts.captured, counts.malformed,
+                 counts.unsupported, counts.unreadable, counts.overwritten);
+        send(line);
+        wifi_tx_evidence::Record record;
+        for (unsigned i=0; i<32 && wifi_tx_evidence_pop(record); ++i) {
+            snprintf(line, sizeof(line), "RDIAG seq=%lu s=%lu up=%lu kind=tx call=%lu at=%lu api=%u if=%u done=%u ip=%u l=%u r=%u tcpSeq=%lu len=%lu flags=%u result=%ld",
+                     ++sequence, sample.sample, sample.at, record.call, record.at, record.api, record.interface,
+                     record.completed, record.ipVersion, record.sourcePort, record.destinationPort,
+                     record.tcpSequence, record.payloadLength, record.flags, record.result);
+            send(line);
+        }
+#endif
         emitterLowStack.store(uxTaskGetStackHighWaterMark(nullptr), std::memory_order_relaxed);
     }
 }
