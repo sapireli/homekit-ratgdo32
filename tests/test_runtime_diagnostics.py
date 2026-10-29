@@ -26,7 +26,7 @@ class RuntimeDiagnostics(unittest.TestCase):
         declarations = "\n".join(block(source, name) + ";" for name in
                                  ["struct Connection {", "struct TcpSnapshot {"])
         functions = "\n".join(block(source, name) for name in
-                              ["uint32_t segmentBytes(", "void snapshotTcp(", "void requestTcpSnapshot("])
+                              ["uint32_t elapsedSince(", "uint32_t segmentBytes(", "void snapshotTcp(", "void requestTcpSnapshot("])
         harness = r'''
 #include <atomic>
 #include <cassert>
@@ -59,6 +59,9 @@ TcpSnapshot captured{};
 void xQueueOverwrite(void *, const TcpSnapshot *value) { captured=*value; }
 ''' + functions + r'''
 int main() {
+    now=101; assert(elapsedSince(100)==1);
+    now=0; assert(elapsedSince(UINT32_MAX)==1);
+    now=100;
     requestTcpSnapshot();
     assert(requests==1 && tcpPending==1 && tcpRequestedAt==100);
     requestTcpSnapshot(); assert(requests==1);

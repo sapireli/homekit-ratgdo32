@@ -40,6 +40,7 @@ std::atomic<TaskHandle_t> mainTask{nullptr}, homekitTask{nullptr};
 std::atomic<uint32_t> tcpPending{0}, tcpRequestedAt{0}, tcpRejected{0}, sendErrors{0};
 std::atomic<uint32_t> emitterLowStack{0};
 uint32_t milliseconds() { return static_cast<uint32_t>(esp_timer_get_time() / 1000); }
+uint32_t elapsedSince(uint32_t timestamp) { return milliseconds() - timestamp; }
 
 struct Connection {
     uint16_t local, remote, queued, rto;
@@ -151,10 +152,10 @@ void observe(void *) {
         sample.observerLowStack = uxTaskGetStackHighWaterMark(nullptr);
         sample.emitterLowStack = emitterLowStack.load(std::memory_order_relaxed);
         sample.phase = phase.load(std::memory_order_relaxed);
-        sample.phaseAge = sample.at - phaseAt.load(std::memory_order_relaxed);
+        sample.phaseAge = elapsedSince(phaseAt.load(std::memory_order_relaxed));
         sample.loops = loops.load(std::memory_order_relaxed);
         const uint32_t hkAt = homekitAt.load(std::memory_order_relaxed);
-        sample.homekitAge = hkAt ? sample.at - hkAt : UINT32_MAX;
+        sample.homekitAge = hkAt ? elapsedSince(hkAt) : UINT32_MAX;
         sample.homekitLoops = homekitLoops.load(std::memory_order_relaxed);
         sample.mainState = sample.homekitState = UINT32_MAX;
 #if INCLUDE_eTaskGetState
@@ -216,15 +217,31 @@ void emit(void *) {
     destination.sin_addr.s_addr = inet_addr(RATGDO_DIAGNOSTIC_HOST);
     int fd = -1;
     uint32_t sequence = 0;
+    uint32_t lastSendErrno = 0, lastSendAt = 0, lastSendBytes = 0, lastSendOp = 0;
     for (;;) {
         Sample sample{};
         xQueueReceive(sampleQueue, &sample, portMAX_DELAY);
-        if (fd < 0) fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        int socketError = 0;
+        if (fd < 0) {
+            fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+            if (fd < 0) socketError = errno;
+        }
         auto send = [&](const char *line) {
             const size_t length = strlen(line);
-            if (fd < 0 || sendto(fd, line, length, MSG_DONTWAIT,
-                reinterpret_cast<sockaddr *>(&destination), sizeof(destination)) != static_cast<int>(length))
+            int error = socketError;
+            if (fd >= 0) {
+                const int result = sendto(fd, line, length, MSG_DONTWAIT,
+                    reinterpret_cast<sockaddr *>(&destination), sizeof(destination));
+                if (result < 0) error = errno;
+                else if (result != static_cast<int>(length)) error = EIO;
+            }
+            if (error) {
+                lastSendErrno = static_cast<uint32_t>(error);
+                lastSendAt = milliseconds();
+                lastSendBytes = static_cast<uint32_t>(length);
+                lastSendOp = fd < 0 ? 1 : 2;
                 sendErrors.fetch_add(1, std::memory_order_relaxed);
+            }
         };
         char line[240];
         if (priorHeapFailure.magic == LATCH_MAGIC) {
@@ -240,6 +257,10 @@ void emit(void *) {
         snprintf(line, sizeof(line), "RDIAG seq=%lu s=%lu up=%lu kind=tasks main=%lu hk=%lu obsLow=%lu emitLow=%lu pending=%lu rejected=%lu sendErr=%lu",
                  ++sequence, sample.sample, sample.at, sample.mainState, sample.homekitState,
                  sample.observerLowStack, sample.emitterLowStack, sample.tcpPendingAge, sample.tcpRejected, sample.sendErrors);
+        send(line);
+        snprintf(line, sizeof(line), "RDIAG seq=%lu s=%lu up=%lu kind=send errors=%lu err=%lu errAt=%lu bytes=%lu op=%lu",
+                 ++sequence, sample.sample, sample.at, sendErrors.load(std::memory_order_relaxed),
+                 lastSendErrno, lastSendAt, lastSendBytes, lastSendOp);
         send(line);
         snprintf(line, sizeof(line), "RDIAG seq=%lu s=%lu up=%lu kind=heap free=%lu largest=%lu min=%lu ok=%lu firstBad=%lu checkUs=%lu fail=%lu size=%lu caps=%lx",
                  ++sequence, sample.sample, sample.at, sample.free, sample.largest, sample.minimum,

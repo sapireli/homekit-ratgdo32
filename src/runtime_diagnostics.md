@@ -2,9 +2,11 @@
 
 This module is disabled unless `RATGDO_RUNTIME_DIAGNOSTICS` is defined. Normal builds keep inline no-op hooks and no diagnostic tasks or storage. Do not silently enable it in a production release.
 
-Build the opt-in Rev1 environment with `pio run -e ratgdo_esp32dev_rev1_diagnostics`. It preserves the Rev1 hardware flags and reports `1.4.2-diag`, distinct from the regular 1.4.2 image. The raw UDP destination defaults to 192.168.23.158:5515, overridden at compile time by RATGDO_DIAGNOSTIC_HOST and RATGDO_DIAGNOSTIC_PORT. Packets contain no credentials, request contents, pairing keys, or actuator commands. Frames are at most 239 bytes; worst-case current formats are 206 bytes. UDP has no delivery guarantee. `seq` detects gaps; `s` links multiple packets to one sample; `up` is monotonic uptime in milliseconds, wrapping after about 49 days.
+Build the opt-in Rev1 environment with `pio run -e ratgdo_esp32dev_rev1_diagnostics`. It preserves the Rev1 hardware flags and reports `1.4.3-diag`, distinct from the regular 1.4.2 image. The raw UDP destination defaults to 192.168.23.158:5515, overridden at compile time by RATGDO_DIAGNOSTIC_HOST and RATGDO_DIAGNOSTIC_PORT. Packets contain no credentials, request contents, pairing keys, or actuator commands. Frames are at most 239 bytes; worst-case current formats are 206 bytes. UDP has no delivery guarantee. `seq` detects gaps; `s` links multiple packets to one sample; `up` is monotonic uptime in milliseconds, wrapping after about 49 days.
 
 The independent observer samples every five seconds. A separate emitter uses direct BSD UDP with MSG_DONTWAIT. This avoids the application's log mutex and keeps observing if the emitter blocks inside the network stack. Both tasks and length-one queues use static storage, about 11 KiB in total. Free heap will therefore start lower than the regular image; compare its own baseline and trend rather than treating that initial difference as a leak. Instrumentation changes memory layout, scheduling, and network traffic and is not a zero-impact probe.
+
+The emitter reports its latest socket/send error code, uptime, and packet size as `kind=send` (`op=1` socket creation, `op=2` send). Progress ages read the timestamp before the current clock, avoiding false near-2^32 ages from concurrent updates.
 
 The observer records:
 
