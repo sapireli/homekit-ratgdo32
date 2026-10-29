@@ -21,7 +21,7 @@
 #include <time.h>
 #ifdef ESP32
 #include <shared_mutex>
-#include "../lib/ratgdo/update_poll_guard.h"
+#include <mutex>
 #endif
 
 // ESP system includes
@@ -1855,7 +1855,8 @@ void handle_firmware_upload()
     static bool verify = false;
     static size_t size = 0;
 #ifdef ESP32
-    static UpdatePollGuard<std::shared_mutex> homekitUpdateGuard(homeSpan.getMutex());
+    // Use the same mutex as homeSpanPAUSE, retaining it across upload callbacks.
+    static std::shared_lock<std::shared_mutex> homekitUpdateLock(homeSpan.getMutex(), std::defer_lock);
 #endif
 
     if (upload.status == UPLOAD_FILE_START)
@@ -1896,7 +1897,8 @@ void handle_firmware_upload()
         {
 #ifdef ESP32
             // Pause at HomeSpan's own polling boundary; retain the task and its locks.
-            homekitUpdateGuard.pause();
+            if (!homekitUpdateLock.owns_lock())
+                homekitUpdateLock.lock();
 #endif
             // Close services so we don't have to handle network traffic during update
             // Only if not verifying as either will have been shutdown on immediately prior upload, or we
@@ -1995,7 +1997,8 @@ void handle_firmware_upload()
     }
 #ifdef ESP32
     // Release polling after success, write/authentication errors, or disconnect.
-    if (upload.status == UPLOAD_FILE_END || upload.status == UPLOAD_FILE_ABORTED)
-        homekitUpdateGuard.resume();
+    if ((upload.status == UPLOAD_FILE_END || upload.status == UPLOAD_FILE_ABORTED) &&
+        homekitUpdateLock.owns_lock())
+        homekitUpdateLock.unlock();
 #endif
 }
