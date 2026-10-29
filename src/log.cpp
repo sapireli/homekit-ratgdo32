@@ -287,10 +287,13 @@ void LOG::clearCrashLog()
 {
 #ifdef ESP8266
     saveCrash.clear();
+    crashCount = 0;
 #else
     esp_core_dump_image_erase();
-#endif
+    TAKE_MUTEX();
     crashCount = 0;
+    GIVE_MUTEX();
+#endif
 }
 
 #ifdef ESP8266
@@ -322,15 +325,22 @@ void LOG::printCrashLog(Print &outputDev)
 #else
 void LOG::printCrashLog(Print &outputDev)
 {
+    // The RTC crash log is written only by the panic handler, which resets the
+    // device. Snapshot ordinary mutable metadata without holding the logger
+    // lock across flash access or potentially blocking output.
     TAKE_MUTEX();
-    if (crashCount > 0)
+    const int32_t savedCrashCount = crashCount;
+    const time_t savedCrashTime = crashTime;
+    const _millis_t savedCrashUpTime = crashUpTime;
+    GIVE_MUTEX();
+    if (savedCrashCount > 0)
     {
-        if (crashTime)
+        if (savedCrashTime)
         {
-            outputDev.printf("Server boot time: %llu (%s)\n", crashTime - (crashUpTime / 1000), timeString(crashTime - (crashUpTime / 1000)));
-            outputDev.printf("Server crash time: %llu (%s)\n", crashTime, timeString(crashTime));
+            outputDev.printf("Server boot time: %llu (%s)\n", savedCrashTime - (savedCrashUpTime / 1000), timeString(savedCrashTime - (savedCrashUpTime / 1000)));
+            outputDev.printf("Server crash time: %llu (%s)\n", savedCrashTime, timeString(savedCrashTime));
         }
-        outputDev.printf("Server uptime: %llu ms (%s)\n", crashUpTime, toHHMMSSmmm((_millis_t)crashUpTime));
+        outputDev.printf("Server uptime: %llu ms (%s)\n", savedCrashUpTime, toHHMMSSmmm((_millis_t)savedCrashUpTime));
         outputDev.printf("Crash reason: %s\n", reasonString);
         outputDev.printf("Firmware version: %s\n\n", crashVersion);
         outputDev.flush();
@@ -350,13 +360,13 @@ void LOG::printCrashLog(Print &outputDev)
         {
             if (esp_core_dump_get_summary(summary) == ESP_OK)
             {
-                if (crashCount <= 0)
+                if (savedCrashCount <= 0)
                     outputDev.print("No saved message log available.\n");
 
                 outputDev.print("\n\n");
                 outputDev.printf("Crash in task: %s, at address: 0x%08lX\n", summary->exc_task, summary->exc_pc);
                 outputDev.print("Decode backtrace with this Linux command:\n\n");
-                if (crashCount > 0)
+                if (savedCrashCount > 0)
                     outputDev.printf("addr2line -p -f -C -e homekit-ratgdo32-v%s.elf \\\n", crashVersion);
                 else
                     outputDev.print("addr2line -p -f -C -e firmware.elf \\\n");
@@ -377,7 +387,6 @@ void LOG::printCrashLog(Print &outputDev)
     {
         outputDev.print("\n\nNo core dump image available.\n");
     }
-    GIVE_MUTEX();
 }
 
 void LOG::saveMessageLog()
