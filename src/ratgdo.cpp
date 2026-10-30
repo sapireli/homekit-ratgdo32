@@ -30,6 +30,7 @@
 
 // RATGDO project includes
 #include "ratgdo.h"
+#include "runtime_diagnostics.h"
 #include "config.h"
 #include "comms.h"
 #include "homekit.h"
@@ -303,6 +304,7 @@ void setup()
     ESP_LOGI(TAG, "=== WAITING for IP address before continuing initialization");
     // led to idle mode
     led.idle();
+    runtime_diagnostics_setup();
 }
 
 /****************************************************************************
@@ -310,6 +312,7 @@ void setup()
  */
 void loop()
 {
+    runtime_diagnostics_phase(1);
     static bool setup_after_IP_done = false;
 
     // Some initialization is postponed until after we have an IP address
@@ -365,6 +368,7 @@ void loop()
 #endif
     }
 
+    runtime_diagnostics_phase(2);
     comms_loop();
 #ifndef USE_GDOLIB
     drycontact_loop();
@@ -380,10 +384,15 @@ void loop()
 #ifdef RATGDO32_DISCO
     vehicle_loop();
 #endif
+    runtime_diagnostics_phase(3);
     web_loop();
+    runtime_diagnostics_phase(4);
     improv_loop();
+    runtime_diagnostics_phase(5);
     soft_ap_loop();
+    runtime_diagnostics_phase(6);
     service_timer_loop();
+    runtime_diagnostics_phase(0);
 }
 
 /****************************************************************************
