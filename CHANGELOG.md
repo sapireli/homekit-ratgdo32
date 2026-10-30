@@ -4,7 +4,13 @@
 
 All notable changes to `homekit-ratgdo32` will be documented in this file. This project tries to adhere to [Semantic Versioning](http://semver.org/).
 
-## v1.4.3 (unreleased) - Gelidus Research
+## v1.4.4 (2026-10-30) - GRGDO1 test release
+
+* Enable bounded HTTP response ownership for both board revisions. Release acknowledged responses and clean up verified connections after five seconds without acknowledgement progress, preventing stalled responses from accumulating unchecked.
+* Build regular Rev1/Rev2 firmware without the extra runtime/heap/TCP collectors, Wi-Fi TX tracing, diagnostic HTTP endpoint, or diagnostic version suffix. Keep normal informational, warning, and error logging.
+* The diagnostic predecessor ran over 18 hours without a recorded reboot or sustained freeze. Intermittent HTTP timeouts recovered; the complete original root cause remains under investigation. Rev2 and the Security+ 1.0 wall panel in #19 still need hardware validation.
+
+## v1.4.3 (test builds) - Gelidus Research
 
 * Merge upstream through `20c1dfd` (v3.5.6 development), preserving GRGDO1 Rev1/Rev2 pin assignments, sensors, and HomeKit vehicle controls.
 * Fix Rev1 UART/I2C ownership, conflicting GPIO outputs, and inactive-LOW transmitter handling during startup, shutdown, restart, and panic.
