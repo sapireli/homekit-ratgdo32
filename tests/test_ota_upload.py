@@ -89,13 +89,21 @@ struct Esp {
     uint32_t getFlashChipSpeed() { return 40000000; }
 } ESP;
 struct SerialPort { template<class T> void print(T) {} } Serial;
-struct Client { bool connected() { return false; } };
+bool streamConnected=false, sendOk=true;
+unsigned retiredStreams=0;
+struct Client { bool connected() { return streamConnected; } };
 struct SSESubscription { Client client; bool active=false; };
 std::atomic<SSESubscription *> firmwareUpdateSub{nullptr};
 struct SSELock { explicit operator bool() const { return true; } };
 char statusStorage[256]{}, *status_json=statusStorage, writeBuffer[512]{};
 void clientWrite(Client,const char *) {}
-void sendSSEEvent(Client,const char *,const char *) {}
+bool sendSSEEvent(Client,const char *,const char *) { return sendOk; }
+void removeSSEsubscription(SSESubscription *s) {
+    s->active=false;
+    ++retiredStreams;
+    SSESubscription *expected=s;
+    firmwareUpdateSub.compare_exchange_strong(expected,nullptr);
+}
 struct FlashUpdate {
     bool beginOk=true, writeOk=true, endOk=true, active=false;
     unsigned begins=0, writes=0, ends=0;
@@ -119,6 +127,16 @@ int main() {
     event(UPLOAD_FILE_WRITE); assert(!pollCanRun());
     event(UPLOAD_FILE_END); assert(pollCanRun());
     event(UPLOAD_FILE_END); assert(pollCanRun());
+
+    // A failed progress stream retires without interrupting flash writes.
+    start();
+    SSESubscription stream; stream.active=true;
+    firmwareUpdateSub=&stream; streamConnected=true; sendOk=false;
+    event(UPLOAD_FILE_WRITE);
+    assert(!stream.active && firmwareUpdateSub==nullptr && retiredStreams==1);
+    assert(!pollCanRun());
+    event(UPLOAD_FILE_END); assert(pollCanRun());
+    streamConnected=false; sendOk=true;
 
     // Re-entering START is idempotent; aborted and repeated uploads can recover.
     start(); start(); assert(!pollCanRun());
