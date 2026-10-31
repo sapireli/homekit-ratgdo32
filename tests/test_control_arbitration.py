@@ -44,6 +44,7 @@ bool txQueuePeek(PacketAction *out){if(queueState.items.empty())return false;*ou
         else:
             harness += "\nvoid observeLight(bool value){garage_door.light=value;lightIntent.clear();}"
             harness += "\nvoid observeLock(bool value){garage_door.current_lock=value?CURR_LOCKED:CURR_UNLOCKED;lockIntent.clear();}"
+            harness += "\nbool recordLightStatus(bool value){observeLight(value);return true;}"
         status_case = block(source[source.index("void sec1_process_message"):], "case secplus1Codes::QueryLightLockStatus:")
         harness += r'''
 #define ESP_LOGV(...) ((void)0)
@@ -53,6 +54,7 @@ struct {struct {bool lightKey=false,lockKey=false;}bit;}motionTriggers;
 void publish_homekit_light(bool){}
 void notify_homekit_light(bool value){garage_door.light=value;}
 void publish_homekit_current_lock(int){}
+void notify_homekit_current_lock(int value){garage_door.current_lock=value;}
 void notify_homekit_motion(bool){}
 void manual_recovery(){}
 using LockTargetState=int;
