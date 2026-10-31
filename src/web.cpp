@@ -102,6 +102,7 @@ void add_dynamic_mdns();
 
 #if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
 bool retainedBySSE(int fd);
+bool drainRetiredSSE();
 void handle_http_lifecycle();
 #endif
 
@@ -167,7 +168,7 @@ constexpr unsigned HTTP_OWNED_SLOTS = 2;
 constexpr uint32_t HTTP_OWNED_POLL_MS = HTTP_MAX_SEND_WAIT / 20;
 constexpr uint32_t HTTP_BODY_MAX_LIFETIME_MS = HTTP_MAX_SEND_WAIT;
 enum class HttpOwnedState { Empty, Active, Release, Aborted, Quarantined };
-enum class HttpBody { None, Flash, MessageLog, DiagnosticLog };
+enum class HttpBody { None, Flash, MessageLog, DiagnosticLog, Generated };
 struct HttpOwnedResponse {
     NetworkClient owner;
     HttpOwnedState state = HttpOwnedState::Empty;
@@ -184,9 +185,21 @@ struct HttpOwnedResponse {
     const uint8_t *bodyData = nullptr;
     size_t bodyLength = 0, bodyOffset = 0;
     uint32_t bodyStarted = 0;
+    size_t (*bodyReader)(uint8_t *, size_t) = nullptr;
+    void (*bodyCleanup)() = nullptr;
     LOG::MessageCursor logCursor;
     LOG::DiagnosticCursor diagnosticCursor;
 };
+// Main-only: release a generated body's scan lease on every retirement path.
+void finishHttpBody(HttpOwnedResponse &entry)
+{
+    if (entry.bodyCleanup)
+        entry.bodyCleanup();
+    entry.bodyCleanup = nullptr;
+    entry.bodyReader = nullptr;
+    entry.body = HttpBody::None;
+}
+
 struct HttpOwnedCounters {
     uint32_t tracked = 0, released = 0, aborted = 0, quarantined = 0;
     uint32_t postFailures = 0, maximumRetainedPayload = 0;
@@ -350,6 +363,7 @@ bool httpOwnedPoll()
                 if (currentFD == -1)
                 {
                     entry.owner.stop();
+                    finishHttpBody(entry);
                     entry = HttpOwnedResponse{};
                     continue;
                 }
@@ -358,6 +372,7 @@ bool httpOwnedPoll()
             }
             if (entry.state == HttpOwnedState::Quarantined)
             {
+                finishHttpBody(entry);
                 if (!entry.reported)
                 {
                     entry.reported = true;
@@ -376,6 +391,7 @@ bool httpOwnedPoll()
                 else
                     ++httpOwnedCounters.released;
                 entry.owner.stop();
+                finishHttpBody(entry);
                 entry = HttpOwnedResponse{};
             }
         }
@@ -391,12 +407,14 @@ bool httpOwnedPoll()
         {
             // An alias already stopped this shared handle. Never use cached fd.
             entry.owner.stop();
+            finishHttpBody(entry);
             entry = HttpOwnedResponse{};
             continue;
         }
         if (currentFD != entry.fd)
         {
             entry.state = HttpOwnedState::Quarantined;
+            finishHttpBody(entry);
             entry.reported = true;
             ++httpOwnedCounters.quarantined;
             ESP_LOGE(TAG, "HTTP owner descriptor changed; HTTP admission paused");
@@ -521,7 +539,7 @@ bool drainHttpBodies()
         // prevent HTTP admission indefinitely.
         if (entry.writeFailed || static_cast<uint32_t>(_millis() - entry.bodyStarted) >= HTTP_BODY_MAX_LIFETIME_MS)
         {
-            entry.body = HttpBody::None;
+            finishHttpBody(entry);
             entry.discardQueued = true;
             continue;
         }
@@ -543,9 +561,20 @@ bool drainHttpBodies()
                 entry.bodyLength = diagnostic ? sizeof(changed) - 1 : sizeof(truncated) - 1;
             }
         }
+        if (entry.bodyOffset == entry.bodyLength && entry.body == HttpBody::Generated)
+        {
+            entry.bodyLength = entry.bodyReader(reinterpret_cast<uint8_t *>(writeBuffer), sizeof(writeBuffer));
+            entry.bodyOffset = 0;
+            if (entry.bodyLength > sizeof(writeBuffer))
+            {
+                finishHttpBody(entry);
+                entry.writeFailed = entry.discardQueued = true;
+                continue;
+            }
+        }
         if (entry.bodyOffset == entry.bodyLength)
         {
-            entry.body = HttpBody::None;
+            finishHttpBody(entry);
             continue;
         }
         const size_t length = std::min<size_t>(1460, entry.bodyLength - entry.bodyOffset);
@@ -553,7 +582,7 @@ bool drainHttpBodies()
         if (sent > 0) entry.bodyOffset += sent;
         else if (sent == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
         {
-            entry.body = HttpBody::None;
+            finishHttpBody(entry);
             entry.writeFailed = entry.discardQueued = true;
         }
         if (entry.bodyOffset == entry.bodyLength && entry.body == HttpBody::Flash)
@@ -565,6 +594,8 @@ bool drainHttpBodies()
 
 void setupHttpOwnedExperiment()
 {
+    if (httpOwnedMessage)
+        return;
     httpOwnedMessage = tcpip_callbackmsg_new(httpOwnedInspect, nullptr);
     if (!httpOwnedMessage)
     {
@@ -612,11 +643,55 @@ void setupHttpOwnedExperiment()
         {
             slot->fd = fd;
         }
-        else *slot = HttpOwnedResponse{};
+        else
+        {
+            finishHttpBody(*slot);
+            *slot = HttpOwnedResponse{};
+        }
         return handled;
     });
 }
+// Pumping is also needed during AP onboarding, before garage/web setup.
+// The caller owns the sole handleClient call for this main-loop iteration.
+bool pollHttpResponses()
+{
+    if (!httpOwnedMessage)
+        return false;
+    const bool room = httpOwnedPoll();
+    if (httpOwnedPending)
+        return true; // Core owns all response entries until its callback finishes.
+    const bool retiredRoom = !web_setup_done || drainRetiredSSE();
+    const bool bodyPending = drainHttpBodies();
+    if (room && retiredRoom && !bodyPending)
+        server.handleClient();
+    // A newly admitted handler may have leased the scratch buffer.
+    for (const auto &entry : httpOwned)
+        if (entry.state == HttpOwnedState::Active && entry.body != HttpBody::None)
+            return true;
+    return bodyPending;
+}
+
 } // namespace
+#endif
+
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+void setup_http_response_delivery()
+{
+    setupHttpOwnedExperiment();
+}
+
+bool defer_http_generated_body(size_t (*reader)(uint8_t *, size_t), void (*cleanup)())
+{
+    if (!httpWriting || httpWriting->writeFailed || !reader || !cleanup)
+        return false;
+    httpWriting->body = HttpBody::Generated;
+    httpWriting->bodyReader = reader;
+    httpWriting->bodyCleanup = cleanup;
+    httpWriting->bodyData = reinterpret_cast<const uint8_t *>(writeBuffer);
+    httpWriting->bodyOffset = httpWriting->bodyLength = 0;
+    httpWriting->bodyStarted = static_cast<uint32_t>(_millis());
+    return true;
+}
 #endif
 
 // Local copy of door status
@@ -1002,13 +1077,14 @@ void notify_new_ipv6_address()
 
 void web_loop()
 {
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+    const bool bodyPending = pollHttpResponses();
+#endif
     if (!web_setup_done)
         return;
 #if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
-    const bool ownedRoom = httpOwnedPoll();
-    const bool retiredRoom = drainRetiredSSE();
-    if (drainHttpBodies()) return;
-    const bool mayHandleClient = retiredRoom && ownedRoom;
+    if (bodyPending)
+        return;
 #endif
 
     // Poll heartbeat deadlines while holding the same lock as slot reuse.
@@ -1178,10 +1254,9 @@ void web_loop()
     }
     // WebServer::handleClient() advances a connection state machine. Delaying
     // every step adds latency even to an idle server; it is not request limiting.
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
-    if (mayHandleClient)
+#if !defined(ESP32) || !defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+    server.handleClient();
 #endif
-        server.handleClient();
 }
 
 void setup_web()
