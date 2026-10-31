@@ -945,12 +945,16 @@ void setup_comms()
  */
 void shutdown_comms()
 {
-    // A timer must not issue a delayed close after communications shut down.
-    cancelFunctionDelay();
-    if (!comms_setup_done)
+    bool wasReady;
+    {
+        FunctionDelayLock lock;
+        // Cancel old work and reject new door commands before teardown starts.
+        cancelFunctionDelay();
+        wasReady = comms_setup_done;
+        comms_setup_done = false;
+    }
+    if (!wasReady)
         return;
-
-    comms_setup_done = false;
 #ifdef USE_GDOLIB
     // Shutdown GDO comms
     gdo_deinit();
@@ -2682,6 +2686,8 @@ bool process_PacketAction(PacketAction &pkt_ac)
 bool door_command(DoorAction action)
 {
     FunctionDelayLock lock;
+    if (!comms_setup_done)
+        return false;
     if (pendingDoorCommand)
     {
         ESP_LOGW(TAG, "Pending door command exists, dropping new command");
@@ -2786,6 +2792,9 @@ bool door_command(DoorAction action)
 
 void door_command_close()
 {
+    FunctionDelayLock lock;
+    if (!comms_setup_done)
+        return;
     // cancel partial open
     openPartialDelay.detach();
 
@@ -2855,6 +2864,9 @@ void door_command_close()
 
 void door_command_open()
 {
+    FunctionDelayLock lock;
+    if (!comms_setup_done)
+        return;
     ESP_LOGI(TAG, "Opening door");
     // cancel partial open
     openPartialDelay.detach();
@@ -2905,6 +2917,8 @@ void door_command_open()
 GarageDoorCurrentState open_door()
 {
     FunctionDelayLock lock;
+    if (!comms_setup_done)
+        return garage_door.current_state;
     if (functionDelayActive())
     {
         // We are in a time-to-close delay timeout.
@@ -2959,6 +2973,8 @@ GarageDoorCurrentState open_door()
 GarageDoorCurrentState stop_door()
 {
     FunctionDelayLock lock;
+    if (!comms_setup_done)
+        return garage_door.current_state;
 
     if (!(garage_door.current_state == GarageDoorCurrentState::CURR_CLOSING || garage_door.current_state == GarageDoorCurrentState::CURR_OPENING))
     {
@@ -2982,6 +2998,9 @@ GarageDoorCurrentState stop_door()
 
 GarageDoorCurrentState open_door_partial(int timePercentage)
 {
+    FunctionDelayLock lock;
+    if (!comms_setup_done)
+        return garage_door.current_state;
     _millis_t dtime = 0;
 
     if (timePercentage < 10)
@@ -3154,6 +3173,8 @@ void delayFnCall(uint32_t ms, void (*callback)())
 GarageDoorCurrentState close_door(bool bypass_ttc)
 {
     FunctionDelayLock lock;
+    if (!comms_setup_done)
+        return garage_door.current_state;
     if (garage_door.current_state == GarageDoorCurrentState::CURR_CLOSED || garage_door.current_state == GarageDoorCurrentState::CURR_CLOSING)
     {
         ESP_LOGD(TAG, "Door already %s; ignored request", DOOR_STATE(garage_door.current_state));
@@ -3245,6 +3266,8 @@ GarageDoorCurrentState close_door(bool bypass_ttc)
 GarageDoorCurrentState toggle_door(bool bypass_ttc)
 {
     FunctionDelayLock lock;
+    if (!comms_setup_done)
+        return garage_door.current_state;
     ESP_LOGI(TAG, "Toggling door via hardwired control");
     if (doorControlType == DOOR_CONTROL_DRY_CONTACT)
     {
