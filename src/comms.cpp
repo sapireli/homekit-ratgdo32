@@ -330,7 +330,8 @@ private:
 };
 static PolledDoorDeadline checkDoorMoving, checkDoorCompleted;
 bool TTCwasLightOn = false;
-static Ticker builtInTTCcountdown = Ticker();
+static bool builtInTTCcountdownActive = false;
+static _millis_t builtInTTClastTick = 0;
 static _millis_t partialDuration = 0, partialStartDeadline = 0, partialStopDeadline = 0;
 static bool partialAwaitingMotion = false;
 void processPartialOpen();
@@ -344,13 +345,38 @@ void cancelPartialOpen()
 
 void cancel_builtin_TTC_countdown()
 {
-    if (builtInTTCcountdown.active())
+    FunctionDelayLock lock;
+    if (builtInTTCcountdownActive)
     {
         ESP_LOGI(TAG, "Ending automatic close countdown timer");
-        builtInTTCcountdown.detach();
+        builtInTTCcountdownActive = false;
     }
+    builtInTTClastTick = 0;
     garage_door.builtInTTCremaining = 0;
     garage_door.builtInTTChold = false;
+}
+
+// The opener owns its built-in TTC. This is only the displayed remaining time;
+// update it from the command owner instead of a concurrent SDK timer callback.
+void process_builtin_TTC_countdown()
+{
+    FunctionDelayLock lock;
+    if (!builtInTTCcountdownActive)
+        return;
+    const _millis_t now = _millis();
+    const auto ticks = (now - builtInTTClastTick) / 1000;
+    if (!ticks)
+        return;
+    builtInTTClastTick += ticks * 1000;
+    if (garage_door.builtInTTChold)
+        return;
+    if (ticks >= garage_door.builtInTTCremaining)
+    {
+        garage_door.builtInTTCremaining = 0;
+        builtInTTCcountdownActive = false;
+    }
+    else
+        garage_door.builtInTTCremaining -= ticks;
 }
 
 struct DoorHistory openHistory = {GDO_MAX_HISTORY, 0, {0}};
@@ -1034,6 +1060,7 @@ void shutdown_comms()
         // Cancel old work and reject new door commands before teardown starts.
         cancelFunctionDelay();
         cancelPartialOpen();
+        cancel_builtin_TTC_countdown();
         checkDoorMoving.detach();
         checkDoorCompleted.detach();
 #ifndef USE_GDOLIB
@@ -2366,6 +2393,9 @@ void comms_loop_sec2()
 
         case PacketCommand::UpdateTtc:
         {
+            FunctionDelayLock lock;
+            if (!comms_setup_done)
+                break;
             // We may receive a series of these while the door is open and it is counting down to a close.
             // The first one will be highest and match what the GDO thinks is the TTC close.
             // The last one (or two) will be zero seconds, indicating door is about to close (will start warning sequence)
@@ -2383,13 +2413,11 @@ void comms_loop_sec2()
             {
                 garage_door.builtInTTCremaining = secs;
                 garage_door.builtInTTChold = false;
-                if (!builtInTTCcountdown.active())
+                builtInTTClastTick = _millis();
+                if (!builtInTTCcountdownActive)
                 {
                     ESP_LOGI(TAG, "Start automatic close countdown timer");
-                    // start a timer that will count down number of seconds remaining in built-in automatic close timer.
-                    builtInTTCcountdown.attach_ms(1000, []()
-                                                  { if (garage_door.builtInTTChold) return;
-                                                    if (--garage_door.builtInTTCremaining == 0)builtInTTCcountdown.detach(); });
+                    builtInTTCcountdownActive = true;
                 }
             }
             else
@@ -2402,6 +2430,9 @@ void comms_loop_sec2()
 
         case PacketCommand::CancelTtc:
         {
+            FunctionDelayLock lock;
+            if (!comms_setup_done)
+                break;
             switch (pkt.m_data.value.cancel_ttc.state)
             {
             case CancelTtcState::Cancel:
@@ -2414,9 +2445,13 @@ void comms_loop_sec2()
             }
             case CancelTtcState::Hold:
             {
-                if (builtInTTCcountdown.active())
+                // Settle elapsed time under the previous hold state. A loop
+                // pause while held must not become countdown debt on release.
+                process_builtin_TTC_countdown();
+                if (builtInTTCcountdownActive)
                 {
                     garage_door.builtInTTChold = !garage_door.builtInTTChold;
+                    builtInTTClastTick = _millis();
                     ESP_LOGI(TAG, "Automatic close time-to-close hold %s %d seconds remaining", garage_door.builtInTTChold ? "at" : "released at", garage_door.builtInTTCremaining);
                 }
                 else
@@ -2574,6 +2609,7 @@ void comms_loop()
     if (!comms_setup_done)
         return;
 
+    process_builtin_TTC_countdown();
     _millis_t current_millis = _millis();
 
 #ifdef ESP32
