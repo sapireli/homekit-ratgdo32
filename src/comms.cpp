@@ -756,62 +756,123 @@ static DoorCommandLifecycle doorLifecycle;
 class ControlIntent
 {
 public:
+    enum class Decision { Admit, Ignore, Handled };
     uint32_t begin(bool value)
     {
         FunctionDelayLock lock;
         generation = ++nextGeneration;
-        if (!generation)
-            generation = ++nextGeneration;
-        requested = value;
+        if (!generation) generation = ++nextGeneration;
+        requested = value; deferred = -1;
         startedAt = static_cast<uint32_t>(_millis());
-        written = false;
+        stage = Stage::Queued;
         return generation;
     }
-    bool pending(bool value)
+    Decision request(bool value, bool current, bool verify, bool toggleProtocol)
     {
         FunctionDelayLock lock;
         expire();
-        return requested == int(value);
+        if (generation && stage == Stage::Queued)
+        {
+            if (requested != int(value) && current == value)
+            {
+                clear();
+                return Decision::Handled;
+            }
+            return verify && requested == int(value) ? Decision::Ignore : Decision::Admit;
+        }
+        const bool unconfirmed = stage == Stage::Written || stage == Stage::Released;
+        if (generation || (toggleProtocol && unconfirmed))
+        {
+            const int latest = deferred >= 0 ? deferred : requested;
+            if (generation && verify && latest == int(value)) return Decision::Ignore;
+            if (!generation)
+            {
+                // Explicit retry gets a new bounded feedback wait, not a toggle.
+                const Stage previous = stage;
+                begin(value); stage = previous;
+            }
+            deferred = value;
+            return Decision::Handled;
+        }
+        // Expired absolute Sec+2 commands can be explicitly retried safely.
+        if (!toggleProtocol && unconfirmed) return Decision::Admit;
+        return verify && current == value ? Decision::Ignore : Decision::Admit;
     }
-    void clear() { FunctionDelayLock lock; generation = 0; requested = -1; }
+    int desired()
+    {
+        FunctionDelayLock lock; expire();
+        return generation ? (deferred >= 0 ? deferred : requested) : -1;
+    }
+    bool pending(bool value) { return desired() == int(value); }
+    void clear()
+    {
+        FunctionDelayLock lock;
+        generation = 0; requested = deferred = -1;
+    }
     void expire()
     {
         FunctionDelayLock lock;
-        if (generation && static_cast<uint32_t>(_millis() - startedAt) >= 3000)
-            clear();
+        if (generation && static_cast<uint32_t>(_millis() - startedAt) >= 3000) clear();
     }
     bool allow(uint32_t token, bool press)
     {
-        FunctionDelayLock lock;
-        expire();
-        return !token || (press ? token == generation && !written
+        FunctionDelayLock lock; expire();
+        return !token || (press ? token == generation && stage == Stage::Queued
                                 : token == generation || token == mandatoryRelease);
     }
-    void writing(uint32_t token, bool press)
+    void writing(uint32_t token, bool press, bool needsRelease = true)
     {
         FunctionDelayLock lock;
         if (token && press)
         {
-            written = true;
-            mandatoryRelease = token;
+            stage = Stage::Written;
+            if (needsRelease) mandatoryRelease = token;
         }
     }
-    void completed(uint32_t token, bool press)
+    void completed(uint32_t token, bool press, bool singleWrite = false)
     {
         FunctionDelayLock lock;
-        if (!press && mandatoryRelease == token)
+        if ((!press && token && mandatoryRelease == token) ||
+            (singleWrite && press && token == generation && stage == Stage::Written))
+        {
             mandatoryRelease = 0;
+            if (stage == Stage::Written) stage = Stage::Released;
+        }
+    }
+    // Command packets and echoes cannot authorize reconciliation.
+    void status(bool value)
+    {
+        FunctionDelayLock lock; expire();
+        if (stage == Stage::Queued)
+        {
+            if (generation && requested == int(value)) clear();
+            return;
+        }
+        if (stage == Stage::Written) return;
+        observed = value; stage = Stage::Fresh;
+        if (generation && deferred < 0 && requested == int(value)) clear();
+    }
+    int reconcile()
+    {
+        FunctionDelayLock lock; expire();
+        if (!generation || stage != Stage::Fresh || deferred < 0) return -1;
+        const int target = deferred;
+        clear();
+        return target == int(observed) ? -1 : target;
     }
     bool needsRelease(uint32_t token) const { FunctionDelayLock lock; return token && token == mandatoryRelease; }
     void failed(uint32_t token) { FunctionDelayLock lock; if (generation == token) clear(); }
-    void reset() { FunctionDelayLock lock; clear(); mandatoryRelease = 0; }
+    void reset() { FunctionDelayLock lock; clear(); mandatoryRelease = 0; stage = Stage::Queued; }
 private:
+    enum class Stage : uint8_t { Queued, Written, Released, Fresh };
     uint32_t nextGeneration = 0, generation = 0, mandatoryRelease = 0, startedAt = 0;
-    int8_t requested = -1;
-    bool written = false;
+    int8_t requested = -1, deferred = -1;
+    Stage stage = Stage::Queued;
+    bool observed = false;
 };
 static_assert(sizeof(ControlIntent) == 20, "Review button owner storage budget");
 static ControlIntent lightIntent, lockIntent;
+
 
 ControlIntent *packetControl(const PacketAction &packet)
 {
@@ -832,9 +893,35 @@ bool packetNeedsRelease(const PacketAction &packet)
     return doorLifecycle.needsRelease(packet.doorGeneration);
 }
 // END CONTROL OWNERSHIP
+// Publish authoritative state and its feedback boundary as one short transition.
+// Client notifications/logging happen after this lock has been released.
+bool recordLightStatus(bool value)
+{
+    FunctionDelayLock lock;
+    const bool changed = garage_door.light != value;
+    garage_door.light = value;
+    lightIntent.status(value);
+    return changed;
+}
+
+bool recordLockStatus(bool value)
+{
+    FunctionDelayLock lock;
+    const auto state = value ? CURR_LOCKED : CURR_UNLOCKED;
+    const bool changed = garage_door.current_lock != state;
+    garage_door.current_lock = state;
+    lockIntent.status(value);
+    const int desired = lockIntent.desired();
+    garage_door.target_lock = (desired >= 0 ? desired : int(value)) ? TGT_LOCKED : TGT_UNLOCKED;
+    publish_homekit_target_lock(garage_door.target_lock);
+    return changed;
+}
+
 static std::atomic<bool> pendingDoorCommand{false};
 static PacketAction *writingDoorPacket = nullptr;
 void processPendingDoorIntent();
+void processControlIntents();
+void reportControlStatusQueryDrops();
 void cancelPendingDoorIntent()
 {
     FunctionDelayLock lock;
@@ -866,8 +953,8 @@ void markDoorPacketWriting()
         return;
     if (auto *control = packetControl(*writingDoorPacket))
     {
-        if (doorControlType == DOOR_CONTROL_SEC_PLUS_V1)
-            control->writing(writingDoorPacket->doorGeneration, writingDoorPacket->doorPress);
+        control->writing(writingDoorPacket->doorGeneration, writingDoorPacket->doorPress,
+                         doorControlType == DOOR_CONTROL_SEC_PLUS_V1);
         if (control == &lightIntent && !writingDoorPacket->doorGeneration && writingDoorPacket->doorPress)
             heldLightReleaseRequired = true;
     }
@@ -2014,6 +2101,12 @@ void sec1_process_message(uint8_t key, uint8_t value = 0xFF)
             last_reported_garage_door.light = !garage_door.light;
         }
 
+        if ((value & 0xF0) != 0x50 && (value & 0xF0) != 0x10)
+        {
+            prevLightLock = 0xFF;
+            break;
+        }
+
         if (value != prevLightLock)
         {
             prevLightLock = value;
@@ -2022,17 +2115,17 @@ void sec1_process_message(uint8_t key, uint8_t value = 0xFF)
 
         uint8_t lightState = bitRead(value, 2);
         uint8_t lockState = !bitRead(value, 3);
+        recordLightStatus(lightState);
+        recordLockStatus(lockState);
 
         // light state change?
         if (lightState != lastLightState)
         {
             ESP_LOGI(TAG, "Light: %s (%s)", lightState ? "On" : "Off", timeString());
             lastLightState = lightState;
-            notify_homekit_light((bool)lightState);
+            publish_homekit_light((bool)lightState);
             // Force update of light state in any listening client
             last_reported_garage_door.light = !garage_door.light;
-            // Clear pending light on/off flags as we have now received an update from the door about the light state
-            lightIntent.clear();
             // If user want to trigger motion sensor based on light button, do it now as we know the light state has changed
             if (motionTriggers.bit.lightKey)
             {
@@ -2047,22 +2140,9 @@ void sec1_process_message(uint8_t key, uint8_t value = 0xFF)
         {
             ESP_LOGI(TAG, "Remotes lock: %s (%s)", LOCK_STATE(lockState), timeString());
             lastLockState = lockState;
-            if (lockState)
-            {
-                garage_door.current_lock = CURR_LOCKED;
-                garage_door.target_lock = TGT_LOCKED;
-            }
-            else
-            {
-                garage_door.current_lock = CURR_UNLOCKED;
-                garage_door.target_lock = TGT_UNLOCKED;
-            }
-            notify_homekit_target_lock(garage_door.target_lock);
-            notify_homekit_current_lock(garage_door.current_lock);
+            publish_homekit_current_lock(lockState ? CURR_LOCKED : CURR_UNLOCKED);
             // Force update of lock state in any listening client
             last_reported_garage_door.current_lock = (LockCurrentState)0xFF;
-            // Clear pending lock on/off flags as we have now received an update from the door about the lock state
-            lockIntent.clear();
             // If user want to trigger motion sensor based on lock button, do it now as we know the lock state has changed
             if (motionTriggers.bit.lockKey)
             {
@@ -2401,34 +2481,27 @@ void comms_loop_sec2()
             }
             handle_protocol_door_state(current_state);
 
-            if (pkt.m_data.value.status.light != garage_door.light)
+            if (recordLightStatus(pkt.m_data.value.status.light))
             {
                 ESP_LOGI(TAG, "Light: %s (%s)", pkt.m_data.value.status.light ? "On" : "Off", timeString());
-                lightIntent.clear();
-                notify_homekit_light(pkt.m_data.value.status.light);
+                publish_homekit_light(pkt.m_data.value.status.light);
             }
 
             LockCurrentState current_lock;
-            LockTargetState target_lock;
             if (pkt.m_data.value.status.lock)
             {
                 current_lock = CURR_LOCKED;
-                target_lock = TGT_LOCKED;
             }
             else
             {
                 current_lock = CURR_UNLOCKED;
-                target_lock = TGT_UNLOCKED;
             }
-            if (current_lock != garage_door.current_lock)
+            if (recordLockStatus(pkt.m_data.value.status.lock))
             {
                 ESP_LOGI(TAG, "Remotes lock: %s (%s)", LOCK_STATE(current_lock), timeString());
-                notify_homekit_target_lock(target_lock);
-                notify_homekit_current_lock(current_lock);
+                publish_homekit_current_lock(current_lock);
                 // Force update of lock state in any listening client
                 last_reported_garage_door.current_lock = (LockCurrentState)0xFF;
-                // Clear pending lock on/off flags as we have now received an update from the door about the lock state
-                lockIntent.clear();
             }
 
             // Handle obstruction from status packet if pin-based detection not available
@@ -2487,73 +2560,54 @@ void comms_loop_sec2()
 
         case PacketCommand::Lock:
         {
-            LockTargetState lock = garage_door.target_lock;
-            switch (pkt.m_data.value.lock.lock)
+            bool changed = false, query = false;
+            LockTargetState target;
             {
-            case LockState::Off:
-                lock = TGT_UNLOCKED;
-                break;
-            case LockState::On:
-                lock = TGT_LOCKED;
-                break;
-            case LockState::Toggle:
-                if (lock == TGT_LOCKED)
+                FunctionDelayLock lock;
+                target = garage_door.target_lock;
+                switch (pkt.m_data.value.lock.lock)
                 {
-                    lock = TGT_UNLOCKED;
+                case LockState::Off: target = TGT_UNLOCKED; break;
+                case LockState::On: target = TGT_LOCKED; break;
+                case LockState::Toggle:
+                    target = target == TGT_LOCKED ? TGT_UNLOCKED : TGT_LOCKED;
+                    query = true;
+                    break;
                 }
-                else
+                if (lockIntent.desired() < 0 && target != garage_door.target_lock)
                 {
-                    lock = TGT_LOCKED;
-                }
-                // Send a get status to make sure we are in sync
-                send_get_status();
-                break;
-            }
-            if (lock != garage_door.target_lock)
-            {
-                ESP_LOGD(TAG, "Lock Cmd %d", lock);
-                notify_homekit_target_lock(lock);
-                // Clear pending lock on/off flags as we have now received an update from the door about the lock state
-                lockIntent.clear();
-                // If user want to trigger motion sensor based on lock button, do it now as we know the lock state has changed
-                if (motionTriggers.bit.lockKey)
-                {
-                    notify_homekit_motion(true);
+                    garage_door.target_lock = target;
+                    publish_homekit_target_lock(target);
+                    changed = true;
                 }
             }
+            if (query) send_get_status();
+            if (changed && motionTriggers.bit.lockKey) notify_homekit_motion(true);
             break;
         }
 
         case PacketCommand::Light:
         {
-            bool l = garage_door.light;
             manual_recovery();
-            switch (pkt.m_data.value.light.light)
+            bool value, changed, query = false;
             {
-            case LightState::Off:
-                l = false;
-                break;
-            case LightState::On:
-                l = true;
-                break;
-            case LightState::Toggle:
-            case LightState::Toggle2:
-                l = !garage_door.light;
-                // Send a get status to make sure we are in sync
-                send_get_status();
-                break;
-            }
-            if (l != garage_door.light)
-            {
-                ESP_LOGD(TAG, "Light Cmd %s", l ? "On" : "Off");
-                notify_homekit_light(l);
-                // Clear pending light on/off flags as we have now received an update from the door about the light state
-                lightIntent.clear();
-                // If user want to trigger motion sensor based on light button, do it now as we know the light state has changed
-                if (motionTriggers.bit.lightKey)
+                FunctionDelayLock lock;
+                value = garage_door.light;
+                switch (pkt.m_data.value.light.light)
                 {
-                    notify_homekit_motion(true);
+                case LightState::Off: value = false; break;
+                case LightState::On: value = true; break;
+                case LightState::Toggle:
+                case LightState::Toggle2: value = !value; query = true; break;
                 }
+                changed = value != garage_door.light;
+                garage_door.light = value;
+            }
+            if (query) send_get_status();
+            if (changed)
+            {
+                publish_homekit_light(value);
+                if (motionTriggers.bit.lightKey) notify_homekit_motion(true);
             }
             break;
         }
@@ -2874,6 +2928,7 @@ void comms_loop_drycontact()
 void comms_loop()
 {
 #ifndef USE_GDOLIB
+    reportControlStatusQueryDrops(); // Aggregate reporting outside command ownership.
     {
         FunctionDelayLock lock;
         if (!functionDelayPending && lightReleaseReserved)
@@ -2886,6 +2941,7 @@ void comms_loop()
     checkDoorCompleted.process();
 #ifndef USE_GDOLIB
     processPendingDoorIntent();
+    processControlIntents();
 #endif
     if (!comms_setup_done)
         return;
@@ -3130,7 +3186,7 @@ bool process_PacketAction(PacketAction &pkt_ac)
     writingDoorPacket = nullptr;
     if (sent && control)
     {
-        control->completed(pkt_ac.doorGeneration, pkt_ac.doorPress);
+        control->completed(pkt_ac.doorGeneration, pkt_ac.doorPress, doorControlType == DOOR_CONTROL_SEC_PLUS_V2);
         if (control == &lightIntent && !pkt_ac.doorGeneration && !pkt_ac.doorPress)
             heldLightReleaseRequired = false;
     }
@@ -3999,6 +4055,35 @@ void send_set_ttc(uint16_t seconds)
 }
 #endif
 
+#ifndef USE_GDOLIB
+static uint32_t controlStatusQueryDrops = 0; // Protected by command ownership.
+void requestControlStatus()
+{
+    FunctionDelayLock lock;
+    PacketData data;
+    const bool sec1 = doorControlType == DOOR_CONTROL_SEC_PLUS_V1;
+    data.type = sec1 ? PacketDataType::Status : PacketDataType::NoData;
+    if (sec1) data.value.cmd = secplus1Codes::QueryLightLockStatus;
+    else data.value.no_data = NoData();
+    PacketAction packet = {Packet(sec1 ? PacketCommand::Status : PacketCommand::GetStatus, data, id_code), true, 0};
+    if (!txQueuePush(&packet) && controlStatusQueryDrops != UINT32_MAX)
+        ++controlStatusQueryDrops;
+}
+
+void reportControlStatusQueryDrops()
+{
+    uint32_t dropped;
+    {
+        FunctionDelayLock lock;
+        dropped = controlStatusQueryDrops;
+        controlStatusQueryDrops = 0;
+    }
+    if (dropped)
+        ESP_LOGW(TAG, "%lu control status queries rejected by TX admission", (unsigned long)dropped);
+}
+
+#endif
+
 #ifdef USE_GDOLIB
 bool set_lock(bool value, bool verify)
 {
@@ -4025,10 +4110,18 @@ bool set_lock(bool value, bool verify)
     FunctionDelayLock lock;
     if (!comms_setup_done || !txQueueReady)
         return false;
-    if (verify && (garage_door.current_lock == (value ? CURR_LOCKED : CURR_UNLOCKED) || lockIntent.pending(value)))
+    const auto decision = lockIntent.request(value, garage_door.current_lock == CURR_LOCKED, verify,
+                                             doorControlType == DOOR_CONTROL_SEC_PLUS_V1);
+    if (decision != ControlIntent::Decision::Admit)
     {
         last_reported_garage_door.current_lock = (LockCurrentState)0xFF;
-        return false;
+        if (decision == ControlIntent::Decision::Handled)
+        {
+            garage_door.target_lock = value ? TGT_LOCKED : TGT_UNLOCKED;
+            publish_homekit_target_lock(garage_door.target_lock);
+            requestControlStatus();
+        }
+        return decision == ControlIntent::Decision::Handled;
     }
     PacketData data;
     data.type = PacketDataType::Lock;
@@ -4062,6 +4155,8 @@ bool set_lock(bool value, bool verify)
         return false;
     }
     garage_door.target_lock = value ? TGT_LOCKED : TGT_UNLOCKED;
+    publish_homekit_target_lock(garage_door.target_lock);
+    requestControlStatus();
     return true;
 }
 #endif // USE_GDOLIB
@@ -4138,10 +4233,14 @@ bool set_light(bool value, bool verify)
     FunctionDelayLock lock;
     if (!comms_setup_done || !txQueueReady)
         return false;
-    if (verify && (garage_door.light == value || lightIntent.pending(value)))
+    const auto decision = lightIntent.request(value, garage_door.light, verify,
+                                              doorControlType == DOOR_CONTROL_SEC_PLUS_V1);
+    if (decision != ControlIntent::Decision::Admit)
     {
         last_reported_garage_door.light = !value;
-        return false;
+        if (decision == ControlIntent::Decision::Handled)
+            requestControlStatus();
+        return decision == ControlIntent::Decision::Handled;
     }
     PacketData data;
     data.type = PacketDataType::Light;
@@ -4174,9 +4273,31 @@ bool set_light(bool value, bool verify)
         lightIntent = previous;
         return false;
     }
-    if (verify)
-        send_get_status();
+    requestControlStatus(); // Forced Sec+2 TTC flashes also require feedback.
     return true;
+}
+
+void processControlIntents()
+{
+    FunctionDelayLock lock;
+    if (!comms_setup_done) return;
+    for (unsigned index = 0; index < 2; ++index)
+    {
+        auto &control = index == 0 ? lightIntent : lockIntent;
+        const auto previous = control;
+        const int target = control.reconcile();
+        if (target >= 0 && !(index == 0 ? set_light(target, false) : set_lock(target, false)))
+            control = previous; // Same feedback/deadline, bounded admission retry.
+    }
+    if (lockIntent.desired() < 0)
+    {
+        const auto observedTarget = garage_door.current_lock == CURR_LOCKED ? TGT_LOCKED : TGT_UNLOCKED;
+        if (garage_door.target_lock != observedTarget)
+        {
+            garage_door.target_lock = observedTarget;
+            publish_homekit_target_lock(observedTarget);
+        }
+    }
 }
 
 void toggle_light()

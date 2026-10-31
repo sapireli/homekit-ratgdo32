@@ -9,6 +9,49 @@ from test_door_queue_atomic import block, QUEUE_HARNESS_PREFIX
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = Path(os.environ.get("CONTROL_TEST_SOURCE", ROOT / "src/comms.cpp"))
 
+
+def control_fixture(source):
+    prefix = QUEUE_HARNESS_PREFIX.replace("PacketData m_data;Packet(", "PacketData m_data;Packet()=default;Packet(").replace("enum class PacketDataType {DoorAction};", "enum class PacketDataType {DoorAction,Light,Lock,Status,NoData};")
+    prefix = prefix.replace("void send_get_status(){}", "unsigned statusQueries=0;void send_get_status(){++statusQueries;}")
+    prefix = prefix.replace("enum class PacketCommand {DoorAction};", "enum class PacketCommand {DoorAction,Light,Lock,Status,GetStatus};")
+    prefix = prefix.replace("namespace secplus1Codes {", "namespace secplus1Codes {constexpr int LightButtonPress=3,LightButtonRelease=4,LockButtonPress=5,LockButtonRelease=6,QueryLightLockStatus=7;")
+    prefix = prefix.replace("struct Value {struct Action", "struct Value {NoData no_data;struct Light {LightState light=LightState::Off;bool pressed=false;}light;struct Lock {LockState lock=LockState::Off;bool pressed=false;}lock;struct Action")
+    prefix = prefix.replace("enum class DoorAction", "struct NoData {};enum class LightState {On,Off};enum class LockState {On,Off};enum LockCurrentState {CURR_UNLOCKED,CURR_LOCKED};constexpr int TGT_UNLOCKED=0,TGT_LOCKED=1;\nenum class DoorAction")
+    prefix = prefix.replace("bool pinModeObstructionSensor=false;", "bool pinModeObstructionSensor=false,light=false,wallPanelEmulated=false;int current_lock=CURR_UNLOCKED,target_lock=TGT_UNLOCKED;")
+    prefix = prefix.replace("QueueHandle_t xQueueCreate(unsigned,unsigned){queueState.items.clear();return &queueState;}", "bool failQueue=false;unsigned queueCreates=0;QueueHandle_t xQueueCreate(unsigned,unsigned){++queueCreates;if(failQueue)return nullptr;queueState.items.clear();return &queueState;}")
+    prefix += r'''
+int xQueueReceive(QueueHandle_t q,PacketAction *out,int){std::lock_guard<std::mutex>lock(q->mutex);if(q->items.empty())return 0;*out=q->items.front();q->items.pop_front();return pdTRUE;}
+'''
+    prefix += (ROOT / "src/door_command_lifecycle.h").read_text().replace("#pragma once", "") + r'''
+DoorCommandLifecycle doorLifecycle;
+uint32_t now=1000;uint32_t _millis(){return now;}
+struct {int current_lock=0;bool light=false;}last_reported_garage_door;
+void sec1_poll_status(int){++statusQueries;}
+int publishedTarget=0;void publish_homekit_target_lock(int value){publishedTarget=value;}
+bool functionDelayPending=false,functionDelayFinalWait=false;
+void (*functionDelayCallback)()=nullptr;uint32_t functionDelayNextTick=0;
+void sec1_light_press(uint32_t delay=0);
+void sec1_light_release(uint8_t howManyReleases=2,uint32_t delay=0);
+bool set_light(bool,bool=true);bool set_lock(bool,bool=true);
+'''
+    declarations = ["inline bool txQueueCreate()", "inline uint32_t txQueueCount()", "inline bool txQueuePushUnlocked(", "inline bool txQueueLock()", "inline void txQueueUnlock()", "inline bool txQueuePush(", "inline bool txQueuePushSequence(", "inline bool txQueuePop(", "inline bool txQueuePrepare()"]
+    functions = "\n".join(block(source, d) for d in declarations)
+    controls = source[source.index("#else  // USE_GDOLIB\nbool set_lock"):]
+    functions += "\n" + block(controls, "bool set_lock(bool value, bool verify)")
+    controls = controls[controls.index("void sec1_light_press"):]
+    functions += "\n" + "\n".join(block(controls,d) for d in ["void sec1_light_press(","void sec1_light_release(","bool set_light("])
+    functions += "\n" + block(source, "void cancelFunctionDelay()")
+    if "void requestControlStatus()" in source:
+        query = block(source, "void requestControlStatus()")
+        if "controlStatusQueryDrops" in query:
+            query = "uint32_t controlStatusQueryDrops=0;\n" + query
+        functions = "void requestControlStatus();\n" + functions + "\n" + query
+    # New production ownership helpers are included as one unit when present.
+    start = source.find("// BEGIN CONTROL OWNERSHIP")
+    end = source.find("// END CONTROL OWNERSHIP")
+    ownership = source[start:end] if start >= 0 else "bool pendingLightOn=false,pendingLightOff=false,pendingLockOn=false,pendingLockOff=false;"
+    return prefix + ownership + "\n" + functions
+
 class ControlQueueOwnership(unittest.TestCase):
     def test_queue_failure_report_respects_console_pin_ownership(self):
         source = SOURCE.read_text()
@@ -44,41 +87,39 @@ int main(){
                                 "-D"+platform,"-I",str(ROOT/"lib/ratgdo"),str(cpp),"-o",str(exe)],check=True)
                 subprocess.run([str(exe)],check=True,timeout=5)
 
-    def test_production_controls(self):
+    def test_feedback_query_failure_reporting_releases_command_lock(self):
         source = SOURCE.read_text()
-        prefix = QUEUE_HARNESS_PREFIX.replace("PacketData m_data;Packet(", "PacketData m_data;Packet()=default;Packet(").replace("enum class PacketDataType {DoorAction};", "enum class PacketDataType {DoorAction,Light,Lock};")
-        prefix = prefix.replace("enum class PacketCommand {DoorAction};", "enum class PacketCommand {DoorAction,Light,Lock};")
-        prefix = prefix.replace("namespace secplus1Codes {", "namespace secplus1Codes {constexpr int LightButtonPress=3,LightButtonRelease=4,LockButtonPress=5,LockButtonRelease=6,QueryLightLockStatus=7;")
-        prefix = prefix.replace("struct Value {struct Action", "struct Value {struct Light {LightState light=LightState::Off;bool pressed=false;}light;struct Lock {LockState lock=LockState::Off;bool pressed=false;}lock;struct Action")
-        prefix = prefix.replace("enum class DoorAction", "enum class LightState {On,Off};enum class LockState {On,Off};enum LockCurrentState {CURR_UNLOCKED,CURR_LOCKED};constexpr int TGT_UNLOCKED=0,TGT_LOCKED=1;\nenum class DoorAction")
-        prefix = prefix.replace("bool pinModeObstructionSensor=false;", "bool pinModeObstructionSensor=false,light=false,wallPanelEmulated=false;int current_lock=CURR_UNLOCKED,target_lock=TGT_UNLOCKED;")
-        prefix = prefix.replace("QueueHandle_t xQueueCreate(unsigned,unsigned){queueState.items.clear();return &queueState;}", "bool failQueue=false;unsigned queueCreates=0;QueueHandle_t xQueueCreate(unsigned,unsigned){++queueCreates;if(failQueue)return nullptr;queueState.items.clear();return &queueState;}")
-        prefix += r'''
-int xQueueReceive(QueueHandle_t q,PacketAction *out,int){std::lock_guard<std::mutex>lock(q->mutex);if(q->items.empty())return 0;*out=q->items.front();q->items.pop_front();return pdTRUE;}
+        harness = control_fixture(source)
+        harness = harness.replace("std::recursive_mutex controlMutex;", "thread_local unsigned commandDepth=0;std::recursive_mutex controlMutex;")
+        harness = harness.replace("controlMutex.lock();", "controlMutex.lock();++commandDepth;")
+        harness = harness.replace("controlMutex.unlock();", "--commandDepth;controlMutex.unlock();")
+        harness += r'''
+#undef ESP_LOGW
+unsigned reports=0,reportedCount=0;
+#define ESP_LOGW(tag,format,count) do{assert(commandDepth==0);++reports;reportedCount=count;}while(0)
 '''
-        prefix += (ROOT / "src/door_command_lifecycle.h").read_text().replace("#pragma once", "") + r'''
-DoorCommandLifecycle doorLifecycle;
-uint32_t now=1000;uint32_t _millis(){return now;}
-struct {int current_lock=0;bool light=false;}last_reported_garage_door;
-void sec1_poll_status(int){}
-bool functionDelayPending=false,functionDelayFinalWait=false;
-void (*functionDelayCallback)()=nullptr;uint32_t functionDelayNextTick=0;
-void sec1_light_press(uint32_t delay=0);
-void sec1_light_release(uint8_t howManyReleases=2,uint32_t delay=0);
-bool set_light(bool,bool=true);bool set_lock(bool,bool=true);
+        harness += block(source, "void reportControlStatusQueryDrops()\n{") + r'''
+int main(){
+ assert(txQueueCreate());PacketData data{};PacketAction filler={Packet(PacketCommand::Status,data,0),false,0};
+ while(txQueuePush(&filler)){}
+ requestControlStatus();requestControlStatus();assert(controlStatusQueryDrops==2&&reports==0);
+ reportControlStatusQueryDrops();assert(reports==1&&reportedCount==2&&controlStatusQueryDrops==0);
+ reportControlStatusQueryDrops();assert(reports==1);
+ queueState.items.clear();doorControlType=2;requestControlStatus();
+ assert(queueState.items.size()==1&&queueState.items.back().pkt.m_data.type==PacketDataType::NoData);
+ doorControlType=1;requestControlStatus();
+ assert(queueState.items.size()==2&&queueState.items.back().pkt.m_data.type==PacketDataType::Status);
+ assert(controlStatusQueryDrops==0);
+}
 '''
-        declarations = ["inline bool txQueueCreate()", "inline uint32_t txQueueCount()", "inline bool txQueuePushUnlocked(", "inline bool txQueueLock()", "inline void txQueueUnlock()", "inline bool txQueuePush(", "inline bool txQueuePushSequence(", "inline bool txQueuePop(", "inline bool txQueuePrepare()"]
-        functions = "\n".join(block(source, d) for d in declarations)
-        controls = source[source.index("#else  // USE_GDOLIB\nbool set_lock"):]
-        functions += "\n" + block(controls, "bool set_lock(bool value, bool verify)")
-        controls = controls[controls.index("void sec1_light_press"):]
-        functions += "\n" + "\n".join(block(controls,d) for d in ["void sec1_light_press(","void sec1_light_release(","bool set_light("])
-        functions += "\n" + block(source, "void cancelFunctionDelay()")
-        # New production ownership helpers are included as one unit when present.
-        start = source.find("// BEGIN CONTROL OWNERSHIP")
-        end = source.find("// END CONTROL OWNERSHIP")
-        ownership = source[start:end] if start >= 0 else "bool pendingLightOn=false,pendingLightOff=false,pendingLockOn=false,pendingLockOff=false;"
-        harness = prefix + ownership + "\n" + functions + r'''
+        with tempfile.TemporaryDirectory() as directory:
+            cpp, exe = Path(directory)/"queries.cpp", Path(directory)/"queries"
+            cpp.write_text(harness)
+            subprocess.run(["c++","-std=c++17","-fsanitize=address,undefined","-pthread",str(cpp),"-o",str(exe)],check=True)
+            subprocess.run([str(exe)],check=True,timeout=5)
+
+    def test_production_controls(self):
+        harness = control_fixture(SOURCE.read_text()) + r'''
 PacketAction filler(){PacketData d{};return {Packet(PacketCommand::DoorAction,d,0),false,0};}
 void reset(unsigned count){queueState.items.clear();for(unsigned i=0;i<count;++i)queueState.items.push_back(filler());}
 int main(){
@@ -94,7 +135,7 @@ int main(){
  garage_door.light=true;set_light(true);garage_door.light=false;
  reset(16);assert(!set_lock(true));reset(0);assert(set_lock(true));
  now+=4000;reset(0);assert(set_lock(true)); // Missing acknowledgement cannot suppress forever.
- doorControlType=1;reset(15);assert(!set_light(false,false));assert(queueState.items.size()==15);
+ lightIntent.reset();lockIntent.reset();doorControlType=1;reset(15);assert(!set_light(false,false));assert(queueState.items.size()==15);
  reset(14);assert(set_light(false,false));assert(queueState.items.size()==16);
  assert(queueState.items[14].pkt.m_data.value.cmd==secplus1Codes::LightButtonPress);
  assert(queueState.items[15].pkt.m_data.value.cmd==secplus1Codes::LightButtonRelease);
@@ -117,7 +158,7 @@ int main(){
  reset(0);lightIntent.reset();garage_door.light=false;
  bool first=false,second=false;
  std::thread a([&]{first=set_light(true);});std::thread b([&]{second=set_light(true);});
- a.join();b.join();assert(first!=second&&queueState.items.size()==3);
+ a.join();b.join();assert(first!=second&&queueState.items.size()==4);
 }
 '''
         with tempfile.TemporaryDirectory() as directory:
