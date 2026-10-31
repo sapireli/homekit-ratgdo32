@@ -21,7 +21,11 @@
 #ifdef ESP32
 #define PROGMEM // so it is no-op in webcontent.h
 #include <WebServer.h>
+#if defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+extern WebServer &server;
+#else
 extern WebServer server;
+#endif
 #else
 #include <ESP8266WebServer.h>
 extern ESP8266WebServer server;
