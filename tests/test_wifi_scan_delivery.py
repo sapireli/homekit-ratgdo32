@@ -61,7 +61,7 @@ class WifiScanDeliveryTest(unittest.TestCase):
 #define TXT_BUFFER_SIZE 1024
 class String:public std::string {public:
  using std::string::string;using std::string::operator=;
- String()=default;String(const std::string&s):std::string(s){}String(int n):std::string(std::to_string(n)){}
+ String()=default;String(const std::string&s):std::string(s){}String(int n):std::string(std::to_string(n)){}bool equals(const char*s)const{return *this==s;}
 };
 struct wifiNet_t {String ssid;int32_t rssi=-40,channel=1;uint8_t bssid[6]{};int encryptionType=0;};
 struct Compare {bool operator()(const wifiNet_t&a,const wifiNet_t&b)const{return a.ssid<b.ssid||(a.ssid==b.ssid&&a.rssi>b.rssi);}};
@@ -85,7 +85,15 @@ const char *encryptionToString(int){return "";}
 std::string expected;
 int responseStatus=0;
 struct Client {void setNoDelay(bool){}};
+unsigned configured=0,restarted=0;
+void set_new_ssid(const char*,const char*,const uint8_t*){assert(!wifiScanOwned);++configured;}
+void sync_and_restart(){++restarted;}
+#define snprintf_P snprintf
+const char *response400invalid="bad";
 struct Server {unsigned handled=0;Client client(){return {};}
+ unsigned args(){return 4;}
+ String arg(const char*k){return std::strcmp(k,"net")==0?"0":std::strcmp(k,"advanced")==0?"on":"manual";}
+ String uri(){return "/setssid";}
  void sendContent(const char*p,size_t n){expected.append(p,n);}
  void send_P(int status,const char*,const char*){responseStatus=status;}
  void handleClient(){++handled;}
@@ -99,7 +107,7 @@ namespace improv {constexpr int ERROR_UNKNOWN=1,GET_WIFI_NETWORKS=2;
 unsigned responses=0,finalResponses=0,errors=0;
 void send_response(const std::vector<uint8_t>&data){++responses;if(data[0]==0)++finalResponses;}
 void set_error(int){++errors;}
-void delay(unsigned){readerProgress();}
+void delay(unsigned ms){if(ms==1)readerProgress();}
 
 unsigned now=0;
 uint32_t _millis(){return now;}
@@ -129,7 +137,7 @@ ssize_t send(int,const void*p,size_t n,int flags){
 }
 """ + formats + fields + r"""
 HttpOwnedResponse httpOwned[2],*httpWriting=&httpOwned[0];
-""" + "bool wifi_scan(bool retainResults=false);\n" + block(web, "bool defer_http_generated_body(") + block(web, "bool drainHttpBodies()") + block(web, "bool pollHttpResponses()") + block(soft, "void htmlEscape(") + renderer + scan + block(soft, "void release_wifi_scan_results()") + result_class + cli + provision + pending + legacy + entry + block(soft, "void handle_rescan()") + r"""
+""" + "bool wifi_scan(bool retainResults=false);\n" + block(web, "bool defer_http_generated_body(") + block(web, "bool drainHttpBodies()") + block(web, "bool pollHttpResponses()") + block(soft, "void htmlEscape(") + renderer + scan + block(soft, "bool acquire_wifi_scan_results()") + block(soft, "void release_wifi_scan_results()") + result_class + cli + provision + pending + legacy + entry + block(soft, "void handle_rescan()") + block(soft, "void handle_setssid()") + r"""
 void readerProgress(){
  unsigned before=asyncScans;
  wifiScanPending=true;pollWifiScan();
@@ -226,6 +234,11 @@ int main(){
  assert(!wifiScanOwned);
  syncCount=2;getAvailableWifiNetworks();
  assert(!wifiScanOwned&&responses==2&&finalResponses==1&&errors==1);
+ wifiScanPending=false;
+ // HTTP selection rejects busy registry access, and releases its result lease
+ // before network reconfiguration or restart can invoke another producer.
+ {WifiScanResults results;assert(results.acquire());handle_setssid();assert(responseStatus==503&&configured==0);}
+ handle_setssid();assert(responseStatus==200&&configured==1&&restarted==1&&!wifiScanOwned);
 }
 """
         with tempfile.TemporaryDirectory() as directory:
