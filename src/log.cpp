@@ -21,6 +21,8 @@
 #ifndef ESP8266
 #include <esp32-hal.h>
 #include <esp_core_dump.h>
+#include <lwip/opt.h>
+#include <arch/sys_arch.h>
 #endif
 
 // RATGDO project includes
@@ -221,7 +223,21 @@ void LOG::disableSerialConsole()
 
 void LOG::logToBuffer(const char *fmt, va_list args)
 {
-    TAKE_MUTEX();
+#ifndef ESP8266
+    // lwIP logs while holding its non-recursive TCPIP core lock. Socket
+    // delivery would take that lock again; waiting for another logger can
+    // also deadlock if that logger is waiting for the core.
+    const bool coreLocked = sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER);
+    if (coreLocked)
+    {
+        if (xSemaphoreTakeRecursive(logMutex, 0) != pdTRUE)
+            return;
+    }
+    else
+#endif
+    {
+        TAKE_MUTEX();
+    }
     // parse the format string into lineBuffer
     vsnprintf(lineBuffer, LINE_BUFFER_SIZE, fmt, args);
     // If timestamp is wrapped in () and not [] then message is from one of the ESP_LOGx() functions.
@@ -267,7 +283,11 @@ void LOG::logToBuffer(const char *fmt, va_list args)
 #endif
 
     static bool inFn = false;
-    if (!inFn)
+    if (!inFn
+#ifndef ESP8266
+        && !coreLocked
+#endif
+    )
     {
         // Control recursion... make sure we don't get into a loop if any
         // of the functions we use here log a message.  This is known to happen
