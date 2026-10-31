@@ -105,6 +105,9 @@ jobs:
       - name: Build PlatformIO Project
         run: pio run -e ratgdo_esp32dev
 
+      - name: Test installed SDK multipart parser
+        run: python tests/test_webserver_multipart.py --source "$HOME/.platformio/packages/framework-arduinoespressif32/libraries/WebServer/src/Parsing.cpp"
+
       - name : md5sum Firmware.bin
         run: |
           cd .pio/build/ratgdo_esp32dev
