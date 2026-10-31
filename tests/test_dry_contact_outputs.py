@@ -68,8 +68,16 @@ std::vector<Timer*> timers;
 bool failCreate=false,failStart=false,failToggleStart=false,expireDuringStart=false;
 int esp_timer_create(const esp_timer_create_args_t*a,esp_timer_handle_t*t){
  assert(!criticalDepth);if(failCreate)return -1;assert(creates<3);auto*p=&storage[creates++];*p={a->callback,a->arg,false};*t=p;return ESP_OK;}
-int esp_timer_start_once(esp_timer_handle_t t,uint64_t us){assert(!criticalDepth&&us==500000);
- if(failStart||(failToggleStart&&t==&storage[0]))return -1;assert(!t->active);t->active=true;timers.push_back(t);if(expireDuringStart){t->active=false;t->callback(t->arg);}return ESP_OK;}
+int esp_timer_start_once(esp_timer_handle_t t,uint64_t us){
+    assert(!criticalDepth&&us==500000);
+    if(failStart||(failToggleStart&&t==&storage[0]))
+        return -1;
+    assert(!t->active);
+    t->active=true;
+    timers.push_back(t);
+    if(expireDuringStart){t->active=false;t->callback(t->arg);}
+    return ESP_OK;
+}
 int esp_timer_stop(esp_timer_handle_t t){assert(!criticalDepth);if(!t->active)return -1;t->active=false;return ESP_OK;}
 void gpio_set_level(int pin,int value) { assert(pin>=0 && value==0); preloads.push_back(pin); }
 void gpio_config(const gpio_config_t *c) { assert(c->pin_bit_mask); configs.push_back(c->pin_bit_mask); }
