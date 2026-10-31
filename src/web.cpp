@@ -634,6 +634,8 @@ static char writeBuffer[512];
 bool clientWrite(WiFiClient client, const char *data)
 {
     const size_t len = strlen(data);
+    if (len == 0)
+        return true;
 #ifdef ESP32
     // NetworkClient::write() retries select() for seconds even when its stream
     // timeout is short. Never let a stalled browser block the GDO/HTTP loop,
@@ -650,16 +652,38 @@ bool clientWrite(WiFiClient client, const char *data)
 #endif
 }
 
-// Build each event in its own buffer: logger callbacks and heartbeat timers
-// can run concurrently with web_loop(). Send a whole event in one operation.
+// Callers hold SSELock across the whole event, so its spans cannot interleave
+// with another broadcaster. Borrow the existing strings rather than allocating
+// a temporary frame or sharing writeBuffer with status/redirect handlers.
 static bool sendSSEEvent(WiFiClient client, const char *event, const char *data)
 {
-    std::string frame = "event: ";
-    frame += event;
-    frame += "\ndata: ";
-    frame += data;
-    frame += "\n\n";
-    return clientWrite(client, frame.c_str());
+#ifdef ESP32
+    // One gathered nonblocking write avoids a separate TCP send for each span.
+    // lwIP copies these borrowed bytes before returning; no frame is allocated.
+    struct iovec parts[] = {
+        {const_cast<char *>("event: "), 7},
+        {const_cast<char *>(event), strlen(event)},
+        {const_cast<char *>("\ndata: "), 7},
+        {const_cast<char *>(data), strlen(data)},
+        {const_cast<char *>("\n\n"), 2}};
+    size_t length = 0;
+    for (const auto &part : parts)
+        length += part.iov_len;
+    struct msghdr message = {};
+    message.msg_iov = parts;
+    message.msg_iovlen = sizeof(parts) / sizeof(parts[0]);
+    if (sendmsg(client.fd(), &message, MSG_DONTWAIT) == static_cast<ssize_t>(length))
+        return true;
+    client.stop();
+    return false;
+#else
+    // Preserve the existing ESP8266 behavior: finish earlier queued output
+    // before beginning a new event. Do not flush between pieces of one event.
+    client.flush();
+    return clientWrite(client, "event: ") && clientWrite(client, event) &&
+           clientWrite(client, "\ndata: ") && clientWrite(client, data) &&
+           clientWrite(client, "\n\n");
+#endif
 }
 
 // Helper functions for connection throttling
