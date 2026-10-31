@@ -42,6 +42,11 @@ class DryContactOutputs(unittest.TestCase):
 #include <vector>
 #include <utility>
 #include <atomic>
+using portMUX_TYPE=int;
+#define portMUX_INITIALIZER_UNLOCKED 0
+int criticalDepth=0;
+void portENTER_CRITICAL(portMUX_TYPE*){assert(criticalDepth++==0);}
+void portEXIT_CRITICAL(portMUX_TYPE*){assert(--criticalDepth==0);}
 #define ESP32 1
 #define OUTPUT 1
 #define LOW 0
@@ -60,12 +65,12 @@ struct esp_timer_create_args_t {void(*callback)(void*);void*arg;int dispatch_met
 constexpr int ESP_OK=0,ESP_TIMER_TASK=0;
 Timer storage[3];unsigned creates=0;
 std::vector<Timer*> timers;
-bool failCreate=false,failStart=false,failToggleStart=false;
+bool failCreate=false,failStart=false,failToggleStart=false,expireDuringStart=false;
 int esp_timer_create(const esp_timer_create_args_t*a,esp_timer_handle_t*t){
- if(failCreate)return -1;assert(creates<3);auto*p=&storage[creates++];*p={a->callback,a->arg,false};*t=p;return ESP_OK;}
-int esp_timer_start_once(esp_timer_handle_t t,uint64_t us){assert(us==500000);
- if(failStart||(failToggleStart&&t==&storage[0]))return -1;assert(!t->active);t->active=true;timers.push_back(t);return ESP_OK;}
-int esp_timer_stop(esp_timer_handle_t t){if(!t->active)return -1;t->active=false;return ESP_OK;}
+ assert(!criticalDepth);if(failCreate)return -1;assert(creates<3);auto*p=&storage[creates++];*p={a->callback,a->arg,false};*t=p;return ESP_OK;}
+int esp_timer_start_once(esp_timer_handle_t t,uint64_t us){assert(!criticalDepth&&us==500000);
+ if(failStart||(failToggleStart&&t==&storage[0]))return -1;assert(!t->active);t->active=true;timers.push_back(t);if(expireDuringStart){t->active=false;t->callback(t->arg);}return ESP_OK;}
+int esp_timer_stop(esp_timer_handle_t t){assert(!criticalDepth);if(!t->active)return -1;t->active=false;return ESP_OK;}
 void gpio_set_level(int pin,int value) { assert(pin>=0 && value==0); preloads.push_back(pin); }
 void gpio_config(const gpio_config_t *c) { assert(c->pin_bit_mask); configs.push_back(c->pin_bit_mask); }
 void pinMode(int pin,int) { assert(pin>=0); modes.push_back(pin); }
@@ -120,10 +125,11 @@ int main() {
     assert(!command(DoorAction::Open)&&writes.size()==count);complete();clear();
     // Failed start deasserts immediately and allows a later retry.
     failStart=true;assert(!command(DoorAction::Open));
-    assert((writes==std::vector<std::pair<int,int>>({{16,HIGH},{16,LOW}})));
+    assert(writes.empty());
     failStart=false;failToggleStart=true;clear();assert(!command(DoorAction::Open));
-    assert((writes==std::vector<std::pair<int,int>>({{16,HIGH},{22,HIGH},{22,LOW},{16,LOW}})));
-    complete();failToggleStart=false;clear();assert(command(DoorAction::Open));
+    assert(writes.empty());
+    complete();failToggleStart=false;clear();expireDuringStart=true;assert(!command(DoorAction::Open)&&writes.empty());
+    complete();expireDuringStart=false;clear();assert(command(DoorAction::Open));
     // Teardown cancels timers and forces LOW without freeing callback storage.
     cancelDryContactTimers();assert(!command(DoorAction::Open));
     complete();assert(writes.back()==std::make_pair(17,LOW));
