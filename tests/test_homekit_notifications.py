@@ -249,9 +249,13 @@ class HomekitNotificationsTest(unittest.TestCase):
         body = function(source, 'void DEV_GarageDoor::loop()')
         harness = r"""
 #include <cassert>
+#include "homekit_notifications.h"
+enum class LockTargetState { TGT_UNLOCKED, TGT_LOCKED };
+static HomekitBooleanMailbox lockTargetMailbox;
+HomekitBooleanMailbox &mailbox(HomekitSignal){return lockTargetMailbox;}
 #define ESP_LOGD(...) ((void)0)
 void runtime_diagnostics_homekit_progress(){}
-struct Value { void setVal(unsigned){} };
+struct Value { template<class T> void setVal(T){} };
 struct GDOEvent { Value *c; union { bool b; unsigned u; } value; };
 unsigned uxQueueMessagesWaiting(void *queue){assert(queue);return 0;}
 void xQueueReceive(void *,GDOEvent *,int){}
@@ -265,7 +269,7 @@ struct DEV_GarageDoor {
             cpp = Path(directory)/'null-queue.cpp'
             binary = Path(directory)/'null-queue'
             cpp.write_text(harness+body+'\nint main(){DEV_GarageDoor service; service.loop();}')
-            subprocess.run([shutil.which('c++'),'-std=c++17',str(cpp),'-o',str(binary)],
+            subprocess.run([shutil.which('c++'),'-std=c++17','-I',str(Path('src').resolve()),str(cpp),'-o',str(binary)],
                            check=True,capture_output=True)
             result = subprocess.run([str(binary)],capture_output=True,text=True,timeout=5)
             self.assertEqual(result.returncode,0,result.stderr)

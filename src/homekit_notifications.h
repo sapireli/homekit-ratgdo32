@@ -84,7 +84,7 @@ public:
 };
 
 enum class HomekitSignal : uint8_t {
-    Light, Laser, Motion, Arriving, Departing, Vehicle, Room, Stop, Manual, Count
+    Light, Laser, Motion, Arriving, Departing, Vehicle, Room, Stop, Manual, LockTarget, Count
 };
 enum class HomekitService : uint8_t {
     Light, Laser, Motion, Vehicle, Room, Stop, Manual, Count

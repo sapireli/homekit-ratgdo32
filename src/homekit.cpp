@@ -1232,6 +1232,9 @@ void DEV_GarageDoor::loop()
             ESP_LOGD(TAG, "Set Unknown: %d", e.value.u);
         e.c->setVal(e.value.u);
     }
+    bool targetLocked;
+    if (mailbox(HomekitSignal::LockTarget).take(targetLocked) && lockTarget)
+        lockTarget->setVal(targetLocked ? LockTargetState::TGT_LOCKED : LockTargetState::TGT_UNLOCKED);
 }
 
 /****************************************************************************
@@ -1508,26 +1511,26 @@ void notify_homekit_current_door_state_change(GarageDoorCurrentState state)
 #endif
 }
 
-void notify_homekit_target_lock(LockTargetState state)
+void publish_homekit_target_lock(LockTargetState state)
 {
-    garage_door.target_lock = state;
-    // Ignore invalid states
     if (state == 0xFF)
         return;
 #ifdef ESP32
-    if (!isPaired)
-        return;
-
-    GDOEvent e;
-    e.c = door->lockTarget;
-    e.value.u = (uint8_t)garage_door.target_lock;
-    queueSendHelper(door->event_q, e, "target lock");
+    // Command ownership chooses the logical target. Publication only transfers
+    // its latest accepted value to the HomeSpan owner, without I/O or logging.
+    mailbox(HomekitSignal::LockTarget).publish(state == LockTargetState::TGT_LOCKED);
 #else
     if (!arduino_homekit_get_running_server())
         return;
 
-    homekit_characteristic_notify(&target_lock_state, HOMEKIT_UINT8_CPP(garage_door.target_lock));
+    homekit_characteristic_notify(&target_lock_state, HOMEKIT_UINT8_CPP(state));
 #endif
+}
+
+void notify_homekit_target_lock(LockTargetState state)
+{
+    garage_door.target_lock = state;
+    publish_homekit_target_lock(state);
 }
 
 void notify_homekit_current_lock(LockCurrentState state)
