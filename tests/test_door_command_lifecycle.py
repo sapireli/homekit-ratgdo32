@@ -93,6 +93,9 @@ int main(){
     open_door();now+=3000;processPendingDoorIntent();assert(!pendingDoorCommand&&queued.size()==1);
     assert(doorLifecycle.allow(close.token,false));doorLifecycle.writing(close.token,false);
     status(CURR_CLOSING);processPendingDoorIntent();assert(queued.size()==1);
+    reset(CURR_OPEN);close_door();close=queued.back();doorLifecycle.writing(close.token,true);
+    open_door();doorLifecycle.status(255);doorLifecycle.writing(close.token,false);
+    processPendingDoorIntent();assert(queued.size()==1&&!pendingDoorCommand);
     // Physical movement before our queued Press invalidates stale intent.
     reset(CURR_OPEN);close_door();close=queued.back();status(CURR_CLOSING);
     assert(!doorLifecycle.allow(close.token,true));

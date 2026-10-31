@@ -66,6 +66,11 @@ public:
     }
     void status(int state)
     {
+        if (state < 0 || state > 4)
+        {
+            cancel(); // Unknown/corrupt feedback cannot authorize more movement.
+            return;
+        }
         if (!generation || state == initialState)
             return;
         if (!committed)
