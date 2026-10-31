@@ -131,9 +131,28 @@ const std::unordered_map<std::string, std::pair<const HTTPMethod, void (*)()>> b
 #endif
     {"/rest/events/subscribe", {HTTP_GET, handle_subscribe}}};
 
+static char writeBuffer[512];
+
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+namespace { size_t httpResponseWrite(NetworkClient &, const uint8_t *, size_t); }
+class OwnedWebServer : public WebServer
+{
+public:
+    using WebServer::WebServer;
+protected:
+    size_t _currentClientWrite(const char *data, size_t length) override
+    { return httpResponseWrite(_currentClient, reinterpret_cast<const uint8_t *>(data), length); }
+    size_t _currentClientWrite_P(PGM_P data, size_t length) override
+    { return httpResponseWrite(_currentClient, reinterpret_cast<const uint8_t *>(data), length); }
+};
+#endif
+
 // Declare web server on HTTP port 80.
 #ifdef ESP8266
 ESP8266WebServer server(80);
+#elif defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+static OwnedWebServer ownedServer(80);
+WebServer &server = ownedServer;
 #else
 WebServer server(80);
 #endif
@@ -141,11 +160,14 @@ WebServer server(80);
 #if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
 // Experimental pinned-SDK lifecycle: retain only ordinary HTTP response owners
 // until ACK completion, or abort their verified attached PCB after no progress.
-// This does not interrupt a NetworkClient::write blocked inside a handler.
+// Response writes use supported WebServer hooks so SDK write failures cannot
+// invalidate the retained shared socket before verified retirement.
 namespace {
 constexpr unsigned HTTP_OWNED_SLOTS = 2;
 constexpr uint32_t HTTP_OWNED_POLL_MS = HTTP_MAX_SEND_WAIT / 20;
+constexpr uint32_t HTTP_BODY_MAX_LIFETIME_MS = HTTP_MAX_SEND_WAIT;
 enum class HttpOwnedState { Empty, Active, Release, Aborted, Quarantined };
+enum class HttpBody { None, Flash, MessageLog, DiagnosticLog };
 struct HttpOwnedResponse {
     NetworkClient owner;
     HttpOwnedState state = HttpOwnedState::Empty;
@@ -157,6 +179,13 @@ struct HttpOwnedResponse {
     uint16_t localPort = 0, remotePort = 0;
     bool initialized = false, reported = false;
     bool discardQueued = false;
+    bool writeFailed = false;
+    HttpBody body = HttpBody::None;
+    const uint8_t *bodyData = nullptr;
+    size_t bodyLength = 0, bodyOffset = 0;
+    uint32_t bodyStarted = 0;
+    LOG::MessageCursor logCursor;
+    LOG::DiagnosticCursor diagnosticCursor;
 };
 struct HttpOwnedCounters {
     uint32_t tracked = 0, released = 0, aborted = 0, quarantined = 0;
@@ -164,6 +193,7 @@ struct HttpOwnedCounters {
 };
 HttpOwnedResponse httpOwned[HTTP_OWNED_SLOTS];
 HttpOwnedCounters httpOwnedCounters;
+HttpOwnedResponse *httpWriting = nullptr; // Main-only request writer context.
 struct tcpip_callback_msg *httpOwnedMessage = nullptr;
 std::atomic<bool> httpOwnedDone{false};
 bool httpOwnedPending = false;
@@ -260,7 +290,7 @@ void httpOwnedInspect(void *)
         truncated = truncated || segment != nullptr;
         entry.retained = retained;
         total += retained;
-        if (!truncated && retained == 0)
+        if (!truncated && retained == 0 && entry.body == HttpBody::None)
         {
             // Payload is acknowledged. Full socket close detaches netconn
             // normally; any FIN-only metadata remains under SDK management.
@@ -394,6 +424,145 @@ bool httpOwnedPoll()
     return httpOwnedRoom();
 }
 
+// A write error must not call NetworkClient::stop(): it closes every shared
+// alias before the verified owner can retire queued TCP payload. These hooks
+// perform one nonblocking send and never service another application loop.
+size_t httpResponseWrite(NetworkClient &client, const uint8_t *data, size_t length)
+{
+    if (!httpWriting || client.fd() != httpWriting->fd)
+        return client.write(data, length); // Excluded OTA/reset paths retain SDK behavior.
+    if (httpWriting->writeFailed || length == 0)
+        return 0;
+    const ssize_t sent = send(client.fd(), data, length, MSG_DONTWAIT);
+    if (sent == static_cast<ssize_t>(length)) return length;
+    httpWriting->writeFailed = true;
+    httpWriting->discardQueued = true;
+    return sent > 0 ? static_cast<size_t>(sent) : 0;
+}
+
+class HttpResponsePrint : public Print
+{
+    NetworkClient client;
+public:
+    explicit HttpResponsePrint(const NetworkClient &owner) : client(owner) {}
+    using Print::write;
+    size_t write(uint8_t value) override { return write(&value, 1); }
+    size_t write(const uint8_t *data, size_t length) override
+    { return httpResponseWrite(client, data, length); }
+};
+
+class HttpBufferPrint : public Print
+{
+public:
+    size_t used = 0;
+    bool failed = false;
+    using Print::write;
+    size_t write(uint8_t value) override { return write(&value, 1); }
+    size_t write(const uint8_t *data, size_t length) override
+    {
+        const size_t copied = std::min(length, sizeof(writeBuffer) - used);
+        memcpy(writeBuffer + used, data, copied);
+        used += copied;
+        failed = failed || copied != length;
+        return copied;
+    }
+};
+
+bool deferHttpAsset(const uint8_t *data, size_t length)
+{
+    if (!httpWriting || httpWriting->writeFailed) return false;
+    httpWriting->body = length ? HttpBody::Flash : HttpBody::None;
+    httpWriting->bodyData = data;
+    httpWriting->bodyLength = length;
+    httpWriting->bodyOffset = 0;
+    httpWriting->bodyStarted = static_cast<uint32_t>(_millis());
+    return true;
+}
+
+void deferHttpMessageLog()
+{
+    if (!httpWriting || httpWriting->writeFailed) return;
+    ratgdoLogger->beginMessageLog(httpWriting->logCursor);
+    HttpBufferPrint header;
+    ratgdoLogger->printMessageLogHeader(header);
+    if (header.failed)
+    {
+        httpWriting->writeFailed = httpWriting->discardQueued = true;
+        return;
+    }
+    httpWriting->body = HttpBody::MessageLog;
+    httpWriting->bodyData = reinterpret_cast<const uint8_t *>(writeBuffer);
+    httpWriting->bodyLength = header.used;
+    httpWriting->bodyOffset = 0;
+    httpWriting->bodyStarted = static_cast<uint32_t>(_millis());
+}
+
+void deferHttpDiagnosticLog(bool crash)
+{
+    if (!httpWriting || httpWriting->writeFailed) return;
+    ratgdoLogger->beginDiagnosticLog(httpWriting->diagnosticCursor, crash);
+    httpWriting->body = HttpBody::DiagnosticLog;
+    httpWriting->bodyData = reinterpret_cast<const uint8_t *>(writeBuffer);
+    httpWriting->bodyLength = httpWriting->bodyOffset = 0;
+    httpWriting->bodyStarted = static_cast<uint32_t>(_millis());
+}
+
+// Main-only, one bounded send per entry per iteration. Flash assets stay in
+// flash; message logs use a cursor and the existing 512-byte web scratch buffer.
+// No request handling/JSON formatting may reuse that buffer until completion.
+bool drainHttpBodies()
+{
+    if (httpOwnedPending) return true;
+    bool pending = false;
+    for (auto &entry : httpOwned)
+    {
+        if (entry.state != HttpOwnedState::Active || entry.body == HttpBody::None) continue;
+        // An occasional ACK must not reserve the sole web scratch buffer and
+        // prevent HTTP admission indefinitely.
+        if (entry.writeFailed || static_cast<uint32_t>(_millis() - entry.bodyStarted) >= HTTP_BODY_MAX_LIFETIME_MS)
+        {
+            entry.body = HttpBody::None;
+            entry.discardQueued = true;
+            continue;
+        }
+        if (entry.bodyOffset == entry.bodyLength &&
+            (entry.body == HttpBody::MessageLog || entry.body == HttpBody::DiagnosticLog))
+        {
+            bool overwritten = false;
+            entry.bodyLength = entry.body == HttpBody::MessageLog ?
+                ratgdoLogger->readMessageLog(entry.logCursor, reinterpret_cast<uint8_t *>(writeBuffer), 256, overwritten) :
+                ratgdoLogger->readDiagnosticLog(entry.diagnosticCursor, reinterpret_cast<uint8_t *>(writeBuffer), 256, overwritten);
+            entry.bodyOffset = 0;
+            if (overwritten)
+            {
+                static const char truncated[] = "\nLog truncated: newer messages overwrote unread log data.\n";
+                static const char changed[] = "\nDiagnostic log changed during download; please request it again.\n";
+                const bool diagnostic = entry.body == HttpBody::DiagnosticLog;
+                entry.body = HttpBody::Flash;
+                entry.bodyData = reinterpret_cast<const uint8_t *>(diagnostic ? changed : truncated);
+                entry.bodyLength = diagnostic ? sizeof(changed) - 1 : sizeof(truncated) - 1;
+            }
+        }
+        if (entry.bodyOffset == entry.bodyLength)
+        {
+            entry.body = HttpBody::None;
+            continue;
+        }
+        const size_t length = std::min<size_t>(1460, entry.bodyLength - entry.bodyOffset);
+        const ssize_t sent = send(entry.owner.fd(), entry.bodyData + entry.bodyOffset, length, MSG_DONTWAIT);
+        if (sent > 0) entry.bodyOffset += sent;
+        else if (sent == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+        {
+            entry.body = HttpBody::None;
+            entry.writeFailed = entry.discardQueued = true;
+        }
+        if (entry.bodyOffset == entry.bodyLength && entry.body == HttpBody::Flash)
+            entry.body = HttpBody::None;
+        pending = pending || entry.body != HttpBody::None;
+    }
+    return pending;
+}
+
 void setupHttpOwnedExperiment()
 {
     httpOwnedMessage = tcpip_callbackmsg_new(httpOwnedInspect, nullptr);
@@ -422,21 +591,28 @@ void setupHttpOwnedExperiment()
         if (!slot || httpOwnedPending)
             return false; // Admission gate should prevent reaching this branch.
         NetworkClient retained = web.client(); // Strong reference before handler.
+        slot->owner = retained;
+        slot->fd = retained.fd();
+        slot->generation = ++httpOwnedCounters.tracked;
+        slot->lastProgress = static_cast<uint32_t>(_millis());
+        slot->state = HttpOwnedState::Active;
+        httpWriting = slot;
         const bool handled = next();
+        httpWriting = nullptr;
         const int fd = retained.fd(); // A failed write may already have stopped it.
         // Successful streams, including failed headers awaiting retirement,
         // retain their owner in the subscription. Invalid/rejected stream
         // requests produce ordinary responses and still need bounded cleanup.
         if (eventStream && fd >= 0 && retainedBySSE(fd))
+        {
+            *slot = HttpOwnedResponse{}; // Stream subscription retains its own alias.
             return handled;
+        }
         if (fd >= 0)
         {
-            slot->owner = retained;
             slot->fd = fd;
-            slot->generation = ++httpOwnedCounters.tracked;
-            slot->lastProgress = static_cast<uint32_t>(_millis());
-            slot->state = HttpOwnedState::Active;
         }
+        else *slot = HttpOwnedResponse{};
         return handled;
     });
 }
@@ -695,7 +871,6 @@ ActiveRequest activeRequests[MAX_CONCURRENT_REQUESTS];
 int activeRequestCount = 0;
 
 #define CLIENT_WRITE_TIMEOUT 500
-static char writeBuffer[512];
 bool clientWrite(WiFiClient client, const char *data)
 {
     const size_t len = strlen(data);
@@ -831,7 +1006,9 @@ void web_loop()
         return;
 #if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
     const bool ownedRoom = httpOwnedPoll();
-    const bool mayHandleClient = drainRetiredSSE() && ownedRoom;
+    const bool retiredRoom = drainRetiredSSE();
+    if (drainHttpBodies()) return;
+    const bool mayHandleClient = retiredRoom && ownedRoom;
 #endif
 
     // Poll heartbeat deadlines while holding the same lock as slot reuse.
@@ -1278,7 +1455,13 @@ void load_page(const char *page)
         else
         {
             ESP_LOGD(TAG, "Client %s requesting: %s (HTTP_GET, type: %s, length: %d)", clientIP.toString().c_str(), page, type, length);
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+            server.setContentLength(length);
+            server.send_P(200, type, "", 0);
+            deferHttpAsset(reinterpret_cast<const uint8_t *>(data), length);
+#else
             server.send_P(200, type, reinterpret_cast<const char *>(data), length);
+#endif
         }
     }
     else
@@ -1377,6 +1560,9 @@ void handle_everything()
 
 void build_status_json(char *json)
 {
+    // A queued log download leases writeBuffer across main-loop iterations.
+    // Serial CLI status requests must not overwrite that pending chunk.
+    char historyJSON[192]; // Eight signed 32-bit values plus fixed syntax fit.
     // Build the JSON string
     _millis_t upTime = _millis();
     JSON_START(json);
@@ -1466,18 +1652,18 @@ void build_status_json(char *json)
     if (garage_door.openDuration)
     {
         JSON_ADD_INT("openDuration", garage_door.openDuration);
-        snprintf_P(writeBuffer, sizeof(writeBuffer), PSTR("{ \"max\": %d, \"count\": %d, \"duration\": [ %d, %d, %d, %d, %d, %d ] }"),
+        snprintf_P(historyJSON, sizeof(historyJSON), PSTR("{ \"max\": %d, \"count\": %d, \"duration\": [ %d, %d, %d, %d, %d, %d ] }"),
                    openHistory.max, openHistory.count,
                    OPEN_HISTORY(1), OPEN_HISTORY(2), OPEN_HISTORY(3), OPEN_HISTORY(4), OPEN_HISTORY(5), OPEN_HISTORY(6));
-        JSON_ADD_RAW("openHistory", writeBuffer);
+        JSON_ADD_RAW("openHistory", historyJSON);
     }
     if (garage_door.closeDuration)
     {
         JSON_ADD_INT("closeDuration", garage_door.closeDuration);
-        snprintf_P(writeBuffer, sizeof(writeBuffer), PSTR("{ \"max\": %d, \"count\": %d, \"duration\": [ %d, %d, %d, %d, %d, %d ] }"),
+        snprintf_P(historyJSON, sizeof(historyJSON), PSTR("{ \"max\": %d, \"count\": %d, \"duration\": [ %d, %d, %d, %d, %d, %d ] }"),
                    closeHistory.max, closeHistory.count,
                    CLOSE_HISTORY(1), CLOSE_HISTORY(2), CLOSE_HISTORY(3), CLOSE_HISTORY(4), CLOSE_HISTORY(5), CLOSE_HISTORY(6));
-        JSON_ADD_RAW("closeHistory", writeBuffer);
+        JSON_ADD_RAW("closeHistory", historyJSON);
     }
 #ifdef ESP8266
 #define accessoryID arduino_homekit_get_running_server() ? arduino_homekit_get_running_server()->accessory_id : "Inactive"
@@ -2235,29 +2421,53 @@ void handle_crashlog()
 {
     if (!requestAuthenticated())
         return;
-    server.client().print(response200);
-    ratgdoLogger->printCrashLog(server.client());
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+    HttpResponsePrint output(server.client());
+#else
+    WiFiClient output = server.client();
+#endif
+    output.print(response200);
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+    deferHttpDiagnosticLog(true);
+#else
+    ratgdoLogger->printCrashLog(output);
+#endif
 }
 
 void handle_showlog()
 {
     if (!requestAuthenticated())
         return;
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+    HttpResponsePrint output(server.client());
+    output.print(response200);
+    deferHttpMessageLog();
+#else
     server.client().print(response200);
     ratgdoLogger->printMessageLog(server.client());
+#endif
 }
 
 void handle_showrebootlog()
 {
     if (!requestAuthenticated())
         return;
-    server.client().print(response200);
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+    HttpResponsePrint output(server.client());
+#else
+    WiFiClient output = server.client();
+#endif
+    output.print(response200);
 #ifdef ESP8266
     File file = LittleFS.open(REBOOT_LOG_MSG_FILE, "r");
-    ratgdoLogger->printSavedLog(file, server.client());
+    ratgdoLogger->printSavedLog(file, output);
     file.close();
 #else
-    ratgdoLogger->printSavedLog(server.client());
+#if defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+    deferHttpDiagnosticLog(false);
+#else
+    ratgdoLogger->printSavedLog(output);
+#endif
 #endif
 }
 

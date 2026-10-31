@@ -29,6 +29,14 @@
 #include "utilities.h"
 #include "web.h"
 #include "comms.h"
+#include <cstring>
+
+#ifndef ESP8266
+// Protected by logMutex. Absolute byte positions let a reader detect when
+// newer messages have overwritten bytes it has not copied yet.
+static uint64_t logAppendBytes = 0;
+static uint32_t diagnosticRevision = 0;
+#endif
 
 // Logger tag
 static const char *TAG = "ratgdo-logger";
@@ -252,6 +260,9 @@ void LOG::logToBuffer(const char *fmt, va_list args)
         msgBuffer->head += len;
     }
     msgBuffer->buffer[msgBuffer->head] = 0; // null terminate
+#ifndef ESP8266
+    logAppendBytes += len;
+#endif
 
     static bool inFn = false;
     if (!inFn)
@@ -274,10 +285,14 @@ void LOG::clearCrashLog()
 {
 #ifdef ESP8266
     saveCrash.clear();
+    crashCount = 0;
 #else
     esp_core_dump_image_erase();
-#endif
+    TAKE_MUTEX();
     crashCount = 0;
+    ++diagnosticRevision;
+    GIVE_MUTEX();
+#endif
 }
 
 #ifdef ESP8266
@@ -307,17 +322,24 @@ void LOG::printCrashLog(Print &outputDev)
 }
 
 #else
-void LOG::printCrashLog(Print &outputDev)
+void LOG::printCrashLog(Print &outputDev, bool includeCore)
 {
+    // The RTC crash log is written only by the panic handler, which resets the
+    // device. Snapshot ordinary mutable metadata without holding the logger
+    // lock across flash access or potentially blocking output.
     TAKE_MUTEX();
-    if (crashCount > 0)
+    const int32_t savedCrashCount = crashCount;
+    const time_t savedCrashTime = crashTime;
+    const _millis_t savedCrashUpTime = crashUpTime;
+    GIVE_MUTEX();
+    if (savedCrashCount > 0)
     {
-        if (crashTime)
+        if (savedCrashTime)
         {
-            outputDev.printf("Server boot time: %llu (%s)\n", crashTime - (crashUpTime / 1000), timeString(crashTime - (crashUpTime / 1000)));
-            outputDev.printf("Server crash time: %llu (%s)\n", crashTime, timeString(crashTime));
+            outputDev.printf("Server boot time: %llu (%s)\n", savedCrashTime - (savedCrashUpTime / 1000), timeString(savedCrashTime - (savedCrashUpTime / 1000)));
+            outputDev.printf("Server crash time: %llu (%s)\n", savedCrashTime, timeString(savedCrashTime));
         }
-        outputDev.printf("Server uptime: %llu ms (%s)\n", crashUpTime, toHHMMSSmmm((_millis_t)crashUpTime));
+        outputDev.printf("Server uptime: %llu ms (%s)\n", savedCrashUpTime, toHHMMSSmmm((_millis_t)savedCrashUpTime));
         outputDev.printf("Crash reason: %s\n", reasonString);
         outputDev.printf("Firmware version: %s\n\n", crashVersion);
         outputDev.flush();
@@ -330,6 +352,12 @@ void LOG::printCrashLog(Print &outputDev)
         outputDev.print(rtcCrashLog.buffer); // assumes null terminated
     }
 
+    if (includeCore)
+        printCoreDump(outputDev, savedCrashCount > 0);
+}
+
+void LOG::printCoreDump(Print &outputDev, bool savedCrash)
+{
     if (esp_core_dump_image_check() == ESP_OK)
     {
         esp_core_dump_summary_t *summary = static_cast<esp_core_dump_summary_t *>(malloc(sizeof(esp_core_dump_summary_t)));
@@ -337,13 +365,13 @@ void LOG::printCrashLog(Print &outputDev)
         {
             if (esp_core_dump_get_summary(summary) == ESP_OK)
             {
-                if (crashCount <= 0)
+                if (!savedCrash)
                     outputDev.print("No saved message log available.\n");
 
                 outputDev.print("\n\n");
                 outputDev.printf("Crash in task: %s, at address: 0x%08lX\n", summary->exc_task, summary->exc_pc);
                 outputDev.print("Decode backtrace with this Linux command:\n\n");
-                if (crashCount > 0)
+                if (savedCrash)
                     outputDev.printf("addr2line -p -f -C -e homekit-ratgdo32-v%s.elf \\\n", crashVersion);
                 else
                     outputDev.print("addr2line -p -f -C -e firmware.elf \\\n");
@@ -364,13 +392,13 @@ void LOG::printCrashLog(Print &outputDev)
     {
         outputDev.print("\n\nNo core dump image available.\n");
     }
-    GIVE_MUTEX();
 }
 
 void LOG::saveMessageLog()
 {
     ESP_LOGI(TAG, "Save message log buffer");
     TAKE_MUTEX();
+    ++diagnosticRevision;
     size_t len = sizeof(rtcRebootLog.buffer);
     uint32_t end = (msgBuffer->head + 1) % sizeof(msgBuffer->buffer); // include the null terminator
     uint32_t start = (sizeof(msgBuffer->buffer) + end - len) % sizeof(msgBuffer->buffer);
@@ -446,6 +474,128 @@ void LOG::printSavedLog(Print &outputDev)
     }
 #endif
 }
+
+#ifndef ESP8266
+namespace {
+// Formatting writes only the requested window into the existing web scratch
+// buffer. Retained RTC bytes are skipped by offset, never copied in full.
+class DiagnosticWindow : public Print
+{
+    uint8_t *output;
+    size_t capacity, offset;
+public:
+    size_t used = 0, total = 0;
+    DiagnosticWindow(uint8_t *out, size_t limit, size_t skip) : output(out), capacity(limit), offset(skip) {}
+    using Print::write;
+    size_t write(uint8_t value) override { return write(&value, 1); }
+    size_t write(const uint8_t *data, size_t length) override
+    {
+        const size_t skip = total < offset ? std::min(length, offset - total) : 0;
+        const size_t copied = std::min(length - skip, capacity - used);
+        if (copied) memcpy(output + used, data + skip, copied);
+        used += copied;
+        total += length;
+        return length;
+    }
+};
+}
+
+void LOG::beginDiagnosticLog(DiagnosticCursor &cursor, bool crash)
+{
+    TAKE_MUTEX();
+    cursor = DiagnosticCursor{};
+    cursor.crash = crash;
+    cursor.savedCrash = crashCount > 0;
+    cursor.revision = diagnosticRevision;
+    GIVE_MUTEX();
+}
+
+size_t LOG::readDiagnosticLog(DiagnosticCursor &cursor, uint8_t *out, size_t capacity, bool &changed)
+{
+    changed = false;
+    for (unsigned part = 0; part < 2 && cursor.stage < 2; ++part)
+    {
+        TAKE_MUTEX();
+        changed = cursor.revision != diagnosticRevision;
+        GIVE_MUTEX();
+        if (changed) return 0;
+        DiagnosticWindow window(out, capacity, cursor.offset);
+        if (!cursor.crash)
+            printSavedLog(window);
+        else if (cursor.stage == 0)
+            printCrashLog(window, false);
+        else
+            printCoreDump(window, cursor.savedCrash);
+        TAKE_MUTEX();
+        changed = cursor.revision != diagnosticRevision;
+        GIVE_MUTEX();
+        if (changed) return 0;
+        cursor.offset += window.used;
+        if (window.total <= cursor.offset)
+        {
+            cursor.offset = 0;
+            cursor.stage = cursor.crash && cursor.stage == 0 ? 1 : 2;
+        }
+        if (window.used) return window.used;
+    }
+    return 0;
+}
+
+void LOG::beginMessageLog(MessageCursor &cursor)
+{
+    TAKE_MUTEX();
+    cursor = MessageCursor{};
+    if (msgBuffer)
+    {
+        cursor.end = logAppendBytes;
+        const size_t capacity = sizeof(msgBuffer->buffer);
+        const size_t saved = msgBuffer->wrapped ? capacity - 1 : msgBuffer->head;
+        cursor.next = cursor.end - saved;
+        cursor.index = msgBuffer->wrapped ? (msgBuffer->head + 1) % capacity : 0;
+    }
+    GIVE_MUTEX();
+}
+
+size_t LOG::readMessageLog(MessageCursor &cursor, uint8_t *out, size_t capacity, bool &overwritten)
+{
+    overwritten = false;
+    size_t length = 0;
+    TAKE_MUTEX();
+    if (msgBuffer && cursor.next < cursor.end)
+    {
+        const size_t ringSize = sizeof(msgBuffer->buffer);
+        if (logAppendBytes - cursor.next > ringSize - 1)
+            overwritten = true;
+        else
+        {
+            length = static_cast<size_t>(std::min<uint64_t>(capacity, cursor.end - cursor.next));
+            const size_t first = std::min(length, ringSize - cursor.index);
+            memcpy(out, msgBuffer->buffer + cursor.index, first);
+            if (first < length) memcpy(out + first, msgBuffer->buffer, length - first);
+            cursor.index = (cursor.index + length) % ringSize;
+            cursor.next += length;
+        }
+    }
+    GIVE_MUTEX();
+    return length;
+}
+
+void LOG::printMessageLogHeader(Print &outputDev)
+{
+    if (clockSet)
+    {
+        time_t now = time(NULL);
+        outputDev.printf_P(PSTR("Server boot time: %llu (%s)\n"), lastRebootAt, timeString(lastRebootAt));
+        outputDev.printf_P(PSTR("Server log time: %llu (%s)\n"), now, timeString(now));
+    }
+    outputDev.printf_P(PSTR("Server uptime: %llu ms (%s)\n"), (int64_t)_millis(), toHHMMSSmmm(_millis()));
+    outputDev.println("Firmware version: " AUTO_VERSION);
+    outputDev.printf_P(PSTR("Free heap: %d\nMinimum heap: %d\n"), free_heap, min_heap);
+    if (doorControlType == DOOR_CONTROL_SEC_PLUS_V2)
+        outputDev.printf_P(PSTR("GDO Firmware version: %s\n"), gdoFirmwareVersion);
+    outputDev.println();
+}
+#endif
 
 void LOG::printMessageLog(Print &outputDev, bool slow)
 {
