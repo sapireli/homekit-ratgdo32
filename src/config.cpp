@@ -13,6 +13,10 @@
  *
  */
 
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
+
 // ESP system files
 #ifdef ESP8266
 #include <LittleFS.h>
@@ -41,6 +45,25 @@
 
 // Logger tag
 static const char *TAG = "ratgdo-config";
+
+// Settings arrive as text from HTTP/CLI. Reject invalid or overflowing values
+// without exceptions, and before changing RAM, NVRAM or hardware state.
+static bool parseConfigInt(const char *text, int &value)
+{
+    if (!text)
+        return false;
+    errno = 0;
+    char *end = nullptr;
+    const long parsed = strtol(text, &end, 10);
+    if (end == text || errno == ERANGE || parsed < INT_MIN || parsed > INT_MAX)
+        return false;
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')
+        ++end;
+    if (*end)
+        return false;
+    value = static_cast<int>(parsed);
+    return true;
+}
 
 char default_device_name[DEVICE_NAME_SIZE] = "";
 #ifndef ESP8266
@@ -96,8 +119,11 @@ bool setDeviceName(const std::string &key, const char *name, configSetting *acti
 
 bool helperWiFiPower(const std::string &key, const char *value, configSetting *action)
 {
+    int parsed;
+    if (!parseConfigInt(value, parsed))
+        return false;
     // Only reboot if value has changed
-    if (std::get<int>(action->value) != std::stoi(value))
+    if (std::get<int>(action->value) != parsed)
     {
         ESP_LOGI(TAG, "Setting WiFi power to: %s", value);
         userConfig->set(key, value);
@@ -113,8 +139,11 @@ bool helperWiFiPower(const std::string &key, const char *value, configSetting *a
 
 bool helperWiFiPhyMode(const std::string &key, const char *value, configSetting *action)
 {
+    int parsed;
+    if (!parseConfigInt(value, parsed))
+        return false;
     // Only reboot if value has changed
-    if (std::get<int>(action->value) != std::stoi(value))
+    if (std::get<int>(action->value) != parsed)
     {
         ESP_LOGI(TAG, "Setting WiFi mode to: %s", value);
         userConfig->set(key, value);
@@ -131,7 +160,8 @@ bool helperWiFiPhyMode(const std::string &key, const char *value, configSetting 
 bool helperGDOSecurityType(const std::string &key, const char *value, configSetting *action)
 {
     // Call fn to reset door
-    userConfig->set(key, value);
+    if (!userConfig->set(key, value))
+        return false;
 #ifdef ESP8266
     action->reboot = true;
 #else
@@ -151,7 +181,10 @@ bool helperLEDidle(const std::string &key, const char *value, configSetting *act
 
 bool helperMotionTriggers(const std::string &key, const char *value, configSetting *action)
 {
-    uint8_t triggers = (uint8_t)std::stoi(value);
+    int parsed;
+    if (!parseConfigInt(value, parsed) || parsed < 0 || parsed > UINT8_MAX)
+        return false;
+    uint8_t triggers = static_cast<uint8_t>(parsed);
     // Only reboot if need for motion sensor accessory changes...
     // action->reboot = (((triggers == 0) && (motionTriggers.asInt != 0)) || ((triggers != 0) && (motionTriggers.asInt == 0)));
     motionTriggers.asInt = triggers;
@@ -224,7 +257,8 @@ bool helperLogLevel(const std::string &key, const char *value, configSetting *ac
 
 bool helperBuiltInTTC(const std::string &key, const char *value, configSetting *action)
 {
-    userConfig->set(key, value);
+    if (!userConfig->set(key, value))
+        return false;
     garage_door.builtInTTC = userConfig->getBuiltInTTC();
 #ifdef USE_GDOLIB
     if (!userConfig->getBuiltInTTC())
@@ -249,9 +283,13 @@ bool helperBuiltInTTC(const std::string &key, const char *value, configSetting *
 #ifdef RATGDO32_DISCO
 bool helperVehicleThreshold(const std::string &key, const char *value, configSetting *action)
 {
-    userConfig->set(key, value);
+    int parsed;
+    if (!parseConfigInt(value, parsed) || parsed < 0 || static_cast<uint32_t>(parsed) > UINT32_MAX / 10)
+        return false;
+    if (!userConfig->set(key, value))
+        return false;
     // set globals so takes effect immediately
-    vehicleThresholdDistance = (uint32_t)std::stoi(value) * 10; // convert centimeters to millimeters
+    vehicleThresholdDistance = static_cast<uint32_t>(parsed) * 10; // centimeters to millimeters
     return true;
 }
 
@@ -699,6 +737,8 @@ bool userSettings::set(const std::string &key, const int value)
 bool userSettings::set(const std::string &key, const char *value)
 {
     bool rc = false;
+    if (!value)
+        return false;
     TAKE_MUTEX();
     if (settings.count(key))
     {
@@ -714,7 +754,17 @@ bool userSettings::set(const std::string &key, const char *value)
         }
         else if (std::holds_alternative<bool>(settings[key].value))
         {
-            settings[key].value = (!strcmp(value, "true")) || (atoi(value) != 0);
+            int parsed;
+            if (!strcmp(value, "true"))
+                parsed = 1;
+            else if (!strcmp(value, "false"))
+                parsed = 0;
+            else if (!parseConfigInt(value, parsed))
+            {
+                GIVE_MUTEX();
+                return false;
+            }
+            settings[key].value = parsed != 0;
 #ifndef ESP8266
             nvRam->write(key, std::get<bool>(settings[key].value) ? 1 : 0);
 #endif
@@ -722,9 +772,15 @@ bool userSettings::set(const std::string &key, const char *value)
         }
         else if (std::holds_alternative<int>(settings[key].value))
         {
-            settings[key].value = atoi(value);
+            int newValue;
+            if (!parseConfigInt(value, newValue))
+            {
+                GIVE_MUTEX();
+                return false;
+            }
+            settings[key].value = newValue;
 #ifndef ESP8266
-            nvRam->write(key, atoi(value));
+            nvRam->write(key, newValue);
 #endif
             rc = true;
         }
