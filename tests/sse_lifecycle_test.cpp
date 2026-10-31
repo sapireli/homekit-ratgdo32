@@ -8,6 +8,25 @@
 
 int main()
 {
+    // Only a bound active subscription emits a heartbeat. No timer work can
+    // leak into a reused slot; rebinding sets a fresh deadline.
+    uint32_t last = 100;
+    assert(!takeSSEHeartbeat(false, true, 1, last, 1100));
+    assert(!takeSSEHeartbeat(true, false, 1, last, 1100));
+    assert(!takeSSEHeartbeat(true, true, 0, last, 1100));
+    assert(!takeSSEHeartbeat(true, true, 61, last, 100000));
+    assert(last == 100);
+    assert(!takeSSEHeartbeat(true, true, 1, last, 1099));
+    assert(takeSSEHeartbeat(true, true, 1, last, 1100));
+    assert(!takeSSEHeartbeat(true, true, 1, last, 1100));
+    last = 5000; // Slot admission/rebinding resets the deadline.
+    assert(!takeSSEHeartbeat(true, true, 60, last, 64999));
+    assert(takeSSEHeartbeat(true, true, 60, last, 65000));
+    last = UINT32_MAX - 500;
+    assert(!takeSSEHeartbeat(true, true, 1, last, 498));
+    assert(takeSSEHeartbeat(true, true, 1, last, 499));
+    assert(last == 499);
+
     // A stale EventSource request must not replace a reused slot's client.
     std::string uuid = "new-uuid", current = "live-client";
     assert(!bindSSEClient(true, uuid, std::string("old-uuid"), current, std::string("stale-client")));

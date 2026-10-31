@@ -569,9 +569,16 @@ bool retireSSESubscription(std::atomic<bool> &active,
     return true;
 }
 
-// Ticker callbacks never touch clients or wait for the lifecycle lock.
-inline void requestSSEHeartbeat(std::atomic<bool> &pending) { pending.store(true); }
-inline bool takeSSEHeartbeat(std::atomic<bool> &pending) { return pending.exchange(false); }
+// Called under the lifecycle lock; elapsed subtraction also handles millis wrap.
+inline bool takeSSEHeartbeat(bool active, bool connected, uint32_t interval,
+                             uint32_t &lastHeartbeat, uint32_t now)
+{
+    if (!active || !connected || !interval || interval > 60 ||
+        static_cast<uint32_t>(now - lastHeartbeat) < interval * 1000)
+        return false;
+    lastHeartbeat = now;
+    return true;
+}
 
 // The caller holds the lifecycle lock while checking and assigning the client.
 template <typename UUID, typename Client>
@@ -588,8 +595,7 @@ struct SSESubscription
 {
     IPAddress clientIP;
     WiFiClient client;
-    Ticker heartbeatTimer;
-    std::atomic<bool> heartbeatPending{false};
+    uint32_t lastHeartbeat = 0;
     uint32_t heartbeatInterval;
     std::atomic<bool> active{false};
     bool SSEconnected;
@@ -873,20 +879,23 @@ void web_loop()
     if (recoverStoppedOTAServices())
         return;
 
-    // Timer callbacks only signal work; client access stays in the web loop.
-    for (uint32_t i = 0; i < SSE_MAX_CHANNELS; ++i)
+    // Poll heartbeat deadlines while holding the same lock as slot reuse.
+    TAKE_MUTEX(); // JSON must always precede the SSE lock.
     {
-        if (takeSSEHeartbeat(subscription[i].heartbeatPending))
+        SSELock lock;
+        if (lock)
         {
-            TAKE_MUTEX(); // JSON must always precede the SSE lock.
+            const uint32_t now = static_cast<uint32_t>(_millis());
+            for (uint32_t i = 0; i < SSE_MAX_CHANNELS; ++i)
             {
-                SSELock lock;
-                if (lock && subscription[i].active)
-                    SSEheartbeat(&subscription[i]);
+                SSESubscription &s = subscription[i];
+                if (takeSSEHeartbeat(s.active, s.SSEconnected, s.heartbeatInterval,
+                                     s.lastHeartbeat, now))
+                    SSEheartbeat(&s);
             }
-            GIVE_MUTEX();
         }
     }
+    GIVE_MUTEX();
 
     static char *json = status_json;
     _millis_t upTime = _millis();
@@ -2179,8 +2188,7 @@ void removeSSEsubscription(SSESubscription *s)
         SSESubscription *expected = s;
         firmwareUpdateSub.compare_exchange_strong(expected, nullptr);
         s->SSEconnected = false;
-        s->heartbeatTimer.detach();
-        s->heartbeatPending = false;
+        s->lastHeartbeat = 0;
 #if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
         s->retiring = s->client.fd() >= 0;
         if (s->retiring)
@@ -2308,12 +2316,7 @@ void SSEHandler(uint32_t channel)
 #endif
     s.SSEconnected = true;
     s.SSEfailCount = 0;
-    if (s.heartbeatInterval)
-    {
-        s.heartbeatTimer.attach_ms(s.heartbeatInterval * 1000, [&s] {
-            requestSSEHeartbeat(s.heartbeatPending);
-        });
-    }
+    s.lastHeartbeat = static_cast<uint32_t>(_millis());
     ESP_LOGD(TAG, "Client %s (%s) listening for SSE events on channel %d", s.client.remoteIP().toString().c_str(), s.clientUUID.c_str(), channel);
 }
 
@@ -2459,7 +2462,7 @@ void handle_subscribe()
 #else
     subscription[channel].client = client;
 #endif
-    subscription[channel].heartbeatTimer = Ticker();
+    subscription[channel].lastHeartbeat = static_cast<uint32_t>(_millis());
     subscription[channel].SSEconnected = false;
     subscription[channel].SSEfailCount = 0;
     subscription[channel].clientUUID = server.arg(id);

@@ -68,7 +68,7 @@ int main() {
         recovery = source[source.index("static bool otaServicesStopped"):
                           source.index("// Common HTTP responses")]
         loop_start = source.index("void web_loop()\n{")
-        loop_prefix = source[loop_start:source.index("// Timer callbacks only signal work", loop_start)] + "}\n"
+        loop_prefix = source[loop_start:source.index("// Poll heartbeat deadlines", loop_start)] + "}\n"
         harness = r'''
 #include <cassert>
 #include <atomic>
