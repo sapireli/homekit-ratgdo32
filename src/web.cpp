@@ -16,6 +16,7 @@
 
 // C/C++ language includes
 #include <string>
+#include <new>
 #include <tuple>
 #include <unordered_map>
 #include <time.h>
@@ -566,7 +567,16 @@ String *ratgdoAuthenticate(HTTPAuthMethod mode, String enteredUsernameOrReq, Str
     // ESP_LOGI(TAG, "User: %s", enteredUsernameOrReq);       // Username
     // ESP_LOGI(TAG, "Param 0: %s", extraParams[0].c_str());  // Realm
     // ESP_LOGI(TAG, "Param 1: %s", extraParams[1].c_str());  // URI
-    String *pw = new String(read_door_str(nvram_ratgdo_pw, "password").c_str());
+    char *stored = nvRam->readAllocatedString(nvram_ratgdo_pw, "password");
+    if (!stored)
+        return nullptr;
+    String *pw = new (std::nothrow) String();
+    if (pw && !pw->concat(stored))
+    {
+        delete pw;
+        pw = nullptr;
+    }
+    free(stored);
     return pw;
 }
 

@@ -849,7 +849,7 @@ std::string nvRamClass::read(const std::string &constKey, const char *dflt)
     if (err == ESP_OK)
     {
         char *buf = static_cast<char *>(malloc(len));
-        if (nvs_get_str(nvHandle, key.c_str(), buf, &len) == ESP_OK)
+        if (buf && nvs_get_str(nvHandle, key.c_str(), buf, &len) == ESP_OK)
         {
             value = buf;
         }
@@ -858,6 +858,36 @@ std::string nvRamClass::read(const std::string &constKey, const char *dflt)
     else if (err != ESP_ERR_NVS_NOT_FOUND)
     {
         ESP_LOGE(TAG, "NVRAM get error for: %s (%s)", key.c_str(), esp_err_to_name(err));
+    }
+    return value;
+}
+
+char *nvRamClass::readAllocatedString(const char *constKey, const char *dflt)
+{
+    char key[NVS_KEY_NAME_MAX_SIZE];
+    strlcpy(key, constKey, sizeof(key));
+    size_t len = 0;
+    esp_err_t err = nvs_get_str(nvHandle, key, nullptr, &len);
+    if (err == ESP_ERR_NVS_NOT_FOUND)
+    {
+        len = strlen(dflt) + 1;
+        char *value = static_cast<char *>(malloc(len));
+        if (value)
+            memcpy(value, dflt, len);
+        return value;
+    }
+    if (err != ESP_OK || len == 0)
+        return nullptr;
+
+    char *value = static_cast<char *>(malloc(len));
+    if (!value)
+        return nullptr;
+    const size_t capacity = len;
+    err = nvs_get_str(nvHandle, key, value, &len);
+    if (err != ESP_OK || len == 0 || len > capacity || value[len - 1] != '\0')
+    {
+        free(value);
+        return nullptr;
     }
     return value;
 }
