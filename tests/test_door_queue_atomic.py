@@ -55,7 +55,7 @@ struct PacketData {
     struct Value {struct Action {DoorAction action;bool pressed=false;int id=0;}door_action;int cmd=0;}value;
 };
 struct Packet {PacketData m_data;Packet(PacketCommand,PacketData data,uint32_t):m_data(data){}};
-struct PacketAction {Packet pkt;bool inc_counter;uint32_t delay;};
+struct PacketAction {Packet pkt;bool inc_counter;uint32_t delay;uint32_t doorGeneration=0;bool doorPress=false;};
 struct Queue {std::deque<PacketAction>items;std::mutex mutex;}queueState;
 using QueueHandle_t=Queue*;
 using StaticSemaphore_t=std::mutex;
@@ -88,6 +88,10 @@ void send_get_status(){}
 void write_status_pin(int,int){}
 unsigned pinWrites=0;
 void digitalWrite(int,int){++pinWrites;}
+''' + (SOURCE.parent / "door_command_lifecycle.h").read_text().replace("#pragma once", "") + r'''
+DoorCommandLifecycle doorLifecycle;
+uint32_t _millis(){return 1000;}
+void cancelPendingDoorIntent(){doorLifecycle.cancel();pendingDoorCommand=false;}
 ''' + functions + r'''
 PacketAction pollPacket(){PacketData d{};return {Packet(PacketCommand::DoorAction,d,0),false,0};}
 void reset(unsigned filled){
