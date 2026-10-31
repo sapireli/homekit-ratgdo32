@@ -1144,36 +1144,184 @@ bool helperGarageLockState(const std::string &key, const char *value, configSett
     return true;
 }
 
+struct RequestJsonField
+{
+    const char *key;
+    bool quoted;
+    const char *begin = nullptr;
+    const char *end = nullptr;
+};
+
+static void skipRequestSpace(const char *&p)
+{
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') ++p;
+}
+
+static int requestHex(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// Decode to the same storage only after the entire request has been checked.
+// The callback receives mutable std::string storage from handle_setgdo().
+static bool requestString(const char *begin, const char *end, char *out = nullptr, size_t *decodedLength = nullptr)
+{
+    size_t length = 0;
+    for (const char *p = begin; p < end; ++p)
+    {
+        uint32_t c = static_cast<unsigned char>(*p);
+        if (c < 0x20) return false;
+        if (c == '\\')
+        {
+            if (++p == end) return false;
+            switch (*p)
+            {
+            case '"': case '\\': case '/': c = *p; break;
+            case 'b': c = '\b'; break;
+            case 'f': c = '\f'; break;
+            case 'n': c = '\n'; break;
+            case 'r': c = '\r'; break;
+            case 't': c = '\t'; break;
+            case 'u':
+            {
+                if (end - p < 5) return false;
+                c = 0;
+                for (unsigned i = 0; i < 4; ++i)
+                {
+                    int digit = requestHex(*++p);
+                    if (digit < 0) return false;
+                    c = (c << 4) | digit;
+                }
+                if (c >= 0xD800 && c <= 0xDBFF)
+                {
+                    if (end - p < 7 || p[1] != '\\' || p[2] != 'u') return false;
+                    p += 2;
+                    uint32_t low = 0;
+                    for (unsigned i = 0; i < 4; ++i)
+                    {
+                        int digit = requestHex(*++p);
+                        if (digit < 0) return false;
+                        low = (low << 4) | digit;
+                    }
+                    if (low < 0xDC00 || low > 0xDFFF) return false;
+                    c = 0x10000 + ((c - 0xD800) << 10) + low - 0xDC00;
+                }
+                else if (c >= 0xDC00 && c <= 0xDFFF) return false;
+                if (c == 0) return false; // Configuration strings are NUL terminated.
+                length += c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+                if (out)
+                {
+                    if (c >= 0x10000) *out++ = 0xF0 | (c >> 18);
+                    if (c >= 0x800) *out++ = (c >= 0x10000 ? 0x80 : 0xE0) | ((c >> 12) & 0x3F);
+                    if (c >= 0x80) *out++ = (c >= 0x800 ? 0x80 : 0xC0) | ((c >> 6) & 0x3F);
+                    *out++ = c >= 0x80 ? 0x80 | (c & 0x3F) : c;
+                }
+                continue;
+            }
+            default: return false;
+            }
+        }
+        ++length;
+        if (out) *out++ = c;
+    }
+    if (out) *out = 0;
+    if (decodedLength) *decodedLength = length;
+    return true;
+}
+
+static bool readRequestQuoted(const char *&p, const char *&begin, const char *&end)
+{
+    if (*p++ != '"') return false;
+    begin = p;
+    while (*p && *p != '"')
+    {
+        if (*p == '\\' && !*++p) return false;
+        ++p;
+    }
+    if (*p != '"') return false;
+    end = p++;
+    return requestString(begin, end);
+}
+
+// Accept the client's small flat schemas, with literal keys and string or
+// unsigned-decimal values. Reject unknown/duplicate keys and trailing input.
+static bool readRequestObject(const char *value, RequestJsonField *fields, size_t count)
+{
+    if (!value) return false;
+    const char *p = value;
+    skipRequestSpace(p);
+    if (*p++ != '{') return false;
+    for (size_t n = 0; n < count; ++n)
+    {
+        skipRequestSpace(p);
+        const char *key, *keyEnd;
+        if (!readRequestQuoted(p, key, keyEnd)) return false;
+        RequestJsonField *field = nullptr;
+        for (size_t i = 0; i < count; ++i)
+            if (strlen(fields[i].key) == static_cast<size_t>(keyEnd - key) &&
+                !memcmp(fields[i].key, key, keyEnd - key)) field = &fields[i];
+        if (!field || field->begin) return false;
+        skipRequestSpace(p);
+        if (*p++ != ':') return false;
+        skipRequestSpace(p);
+        if (field->quoted)
+        {
+            if (!readRequestQuoted(p, field->begin, field->end)) return false;
+        }
+        else
+        {
+            field->begin = p;
+            while (*p >= '0' && *p <= '9') ++p;
+            field->end = p;
+            if (p == field->begin || (p - field->begin > 1 && *field->begin == '0')) return false;
+        }
+        skipRequestSpace(p);
+        if (*p++ != (n + 1 == count ? '}' : ',')) return false;
+    }
+    skipRequestSpace(p);
+    if (*p) return false;
+    return true;
+}
+
+static bool readFirmwareSize(const char *begin, const char *end, size_t &result)
+{
+    result = 0;
+    if (begin == end) return false;
+    for (; begin < end; ++begin)
+    {
+        const unsigned digit = static_cast<unsigned char>(*begin) - '0';
+        if (digit > 9 || result > (UINT32_MAX - digit) / 10) return false;
+        result = result * 10 + digit;
+    }
+    return result != 0;
+}
+
+static bool validRequestMD5(const RequestJsonField &field)
+{
+    if (field.end - field.begin != 32) return false;
+    for (const char *p = field.begin; p < field.end; ++p)
+        if (requestHex(*p) < 0) return false;
+    return true;
+}
+
 bool helperCredentials(const std::string &key, const char *value, configSetting *action)
 {
-#define PTR1 ((const char *)1)
-    const char *newUsername = strstr(value, "username");
-    const char *newCredentials = strstr(value, "credentials");
-    const char *newPassword = strstr(value, "password");
-    if (!(newUsername && newCredentials && newPassword))
-        return false;
-
-    // JSON string passed in.
-    // Very basic parsing, not using library functions to save memory
-    // find the colon after the key string
-    newUsername = strchr(newUsername, ':') + 1;
-    newCredentials = strchr(newCredentials, ':') + 1;
-    newPassword = strchr(newPassword, ':') + 1;
-    // check that none of the strchr() calls failed.
-    if ((newUsername == PTR1) || (newCredentials == PTR1) || (newPassword == PTR1))
-        return false;
-    // for strings find the double quote
-    newUsername = strchr(newUsername, '"') + 1;
-    newCredentials = strchr(newCredentials, '"') + 1;
-    newPassword = strchr(newPassword, '"') + 1;
-    // Again check that none of the strchr() calls failed.
-    if ((newUsername == PTR1) || (newCredentials == PTR1) || (newPassword == PTR1))
-        return false;
-    // null terminate the strings (at closing quote).
-    // We are trusting that if the first quote was found, the second quote will be found as well (so strchr will not return NULL)
-    *strchr(newUsername, '"') = (char)0;
-    *strchr(newCredentials, '"') = (char)0;
-    *strchr(newPassword, '"') = (char)0;
+    RequestJsonField fields[] = {{"username", true}, {"credentials", true}, {"password", true}};
+    if (!readRequestObject(value, fields, 3) || !validRequestMD5(fields[1])) return false;
+    size_t usernameLength = 0;
+    if (!requestString(fields[0].begin, fields[0].end, nullptr, &usernameLength)) return false;
+    const configStr username = std::get<configStr>(userConfig->get(cfg_wwwUsername));
+    if (!usernameLength || usernameLength >= username.max) return false;
+    // Decode only once all fields are present and well formed. The previous
+    // parser could write through NULL for a missing closing quote.
+    for (auto &field : fields)
+        requestString(field.begin, field.end, const_cast<char *>(field.begin));
+    const char *newUsername = fields[0].begin;
+    const char *newCredentials = fields[1].begin;
+    const char *newPassword = fields[2].begin;
     // save values...
     ESP_LOGI(TAG, "Set credentials for user: %s", newUsername);
     userConfig->set(cfg_wwwUsername, newUsername);
@@ -1188,38 +1336,17 @@ bool helperCredentials(const std::string &key, const char *value, configSetting 
 
 bool helperUpdateUnderway(const std::string &key, const char *value, configSetting *action)
 {
-    firmwareSize = 0;
-    firmwareUpdateSub = NULL;
-    const char *md5 = strstr(value, "md5");
-    const char *size = strstr(value, "size");
-    const char *uuid = strstr(value, "uuid");
-
-    if (!(md5 && size && uuid))
-        return false;
-
-    // JSON string of passed in.
-    // Very basic parsing, not using library functions to save memory
-    // find the colon after the key string
-    md5 = strchr(md5, ':') + 1;
-    size = strchr(size, ':') + 1;
-    uuid = strchr(uuid, ':') + 1;
-    // check that none of the strchr() calls failed.
-    if ((md5 == PTR1) || (size == PTR1) || (uuid == PTR1))
-        return false;
-    // for strings find the double quote
-    md5 = strchr(md5, '"') + 1;
-    uuid = strchr(uuid, '"') + 1;
-    // again, check that none of the strchr() calls failed.
-    if ((md5 == PTR1) || (uuid == PTR1))
-        return false;
-    // null terminate the strings (at closing quote).
-    // We are trusting that if the first quote was found, the second quote will be found as well (so strchr will not return NULL)
-    *strchr(md5, '"') = (char)0;
-    *strchr(uuid, '"') = (char)0;
-    // ESP_LOGI(TAG,"MD5: %s, UUID: %s, Size: %d", md5, uuid, atoi(size));
-    // save values...
-    strlcpy(firmwareMD5, md5, sizeof(firmwareMD5));
-    firmwareSize = (size_t)atoi(size);
+    RequestJsonField fields[] = {{"md5", true}, {"size", false}, {"uuid", true}};
+    size_t size;
+    if (!readRequestObject(value, fields, 3) || !validRequestMD5(fields[0]) ||
+        !readFirmwareSize(fields[1].begin, fields[1].end, size)) return false;
+    if (fields[2].begin == fields[2].end) return false;
+    for (auto &field : fields)
+        if (field.quoted) requestString(field.begin, field.end, const_cast<char *>(field.begin));
+    const char *uuid = fields[2].begin;
+    strlcpy(firmwareMD5, fields[0].begin, sizeof(firmwareMD5));
+    firmwareSize = size;
+    firmwareUpdateSub = nullptr;
     for (uint32_t channel = 0; channel < SSE_MAX_CHANNELS; channel++)
     {
         if (subscription[channel].SSEconnected && subscription[channel].clientUUID == uuid && subscription[channel].client.connected())
