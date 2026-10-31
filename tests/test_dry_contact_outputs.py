@@ -27,7 +27,7 @@ class DryContactOutputs(unittest.TestCase):
         end = source.index("\n    }\n    return true;", start)
         command = source[start:end]
         pulse = source[source.index("class DryContactPulse"):source.index("// times in miliseconds")]
-        pulse = pulse[:pulse.rfind("#endif")]
+        pulse = "#ifdef ESP32\n" + pulse[:pulse.rfind("#endif")] + "#endif\n"
         setup = block(source, "void setup_comms()")
         self.assertEqual(setup.count("setupDryContactTimers();"), 1)
         shutdown = block(source, "void shutdown_comms()")
@@ -38,7 +38,6 @@ class DryContactOutputs(unittest.TestCase):
 #include <vector>
 #include <utility>
 #include <atomic>
-#define ESP32 1
 #define OUTPUT 1
 #define LOW 0
 #define HIGH 1
@@ -48,7 +47,7 @@ std::vector<std::pair<int,int>> writes;
 struct Timer {void(*callback)(void*);void*arg;bool active=false;};
 using esp_timer_handle_t=Timer*;
 struct esp_timer_create_args_t {void(*callback)(void*);void*arg;int dispatch_method;const char*name;};
-constexpr int ESP_OK=0,ESP_TIMER_TASK=0;
+inline constexpr int ESP_OK=0,ESP_TIMER_TASK=0;
 Timer storage[3];unsigned creates=0;
 std::vector<Timer*> timers;
 bool failCreate=false,failStart=false,failToggleStart=false;
@@ -58,6 +57,10 @@ int esp_timer_start_once(esp_timer_handle_t t,uint64_t us){assert(us==500000);
  if(failStart||(failToggleStart&&t==&storage[0]))return -1;assert(!t->active);t->active=true;timers.push_back(t);return ESP_OK;}
 int esp_timer_stop(esp_timer_handle_t t){if(!t->active)return -1;t->active=false;return ESP_OK;}
 void digitalWrite(int pin,int value) { assert(pin>=0); writes.emplace_back(pin,value); }
+#ifndef ESP32
+struct Ticker {void once_ms(unsigned ms,void(*cb)()){assert(ms==500);cb();}};
+void delay(unsigned ms){assert(ms==500);}
+#endif
 enum class DoorAction { Open, Close, Toggle, Stop };
 enum GarageDoorCurrentState { CURR_OPEN, CURR_CLOSED, CURR_STOPPED };
 struct { GarageDoorCurrentState current_state=CURR_CLOSED; } garage_door;
@@ -72,6 +75,7 @@ bool command(DoorAction action) {
 void clear() { writes.clear(); timers.clear(); }
 void complete() { auto pending=timers; timers.clear(); for(auto*t:pending)if(t->active){t->active=false;t->callback(t->arg);} }
 int main() {
+#ifdef ESP32
     assert(creates==0); // Protocol modes do not allocate pulse timers.
     // Allocation failure must not assert any of a command's outputs.
     clear();failCreate=true;setupDryContactTimers();assert(!command(DoorAction::Open)&&writes.empty());
@@ -116,15 +120,23 @@ int main() {
     cancelDryContactTimers();setupDryContactTimers();count=writes.size();
     assert(!command(DoorAction::Open)&&writes.size()==count);
     t->callback(t->arg);timers.clear();clear();assert(command(DoorAction::Open));complete();
+#else
+    DISCRETE_OPEN_PIN=16;DISCRETE_CLOSE_PIN=17;garage_door.current_state=CURR_CLOSED;
+    clear();assert(command(DoorAction::Open));
+    assert((writes==std::vector<std::pair<int,int>>({{16,HIGH},{16,LOW},{22,HIGH},{22,LOW}})));
+    assert(creates==0);
+#endif
 }
 '''
         with tempfile.TemporaryDirectory() as temp:
             cpp = Path(temp) / "dry-contact.cpp"
             binary = Path(temp) / "dry-contact"
             cpp.write_text(harness)
-            subprocess.run(["c++", "-std=c++17", "-Wall", "-Wextra", "-Werror",
-                            "-fsanitize=address,undefined", str(cpp), "-o", str(binary)], check=True)
-            subprocess.run([str(binary)], check=True)
+            for target in ["ESP32", "ESP8266"]:
+                subprocess.run(["c++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-D" + target,
+                                "-fsanitize=address,undefined", str(cpp), "-o", str(binary)], check=True)
+                subprocess.run([str(binary)], check=True)
+
 
 
 if __name__ == "__main__":
