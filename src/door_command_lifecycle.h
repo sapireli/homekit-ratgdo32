@@ -106,6 +106,7 @@ public:
         mandatoryRelease = 0;
     }
     bool pending() const { return generation != 0; }
+    bool needsRelease(uint32_t token) const { return token && token == mandatoryRelease; }
 private:
     uint32_t nextGeneration = 0, generation = 0, mandatoryRelease = 0;
     uint32_t startedAt = 0, deferredAt = 0;
