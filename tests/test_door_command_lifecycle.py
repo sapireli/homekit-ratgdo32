@@ -15,7 +15,8 @@ class DoorCommandLifecycleTest(unittest.TestCase):
         functions = "\n".join(block(source, declaration) for declaration in [
             "bool requestPendingDoorIntent(", "void processPendingDoorIntent()\n{",
             "GarageDoorCurrentState open_door()", "GarageDoorCurrentState close_door(bool",
-            "GarageDoorCurrentState stop_door()", "GarageDoorCurrentState toggle_door(bool"])
+            "GarageDoorCurrentState stop_door()", "GarageDoorCurrentState toggle_door(bool",
+            "void processPartialOpen()\n{"])
         harness = r'''
 #include <cassert>
 #include <cstdint>
@@ -38,7 +39,9 @@ bool comms_setup_done=true,pendingDoorCommand=false,TTCwasLightOn=false;
 struct Door {GarageDoorCurrentState current_state=CURR_OPEN;bool obstructed=false;}garage_door,last_reported_garage_door;
 struct Config {bool getReverseOnStop(){return false;}int getTTCseconds(){return 0;}}config,*userConfig=&config;
 DoorCommandLifecycle doorLifecycle;
-void cancelPartialOpen(){}
+bool doingPartial=false,partialAwaitingMotion=false;
+_millis_t partialStartDeadline=0,partialStopDeadline=0,partialDuration=0;
+void cancelPartialOpen(){doingPartial=false;partialAwaitingMotion=false;}
 void cancel_builtin_TTC_countdown(){}
 bool functionDelayActive(){return false;}
 void cancelFunctionDelay(){}
@@ -106,6 +109,12 @@ int main(){
     doorLifecycle.writing(close.token,true);open_door();now+=3001;processPendingDoorIntent();
     assert(!pendingDoorCommand&&queued.size()==1&&doorLifecycle.allow(close.token,false));
     comms_setup_done=false;processPendingDoorIntent();assert(!doorLifecycle.allow(close.token,false));
+    comms_setup_done=true;reset(CURR_CLOSED);door_command(DoorAction::Open);
+    auto opening=queued.back();doorLifecycle.writing(opening.token,true);status(CURR_OPENING);
+    doingPartial=true;partialStopDeadline=now;processPartialOpen();
+    assert(!doingPartial&&queued.size()==1);
+    doorLifecycle.writing(opening.token,false);processPendingDoorIntent();
+    assert(queued.size()==2&&queued.back().action==DoorAction::Stop);
 }
 '''
         with tempfile.TemporaryDirectory() as directory:

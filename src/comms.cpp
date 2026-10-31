@@ -3258,11 +3258,9 @@ void processPartialOpen()
 #endif
         return;
     cancelPartialOpen();
-#ifdef USE_GDOLIB
-    gdo_door_stop();
-#else
-    door_command(DoorAction::Stop);
-#endif
+    // The original Open may still be waiting for its mandatory Release.
+    // Use normal intent arbitration instead of dropping the timed Stop.
+    stop_door();
 }
 
 void processFunctionDelay()

@@ -37,6 +37,7 @@ _millis_t _millis(){return now;}
 unsigned stops=0;
 bool startDoorOpenCommand(){return acceptOpen;}
 bool door_command(DoorAction){++stops;return true;}
+GarageDoorCurrentState stop_door(){door_command(Stop);return garage_door.current_state;}
 GarageDoorCurrentState open_door(){return garage_door.current_state;}
 ''' + functions + r'''
 int main(){
