@@ -17,6 +17,7 @@
 
 // Arduino includes
 #include <Ticker.h>
+#include <atomic>
 
 // RATGDO project includes
 #include "ratgdo.h"
@@ -72,13 +73,20 @@ struct __attribute__((aligned(4))) PacketAction
 #define COMMAND_QUEUE_SIZE 16
 #ifdef ESP32
 QueueHandle_t pkt_q;
+static StaticSemaphore_t txQueueMutexStorage;
+static SemaphoreHandle_t txQueueMutex = nullptr;
 #else
 Queue_t pkt_q;
+static bool txQueueBusy = false;
 #endif // ESP32
 
 inline bool txQueueCreate()
 {
 #ifdef ESP32
+    if (!txQueueMutex)
+        txQueueMutex = xSemaphoreCreateMutexStatic(&txQueueMutexStorage);
+    if (!txQueueMutex)
+        return false;
     pkt_q = xQueueCreate(COMMAND_QUEUE_SIZE, sizeof(PacketAction));
     return pkt_q != NULL;
 #else
@@ -95,13 +103,56 @@ inline uint32_t txQueueCount()
 #endif
 }
 
-inline bool txQueuePush(PacketAction *pkt)
+inline bool txQueuePushUnlocked(PacketAction *pkt)
 {
 #ifdef ESP32
     return xQueueSendToBack(pkt_q, pkt, 0) == pdTRUE;
 #else
     return q_push(&pkt_q, pkt);
 #endif
+}
+
+inline bool txQueueLock()
+{
+#ifdef ESP32
+    return txQueueMutex && xSemaphoreTake(txQueueMutex, 0) == pdTRUE;
+#else
+    if (txQueueBusy)
+        return false;
+    txQueueBusy = true;
+    return true;
+#endif
+}
+
+inline void txQueueUnlock()
+{
+#ifdef ESP32
+    xSemaphoreGive(txQueueMutex);
+#else
+    txQueueBusy = false;
+#endif
+}
+
+inline bool txQueuePush(PacketAction *pkt)
+{
+    if (!txQueueLock())
+        return false;
+    const bool accepted = txQueuePushUnlocked(pkt);
+    txQueueUnlock();
+    return accepted;
+}
+
+inline bool txQueuePushSequence(PacketAction *packets, uint32_t count)
+{
+    if (count > COMMAND_QUEUE_SIZE || !txQueueLock())
+        return false;
+    // All producers use this lock. Consumers may only free more space, so
+    // a successful reservation guarantees the entire essential sequence fits.
+    bool accepted = COMMAND_QUEUE_SIZE - txQueueCount() >= count;
+    for (uint32_t i = 0; accepted && i < count; ++i)
+        accepted = txQueuePushUnlocked(&packets[i]);
+    txQueueUnlock();
+    return accepted;
 }
 
 inline bool txQueuePeek(PacketAction *pkt)
@@ -444,7 +495,7 @@ static bool pendingLightOn = false;
 static bool pendingLightOff = false;
 static bool pendingLockOn = false;
 static bool pendingLockOff = false;
-static bool pendingDoorCommand = false;
+static std::atomic<bool> pendingDoorCommand{false};
 
 #define SEC1_CMD(s) (s == secplus1Codes::DoorButtonPress)      ? "door press"    \
                     : (s == secplus1Codes::DoorButtonRelease)  ? "door release"  \
@@ -2613,6 +2664,7 @@ bool process_PacketAction(PacketAction &pkt_ac)
 
 bool door_command(DoorAction action)
 {
+    FunctionDelayLock lock;
     if (pendingDoorCommand)
     {
         ESP_LOGW(TAG, "Pending door command exists, dropping new command");
@@ -2632,11 +2684,7 @@ bool door_command(DoorAction action)
 
         Packet pkt = Packet(PacketCommand::DoorAction, data, id_code);
         PacketAction pkt_ac = {pkt, false, 0};
-        if (!txQueuePush(&pkt_ac))
-        {
-            ESP_LOGE(TAG, "packet queue full, dropping door command pressed pkt");
-            return false;
-        }
+        PacketAction sequence[2] = {pkt_ac, pkt_ac};
 
         /* Removing this section as testing with 398LM (a 0x37 wall panel) was never successful.
         if (is_0x37_panel && (garage_door.current_state == GarageDoorCurrentState::CURR_CLOSED ||
@@ -2653,9 +2701,10 @@ bool door_command(DoorAction action)
         if (doorControlType == DOOR_CONTROL_SEC_PLUS_V1)
             pkt_ac.pkt.m_data.value.cmd = secplus1Codes::DoorButtonRelease;
         pkt_ac.inc_counter = true;
-        if (!txQueuePush(&pkt_ac))
+        sequence[1] = pkt_ac;
+        if (!txQueuePushSequence(sequence, 2))
         {
-            ESP_LOGE(TAG, "packet queue full, dropping door command release pkt");
+            ESP_LOGE(TAG, "packet queue full, dropping complete door command");
             return false;
         }
         pendingDoorCommand = true;
