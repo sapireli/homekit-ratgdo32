@@ -67,7 +67,7 @@ Runtime free heap, largest block, fragmentation, stack headroom, CPU load, alloc
 
 ## Current independent resource review
 
-Scope: actuator commit `321a2eb`, HomeKit commit `bd61d3c` and the notification critical-section adapter commit `cabd742`. These changes are candidates. This review ran no PlatformIO builds, hardware operations or traffic.
+Scope: actuator commits `321a2eb`/`bd50ecd`, HomeKit ownership `bd61d3c`, adapter `cabd742`, and publication adapters `eb8f2d8`/`3b56ba8`. These changes are candidates. This review ran no PlatformIO builds, hardware operations or traffic.
 
 ### Target layout evidence and current costs
 
@@ -75,12 +75,12 @@ Read-only DWARF extraction from the preserved Rev1 ELF establishes `StaticQueue_
 
 | Change | Current storage/work | Assessment |
 |---|---|---|
-| Optional notification mailboxes | Nine 32-bit boolean words 36 B; seven request words 28 B; DHT pair 8 B; round-robin cursor 4 B; polling flag and task-owner publication about 8 B including alignment | About 84 B new metadata before final linker placement. Optional QueueHandle_t members are removed; motion/occupancy add a byte enum. Exact class deltas need target output. |
-| Notification guard adapter | One 8 B global portMUX; compile assertion and IDF 5.5 version guard; fixed operations per critical section, longest reads seven request words | About 92 B total metadata with above estimate. This replaces the unsupported lock-free atomic mailbox assumption. No added task, queue or mutex allocation. Spinlock contention and wall-time bound remain unmeasured. |
-| Optional queue removal | 172 B requested per enabled instance; permanent door queue retained | Savings scale with enabled instances. For N enabled optional instances, queue request reduction is 172 * N B before metadata, offset by about 92 B static metadata and final class deltas. The DHT queue was allocated but unused. Do not claim a universal eight-queue saving. |
-| Actuator owners | Two 20 B ControlIntent records replace four flags; three readiness/reservation/debt flags | About 39 B net persistent growth before linker padding, guarded by owner-size assertion. No new task/queue/timer/full buffer. PacketAction remains 44 B by assertion. |
+| Optional notification mailboxes | Ten 32-bit boolean words 40 B; seven request words 28 B; DHT pair 8 B; round-robin cursor 4 B; polling flag and task-owner publication about 8 B including alignment | About 88 B new metadata before final linker placement. Optional QueueHandle_t members are removed; motion/occupancy add a byte enum. Exact class deltas need target output. |
+| Notification guard adapter | One 8 B global portMUX; compile assertion and IDF 5.5 version guard; fixed operations per critical section, longest reads seven request words | About 96 B total metadata with above estimate. This replaces the unsupported lock-free atomic mailbox assumption. No added task, queue or mutex allocation. Spinlock contention and wall-time bound remain unmeasured. |
+| Optional queue removal | 172 B requested per enabled instance; permanent door queue retained | Savings scale with enabled instances. For N enabled optional instances, queue request reduction is 172 * N B before metadata, offset by about 96 B static metadata and final class deltas. The DHT queue was allocated but unused. Do not claim a universal eight-queue saving. |
+| Actuator owners | Two 20 B ControlIntent records replace four flags; three readiness/reservation/debt flags | About 43 B net persistent growth before linker padding including the four-byte query-drop counter, guarded by owner-size assertion. No new task/queue/timer/full buffer. PacketAction remains 44 B by assertion. |
 | Command queue lifecycle | Reuses existing queue; setup drains at most 16 stale entries; dry-contact avoids allocating unused serial queue | Serial queue capacity/cost unchanged. Dry-contact avoids 796 B requested capacity when no earlier session created it; this is conditional allocation avoidance, not measured released heap. |
-| Command admission stack | Two 44 B packets plus 20 B rollback state = 108 B explicit objects, plus PacketData/scalars/compiler frames | Baseline light/lock paths had about 76 B Packet/PacketAction explicit objects. Increased transient peak needs target stack evidence; no high-water claim. |
+| Command admission stack | Nested reconciliation snapshot 20 B, pair 88 B, admission rollback 20 B, query packet 44 B = 172 B explicit payload objects, plus PacketData/scalars/compiler frames | Baseline light/lock paths had about 76 B Packet/PacketAction explicit objects. Not 172 B net new: the baseline query also nested packet objects. Compiler-frame evidence is in verification.md; runtime high-water remains unknown. |
 
 The static-metadata increases are justified provisionally by complete command ownership and stable notification lifetimes, with reduced dynamic queue requests as the offset. This is an exception to the strict no-static-growth gate, not proof that the integrated binary meets its complete resource budgets. Final build sizes must report the actual static/IRAM/flash delta separately; do not hide static growth in a broad heap-saving estimate.
 
@@ -99,3 +99,9 @@ Actuator owner-state methods use the existing command lock. Whole receive-handle
 No new source-level resource blocker was identified in the reviewed final candidate layouts, subject to the adapter checks and tests passing. Integration/release remains blocked on target sizes, per-task stack headroom, capability-specific peak heap/largest block, SDK queue retention, latency/CPU measurements and sustained recovery defined above. Native tests and compile assertions cannot establish runtime headroom or hardware recovery. Preserve matched binaries/ELFs and compare identical feature configurations.
 
 Logger network/serial I/O under its mutex remains an open major issue outside this batch. Deferred delivery or compact records would change export, panic, suppression and sink ownership semantics; no record-format design or implementation is approved by this review. A future correction must keep the existing ring capacity, avoid another full buffer/task/queue, preserve panic/export evidence, and measure sink blocking rather than equating a byte budget with a time budget.
+
+## Integrated target measurement
+
+Ordinary builds through production `bd50ecd` measure static RAM73,520 B per board (+128 B against preserved baseline), unchanged IRAM99,411 B, flash1,803,684 B Rev1 (+4,320 B) /1,803,276 B Rev2 (+4,304 B). Independent resource review accepted this measured exception for stable lifetime and complete command ownership, conditional on matched final artifacts and runtime gates. Source field estimates do not replace linker totals or establish live heap savings.
+
+Rev1 entry frames for reconciliation/setter/query total304 B on the visible nested path; SDK frames, spills and other callers add to it. The new target mailbox has no extra service-request slot. Pure current-lock/light publishers retain their consumer channels without post-guard state writes. Query-drop reporting occurs outside command ownership; logger/network pressure remains open.

@@ -48,15 +48,16 @@ The first refactor batch changes ownership rather than file organization:
 - Serial queue initialization is checked and reused. Dry-contact startup skips its unused serial queue. Light/lock admission owns the essential press/release pair, pending intent expires or retires on failure, and TTC reserves capacity for its eventual release. No new task, queue, timer, or full payload buffer was added.
 - Independent review corrected stale room occupancy after recreation and kept allocation-error output off console pins already transferred to the Rev1 sensor. Target compilation replaced an unsupported lock-free atomic assumption with an explicit eight-byte, SDK-version-checked critical-section adapter.
 
-See `docs/refactor/ownership-review.md`, `actuator-review.md`, `resource-baseline.md`, and `verification.md` for evidence and limits. Source changes through `10a93bf` have two correctness reviews and an independent resource review. The new branch is a candidate, not a release or proof of field recovery.
+See `docs/refactor/ownership-review.md`, `actuator-review.md`, `resource-baseline.md`, and `verification.md` for evidence and limits. Production changes through `bd50ecd`, including publication adapters `eb8f2d8`/`3b56ba8`, have independent correctness and resource reviews. The new branch is a candidate, not a release or proof of field recovery.
 
 To resume the previous work, use `/Users/eliransapir/code/homekit-ratgdo32-integration` on `integrate-mother-main`, or the pushed `preserve/1.4.6-before-resource-refactor` branch. Both retain `7931509`. Do not reset this refactor branch onto that baseline or replace the old PR with it.
+
+Opposite light/lock requests now cancel unwritten work or defer until fresh typed feedback after transmission. Required Releases survive cancellation, expiry, and collision. Accepted lock targets use a latest-value mailbox; pure publishers keep later notifications from rewriting command state. Rejected feedback queries are counted and reported outside command ownership.
 
 ## Major work still open
 
 1. Logger serial/network output still runs under its mutex. A deferred design must preserve recursion suppression, serial pin ownership, panic/export evidence, and sink eligibility without another log copy, task, or queue. No replacement is approved yet.
-2. Opposite light/lock requests can be ignored while the opposite command is queued. The actuator review records a bounded reconciliation proposal; it is not implemented.
-3. UART shutdown is electrically inactive but is not proof that an already transmitted protocol-button press was released at the opener. Do not add speculative teardown writes.
-4. Aggregate SDK TCP retention, capability-specific heap/largest block, task stack headroom, critical/loop latency, and sustained recovery remain unmeasured. Native regressions and builds do not satisfy those runtime gates.
+2. UART shutdown is electrically inactive but is not proof that an already transmitted protocol-button press was released at the opener. Do not add speculative teardown writes.
+3. Aggregate SDK TCP retention, capability-specific heap/largest block, task stack headroom, critical/loop latency, and sustained recovery remain unmeasured. Native regressions and builds do not satisfy those runtime gates.
 
 The original complete freeze cause remains under investigation. Existing post-power-cycle symptoms and improvement after re-pairing/reflashing are not explained by these source mechanisms alone. Keep this refactor separate from the established testing/release track until its remaining validation is complete.
