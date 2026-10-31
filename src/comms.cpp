@@ -39,6 +39,7 @@
 #include "secplus2.h"
 #include "Packet.h"
 #include "drycontact.h"
+#include "door_command_lifecycle.h"
 #endif // USE_GDOLIB
 
 #ifdef ESP8266
@@ -66,6 +67,8 @@ struct __attribute__((aligned(4))) PacketAction
     Packet pkt;
     bool inc_counter;
     uint32_t delay;
+    uint32_t doorGeneration = 0;
+    bool doorPress = false;
 };
 
 // On ESP32 we use the FreeRTOS queues.  This is not available on our ESP8266 builds.
@@ -513,6 +516,39 @@ static bool pendingLightOff = false;
 static bool pendingLockOn = false;
 static bool pendingLockOff = false;
 static std::atomic<bool> pendingDoorCommand{false};
+static DoorCommandLifecycle doorLifecycle;
+static PacketAction *writingDoorPacket = nullptr;
+void processPendingDoorIntent();
+void cancelPendingDoorIntent()
+{
+    FunctionDelayLock lock;
+    doorLifecycle.cancel();
+    pendingDoorCommand = false;
+}
+bool requestPendingDoorIntent(DoorCommandLifecycle::Intent intent)
+{
+    if (doorControlType == DOOR_CONTROL_DRY_CONTACT)
+        return false;
+    const bool wasPending = doorLifecycle.pending();
+    if (wasPending)
+    {
+        stopSentClosePending = 0;
+        stopSentOpenPending = 0;
+    }
+    const bool deferred = doorLifecycle.request(intent, static_cast<uint32_t>(_millis()));
+    pendingDoorCommand = doorLifecycle.pending();
+    if (wasPending && !pendingDoorCommand)
+    {
+        checkDoorMoving.detach();
+        checkDoorCompleted.detach();
+    }
+    return deferred;
+}
+void markDoorPacketWriting()
+{
+    if (writingDoorPacket)
+        doorLifecycle.writing(writingDoorPacket->doorGeneration, writingDoorPacket->doorPress);
+}
 
 #define SEC1_CMD(s) (s == secplus1Codes::DoorButtonPress)      ? "door press"    \
                     : (s == secplus1Codes::DoorButtonRelease)  ? "door release"  \
@@ -948,6 +984,10 @@ void shutdown_comms()
         // Cancel old work and reject new door commands before teardown starts.
         cancelFunctionDelay();
         cancelPartialOpen();
+#ifndef USE_GDOLIB
+        doorLifecycle.reset();
+        pendingDoorCommand = false;
+#endif
         wasReady = comms_setup_done;
         comms_setup_done = false;
     }
@@ -1153,7 +1193,8 @@ void update_door_state(GarageDoorCurrentState current_state)
     _millis_t now = _millis();
 
     GarageDoorTargetState target_state = garage_door.target_state;
-    pendingDoorCommand = false;
+    doorLifecycle.status(static_cast<int>(current_state));
+    pendingDoorCommand = doorLifecycle.pending();
 
     // Determine target state
     switch (current_state)
@@ -1298,10 +1339,18 @@ void update_door_state(GarageDoorCurrentState current_state)
         stopSentOpenPending = 0;
         if (_millis() - stopTime < 2000)
         {
-            if (reverseOpen)
-                door_command_open();
+#ifndef USE_GDOLIB
+            if (doorLifecycle.pending())
+                doorLifecycle.defer(reverseOpen ? DoorCommandLifecycle::Intent::Open : DoorCommandLifecycle::Intent::Close,
+                                    static_cast<uint32_t>(_millis()));
             else
-                door_command_close();
+#endif
+            {
+                if (reverseOpen)
+                    door_command_open();
+                else
+                    door_command_close();
+            }
         }
         else
         {
@@ -2452,6 +2501,9 @@ void comms_loop()
 {
     processFunctionDelay();
     processPartialOpen();
+#ifndef USE_GDOLIB
+    processPendingDoorIntent();
+#endif
     if (!comms_setup_done)
         return;
 
@@ -2561,6 +2613,7 @@ bool transmitSec1(byte toSend)
 
     // aprox 10ms to write byte
     // every byte we send echos, but want the echo on polls to id the GDO response
+    markDoorPacketWriting();
     Sec1Serial.write(toSend);
     // timestamp tx
     last_tx = _millis();
@@ -2657,6 +2710,7 @@ bool transmitSec2(PacketAction &pkt_ac)
     {
         // Use LED to signal activity
         led.flash(FLASH_ACTIVITY_MS);
+        markDoorPacketWriting();
         sw_serial.write(buf, SECPLUS2_CODE_LEN);
         delayMicroseconds(100);
         // timestamp tx
@@ -2674,15 +2728,21 @@ bool transmitSec2(PacketAction &pkt_ac)
 
 bool process_PacketAction(PacketAction &pkt_ac)
 {
+    FunctionDelayLock lock;
+    if (!comms_setup_done || !doorLifecycle.allow(pkt_ac.doorGeneration, pkt_ac.doorPress))
+        return true; // Discard a cancelled or already-written button press.
+    writingDoorPacket = &pkt_ac;
+    bool sent = false;
     if (doorControlType == DOOR_CONTROL_SEC_PLUS_V2)
     {
-        return transmitSec2(pkt_ac);
+        sent = transmitSec2(pkt_ac);
     }
     else if (pkt_ac.pkt.m_data.value.cmd)
     {
-        return transmitSec1(pkt_ac.pkt.m_data.value.cmd);
+        sent = transmitSec1(pkt_ac.pkt.m_data.value.cmd);
     }
-    return false;
+    writingDoorPacket = nullptr;
+    return sent;
 }
 
 bool door_command(DoorAction action)
@@ -2710,6 +2770,9 @@ bool door_command(DoorAction action)
         Packet pkt = Packet(PacketCommand::DoorAction, data, id_code);
         PacketAction pkt_ac = {pkt, false, 0};
         PacketAction sequence[2] = {pkt_ac, pkt_ac};
+        const uint32_t generation = doorLifecycle.begin(static_cast<int>(garage_door.current_state), static_cast<uint32_t>(_millis()));
+        sequence[0].doorGeneration = generation;
+        sequence[0].doorPress = true;
 
         /* Removing this section as testing with 398LM (a 0x37 wall panel) was never successful.
         if (is_0x37_panel && (garage_door.current_state == GarageDoorCurrentState::CURR_CLOSED ||
@@ -2727,12 +2790,15 @@ bool door_command(DoorAction action)
             pkt_ac.pkt.m_data.value.cmd = secplus1Codes::DoorButtonRelease;
         pkt_ac.inc_counter = true;
         sequence[1] = pkt_ac;
+        sequence[1].doorGeneration = generation;
         if (!txQueuePushSequence(sequence, 2))
         {
             ESP_LOGE(TAG, "packet queue full, dropping complete door command");
+            cancelPendingDoorIntent();
             return false;
         }
         pendingDoorCommand = true;
+        pkt_ac.doorGeneration = generation;
 
         // if sec+1.0, repeat the release
         if (doorControlType == DOOR_CONTROL_SEC_PLUS_V1)
@@ -2788,6 +2854,30 @@ bool door_command(DoorAction action)
                             { digitalWrite(UART_TX_PIN, LOW); });
     }
     return true;
+}
+
+void processPendingDoorIntent()
+{
+    FunctionDelayLock lock;
+    if (!comms_setup_done)
+    {
+        doorLifecycle.reset();
+        pendingDoorCommand = false;
+        return;
+    }
+    // A command timeout must retire its intent as well as the legacy flag.
+    if (!pendingDoorCommand)
+        doorLifecycle.cancel();
+    const auto intent = doorLifecycle.poll(static_cast<uint32_t>(_millis()));
+    pendingDoorCommand = doorLifecycle.pending();
+    switch (intent)
+    {
+    case DoorCommandLifecycle::Intent::Open: open_door(); break;
+    case DoorCommandLifecycle::Intent::Close: close_door(); break;
+    case DoorCommandLifecycle::Intent::Stop: stop_door(); break;
+    case DoorCommandLifecycle::Intent::Toggle: toggle_door(); break;
+    case DoorCommandLifecycle::Intent::None: break;
+    }
 }
 
 #endif // not USE_GDOLIB
@@ -2928,6 +3018,10 @@ GarageDoorCurrentState open_door()
     FunctionDelayLock lock;
     if (!comms_setup_done)
         return garage_door.current_state;
+#ifndef USE_GDOLIB
+    if (requestPendingDoorIntent(DoorCommandLifecycle::Intent::Open))
+        return garage_door.current_state;
+#endif
     cancelPartialOpen();
     if (functionDelayActive())
     {
@@ -2985,6 +3079,10 @@ GarageDoorCurrentState stop_door()
     FunctionDelayLock lock;
     if (!comms_setup_done)
         return garage_door.current_state;
+#ifndef USE_GDOLIB
+    if (requestPendingDoorIntent(DoorCommandLifecycle::Intent::Stop))
+        return garage_door.current_state;
+#endif
     cancelPartialOpen();
 
     if (!(garage_door.current_state == GarageDoorCurrentState::CURR_CLOSING || garage_door.current_state == GarageDoorCurrentState::CURR_OPENING))
@@ -3224,6 +3322,10 @@ GarageDoorCurrentState close_door(bool bypass_ttc)
     FunctionDelayLock lock;
     if (!comms_setup_done)
         return garage_door.current_state;
+#ifndef USE_GDOLIB
+    if (requestPendingDoorIntent(DoorCommandLifecycle::Intent::Close))
+        return garage_door.current_state;
+#endif
     cancelPartialOpen();
     if (garage_door.current_state == GarageDoorCurrentState::CURR_CLOSED || garage_door.current_state == GarageDoorCurrentState::CURR_CLOSING)
     {
@@ -3318,6 +3420,10 @@ GarageDoorCurrentState toggle_door(bool bypass_ttc)
     FunctionDelayLock lock;
     if (!comms_setup_done)
         return garage_door.current_state;
+#ifndef USE_GDOLIB
+    if (requestPendingDoorIntent(DoorCommandLifecycle::Intent::Toggle))
+        return garage_door.current_state;
+#endif
     cancelPartialOpen();
     ESP_LOGI(TAG, "Toggling door via hardwired control");
     if (doorControlType == DOOR_CONTROL_DRY_CONTACT)

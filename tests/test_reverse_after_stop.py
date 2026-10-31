@@ -78,8 +78,17 @@ int main() {
     follow(CURR_STOPPED); assert(toggles==1 && stopSentClosePending==0);
     now=3000; stopSentOpenPending=2900;
     follow(CURR_STOPPED); assert(opens==1 && stopSentOpenPending==0);
+    const uint32_t token=doorLifecycle.begin(CURR_OPENING,now);
+    doorLifecycle.writing(token,true);doorLifecycle.status(CURR_STOPPED);
+    stopSentOpenPending=now;
+    follow(CURR_STOPPED);assert(opens==1 && stopSentOpenPending==0);
+    assert(doorLifecycle.poll(now)==DoorCommandLifecycle::Intent::None);
+    doorLifecycle.writing(token,false);
+    assert(doorLifecycle.poll(now)==DoorCommandLifecycle::Intent::Open);
 }
 """
+        header = (SOURCE.parent / "door_command_lifecycle.h").read_text().replace("#pragma once", "")
+        harness = header + "\nDoorCommandLifecycle doorLifecycle;\n" + harness
         with tempfile.TemporaryDirectory() as tmp:
             cpp = Path(tmp) / "reverse.cpp"
             exe = Path(tmp) / "reverse"

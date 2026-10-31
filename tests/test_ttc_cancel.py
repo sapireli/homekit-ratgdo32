@@ -109,6 +109,10 @@ void door_command_close(){
 }
 void door_command_open(){}
 bool door_command(DoorAction){return true;}
+''' + (SOURCE.parent / "door_command_lifecycle.h").read_text().replace("#pragma once", "") + r'''
+DoorCommandLifecycle doorLifecycle;
+bool pendingDoorCommand=false;
+bool requestPendingDoorIntent(DoorCommandLifecycle::Intent){return false;}
 ''' + helpers + functions + r'''
 int main(){
     delayFnCall(0,door_command_close);
