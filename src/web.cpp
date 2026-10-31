@@ -526,7 +526,11 @@ bool retireSSESubscription(std::atomic<bool> &active,
 inline bool takeSSEHeartbeat(bool active, bool connected, uint32_t interval,
                              uint32_t &lastHeartbeat, uint32_t now)
 {
-    if (!active || !connected || !interval || interval > 60 ||
+    // Reap registrations whose client never opens the event stream, including
+    // subscriptions that disable periodic heartbeats after connecting.
+    if (!connected)
+        interval = 1;
+    if (!active || !interval || interval > 60 ||
         static_cast<uint32_t>(now - lastHeartbeat) < interval * 1000)
         return false;
     lastHeartbeat = now;
