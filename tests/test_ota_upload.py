@@ -183,6 +183,7 @@ bool httpOwnedPoll() { return !httpOwnedPending; }
 bool drainRetiredSSE() { return true; }
 bool bodyPending=false;
 bool drainHttpBodies() { return bodyPending; }
+bool pollHttpResponses() { return bodyPending; }
 ''' + loop_prefix + callback + r'''
 void event(UploadStatus status) { server.data.status=status; handle_firmware_upload(); }
 void start(bool verify=false) {

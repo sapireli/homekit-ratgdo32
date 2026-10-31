@@ -64,3 +64,9 @@ enum BroadcastType : uint8_t
     LOG_MESSAGE = 2,
 };
 void SSEBroadcastState(const char *data, BroadcastType type = RATGDO_STATUS);
+
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+void setup_http_response_delivery();
+// Reader returns one scratch-buffer span, zero at EOF, SIZE_MAX on failure.
+bool defer_http_generated_body(size_t (*reader)(uint8_t *, size_t), void (*cleanup)());
+#endif
