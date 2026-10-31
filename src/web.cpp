@@ -141,6 +141,27 @@ bool _authenticatedUpdate;
 char firmwareMD5[36] = "";
 size_t firmwareSize = 0;
 
+// OTA tears down UART/GDO services. Recover by a clean restart rather than
+// rebuilding drivers/queues from an HTTP callback or remaining offline if the
+// uploader disappears before requesting its normal reboot.
+static bool otaServicesStopped = false;
+static bool otaUploadActive = false;
+static bool otaRecoveryPending = false;
+static _millis_t otaRecoveryAt = 0;
+static constexpr uint32_t OTA_FAILURE_RESTART_MS = 1000;
+static constexpr uint32_t OTA_STAGED_RESTART_MS = 30000;
+
+static bool recoverStoppedOTAServices()
+{
+    if (!otaRecoveryPending || otaUploadActive || _millis() < otaRecoveryAt)
+        return false;
+    otaRecoveryPending = false;
+    ESP_LOGW(TAG, "Restarting to restore services stopped for firmware upload");
+    server.stop();
+    sync_and_restart();
+    return true;
+}
+
 // Common HTTP responses
 constexpr char response400missing[] = "400: Bad Request, missing argument\n";
 constexpr char response400invalid[] = "400: Bad Request, invalid argument\n";
@@ -336,6 +357,8 @@ void notify_new_ipv6_address()
 void web_loop()
 {
     if (!web_setup_done)
+        return;
+    if (recoverStoppedOTAServices())
         return;
 
     static char *json = status_json;
@@ -1831,7 +1854,8 @@ void handle_update()
     if (server.args() > 0)
     {
         firmwareUpdateSub = NULL;
-        // Don't reboot, user/client must explicitly request reboot.
+        // The client normally requests reboot after this response. A bounded
+        // fallback also restores services if that client disappears.
         server.send_P(200, type_txt, PSTR("Upload Success.\n"));
     }
     else
@@ -1868,6 +1892,10 @@ void handle_firmware_upload()
             ESP_LOGE(TAG, "Unauthenticated Update");
             return;
         }
+        // Never reboot in the middle of a transfer/verification. Keep an
+        // existing recovery deadline armed until a terminal callback, so a
+        // rejected retry cannot permanently cancel recovery.
+        otaUploadActive = true;
         ESP_LOGI(TAG, "Update: %s", upload.filename.c_str());
         verify = !strcmp(server.arg("action").c_str(), "verify");
         size = atoi(server.arg("size").c_str());
@@ -1904,6 +1932,8 @@ void handle_firmware_upload()
             // Only if not verifying as either will have been shutdown on immediately prior upload, or we
             // just want to verify without disrupting operation of the HomeKit service.
             ESP_LOGI(TAG, "Shutdown HomeKit and GDO communications");
+
+            otaServicesStopped = true;
 
             // Service loop has things like reboot after X days, homekit notifications, etc. that we don't want during OTA
             suspend_service_loop = true;
@@ -2001,4 +2031,14 @@ void handle_firmware_upload()
         homekitUpdateLock.owns_lock())
         homekitUpdateLock.unlock();
 #endif
+    if (upload.status == UPLOAD_FILE_END || upload.status == UPLOAD_FILE_ABORTED)
+    {
+        otaUploadActive = false;
+        if (_authenticatedUpdate && otaServicesStopped)
+        {
+            const bool failed = upload.status == UPLOAD_FILE_ABORTED || _updaterError.length();
+            otaRecoveryAt = _millis() + (failed ? OTA_FAILURE_RESTART_MS : OTA_STAGED_RESTART_MS);
+            otaRecoveryPending = true;
+        }
+    }
 }
