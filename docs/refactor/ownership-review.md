@@ -1,20 +1,22 @@
 # Ownership and execution-context review
 
-Reviewed the isolated 1.4.6 base at `7931509`. This is a source investigation; no device traffic, actuator commands, builds, runtime reproductions, or resource measurements were performed. References to HomeSpan use the existing dependency at `/Users/eliransapir/code/homekit-ratgdo32-integration/.pio/libdeps/ratgdo_esp32dev_rev1/HomeSpan/src/`; its exact dependency provenance must be checked before implementation relies on it.
+The baseline source review used 1.4.6 commit `7931509`. The first two findings below describe that baseline and have candidate source corrections in the isolated refactor branch; they are not descriptions of the current optional-service implementation. The logger finding remains open. The current implementation and verification limits are recorded after the inventory.
 
-## Major findings
+Baseline source line references in the findings, inventory, and lock graph refer to `7931509`; later refactor edits move those lines. HomeSpan references use the existing pinned dependency in `/Users/eliransapir/code/homekit-ratgdo32-integration/.pio/libdeps/ratgdo_esp32dev_rev1/HomeSpan/src/`. This investigation performed source review and host regressions, with no device traffic, actuator commands, or hardware validation. The coordinating agent owns target builds and the build/resource record in `resource-baseline.md`.
 
-### 1. Optional HomeKit services abandon their FreeRTOS queues on deletion
+## Baseline findings and current status
+
+### 1. Baseline optional-service queue retention: corrected in candidate source
 
 Concrete source mechanism: every `DEV_*` service constructor allocates an event queue (`src/homekit.cpp:1098,1170,1218,1240,1262,1295,1332`). None of the service declarations in `src/homekit.h:91-182` defines a destructor. Runtime configuration helpers delete optional accessories and clear the application pointer (`src/homekit.cpp:650-903`). HomeSpan `Span::deleteAccessory` (`HomeSpan.cpp:1592`) deletes the accessory; `SpanService::~SpanService` (`HomeSpan.cpp:2110`) deletes characteristics and framework registrations, but has no knowledge of the application `QueueHandle_t`.
 
 Each disable/enable cycle therefore loses a live queue allocation. An allocation-failure consequence is also concrete: constructors do not check queue creation; service `loop()` methods call `uxQueueMessagesWaiting(event_q)` unconditionally. The producer helper's null guard at `src/homekit.cpp:1048` does not protect consumers. Exact leaked bytes and failure behavior remain unmeasured.
 
-Correction: give the existing service object ownership of its existing queue and release it during safe service retirement. A small common queue-owning base/member can enforce allocation checks and destruction without another task, registry, queue, or payload buffer. Consumers must tolerate unavailable queues. Do not add queue destruction before fixing concurrent users in finding 2: that would turn a queue leak into a stale-handle race. The unused DHT queue (`src/homekit.cpp:1259-1287`) is removable, but does not by itself resolve optional-service retention.
+Current correction: remove optional-service queues entirely and publish state through lifetime-stable mailboxes. Producers no longer borrow a deletable service or queue handle. Queue-owning destructors are therefore unnecessary for optional services. The permanent garage-door FIFO remains to preserve intermediate transitions, and its consumer now checks allocation failure.
 
-Required regression: repeatedly create/delete actual derived services through the actual HomeSpan accessory lifecycle and observe balanced queue allocation/free; inject queue allocation failure and call the production consumer loop. This can use an isolated native lifecycle fixture only if it exercises production destructors; target validation is still required for FreeRTOS memory totals.
+The production constructor/helper regression fails on the baseline at the retained-queue allocation assertion after 1,000 create/delete cycles and passes on the candidate. The host fixture models framework deletion; actual HomeSpan/FreeRTOS lifecycle and memory-return measurements remain target validation requirements.
 
-### 2. Accessory mutation and notification producers have no shared lifetime boundary
+### 2. Baseline optional-service lifetime race: corrected in candidate source
 
 The web settings path calls a setting helper directly (`src/web.cpp:2384-2397`), and helpers enable/delete accessories (`src/config.cpp:476-558`). HomeSpan runs on a separate 16 KiB auto-poll task (`src/homekit.cpp:1043`). Installed HomeSpan `pollTask()` holds a unique `pollMutex` lock (`HomeSpan.cpp:185-187`); `deleteAccessory` itself does not lock. Application helpers do not use the matching pause mechanism. They mutate vectors traversed by the poll task and delete characteristics/services it may be using.
 
@@ -22,21 +24,21 @@ In addition, notify functions test a raw optional-service pointer and then acces
 
 The unsynchronized operations and possible stale access follow from the call graph. No adverse interleaving has been reproduced on hardware; this review does not attribute a reported crash to this mechanism.
 
-Preferred correction to investigate: transfer requested optional-service changes and latest state into existing storage consumed by the HomeSpan owner. Keep timer callbacks limited to physical/light state and a bounded state publication; make service pointer and queue access owner-only. Preserve intermediate transitions that the protocol needs rather than blindly coalescing all events. An alternative narrow lifetime lock must protect all producers and deletion, account for callbacks invoked from inside HomeSpan, and obey the order below. Avoid solving this with a second service registry or task.
+Current correction: producers use stable mailbox storage, while optional accessory creation/deletion runs from the existing Arduino owner loop under a nonblocking HomeSpan pause. The integrated ESP32 `homekit_loop()` call runs before application locks. It never mutates HomeSpan's service-loop vector from inside that traversal. Timer publication performs bounded critical work without service pointers; intermediate garage-door transitions remain in the permanent FIFO.
 
 Do not blindly add a HomeSpan pause under JSON. HomeSpan's connection callback calls `refresh_ipv4_config()` then `notify_new_ipv4_address()` (`src/homekit.cpp:429-467`), which waits on JSON (`src/web.cpp:1109-1114`). This establishes `HomeSpan -> JSON`. A new `JSON -> HomeSpan` edge would introduce a deadlock. The SDK's `homeSpanPAUSE` is a shared lock (`HomeSpan.h:95`), so it excludes polling but permits multiple external holders; it is not an all-caller lifetime mutex.
 
-Required regressions: pause or block a production poll traversal while requesting optional deletion; overlap an existing laser notification with retirement; inject failed queue allocation. Verify no stale service/characteristic/queue access and no blocked timer task. Use actual HomeSpan lock and deletion implementation for the synchronization checks.
+Host regressions now cover notification/deletion overlap, nonblocking pause contention with retained requests, recreation state, and failed permanent queue allocation. These tests exercise extracted production methods with inert framework boundaries; they do not substitute for a target test using HomeSpan's actual traversal/deletion and FreeRTOS scheduling.
 
-### 3. Logger retains its mutex while doing socket and UART work
+### 3. Open: logger retains its mutex while doing socket and UART work
 
-`LOG::logToBuffer` holds its recursive logger lock across `Serial.print`, SSE fan-out, and syslog packet construction/transmission (`src/log.cpp:250-317`). `logToSyslog` performs many `WiFiUDP::print` calls and `beginPacket`/`endPacket` (`src/log.cpp:770-824`). This makes any task logging a possible network sender and serial waiter, including HomeSpan callbacks and the ESP timer task when a notification queue is full. `MSG_DONTWAIT` on the SSE send bounds socket-buffer admission, but does not prove the complete SDK call or `client.stop()` is bounded while other locks are held.
+`LOG::logToBuffer` holds its recursive logger lock across `Serial.print`, SSE fan-out, and syslog packet construction/transmission (`src/log.cpp:250-317`). `logToSyslog` performs many `WiFiUDP::print` calls and `beginPacket`/`endPacket` (`src/log.cpp:770-824`). This makes any task logging a possible network sender and serial waiter, including HomeSpan callbacks. The baseline optional queue-full path could also invoke logging from the ESP timer task; the candidate mailbox publication removes that particular path. `MSG_DONTWAIT` on the SSE send bounds socket-buffer admission, but does not prove the complete SDK call or `client.stop()` is bounded while other locks are held.
 
 The existing core-held logging guard is valuable: `esp_log_hook` avoids serial setup when the TCPIP core lock is held, and `logToBuffer` uses a zero-wait logger acquisition and skips output in that context (`src/log.cpp:68-79,241-250,272-276,303`). This removes the direct `TCPIP -> logger wait -> TCPIP` cycle; do not report that already-addressed inversion as a current defect.
 
 Major architectural candidate: append under the logger lock and let an existing main-loop owner drain bounded pending log data through existing ring cursor support. This removes external I/O from logging callers without a new task or full buffer. Handle ring overwrite visibly, account for per-subscriber delivery, and preserve syslog behavior. Do not borrow `lineBuffer` after unlocking: recursive error logging can overwrite it, and concurrent callers share it. Native timing or mocked UDP is insufficient to claim SDK boundedness; target latency and capability-specific heap measurements are needed.
 
-## Context and resource inventory
+## Baseline context and resource inventory
 
 | Context | Owned work and shared resources | Boundaries |
 | --- | --- | --- |
@@ -49,9 +51,9 @@ Major architectural candidate: append under the logger lock and let an existing 
 | Panic/shutdown | `quiesce_gdo_tx`, RTC crash snapshot | Panic handler dereferences logger buffers without initialization checks (`log.cpp:156-187`); boot allocations are unchecked (`log.cpp:213-222`). No runtime failure reproduced. |
 | Optional diagnostics | Existing `diag-send` and `diag-observe` static tasks (`runtime_diagnostics.cpp:326-327`) | Count their stacks/storage separately from a production baseline. Do not add comparable tasks as a default fix. |
 
-Persistent buffers include the logger ring, shared logger line buffer, RTC crash/reboot buffers, global web `status_json`/`writeBuffer`, fixed SSE slots, command queue, HomeKit service queues, and optional diagnostics storage. A complete byte budget requires actual build symbols and SDK allocation measurements; this report makes no savings claim.
+Baseline persistent buffers include the logger ring, shared logger line buffer, RTC crash/reboot buffers, global web `status_json`/`writeBuffer`, fixed SSE slots, command queue, HomeKit service queues, and optional diagnostics storage. The current candidate replaces optional HomeKit queues with the mailboxes described below; the permanent garage-door FIFO remains. A complete byte budget requires actual build symbols and SDK allocation measurements; this report makes no savings claim.
 
-## Existing lock graph and socket ownership
+## Baseline lock graph and socket ownership
 
 - Logger lock can precede SSE try-lock, socket/core operations, UDP operations, and serial driver locks. SSE paths can log while holding SSE, but logger broadcasts try-lock SSE, avoiding a blocking `logger -> SSE` edge. Preserve that behavior until output moves to one owner.
 - JSON precedes SSE in heartbeat processing (`web.cpp:1140-1155`); JSON-held status work can log (`web.cpp:1175-1346`). Never add a blocking SSE-to-JSON path.
@@ -62,7 +64,7 @@ Persistent buffers include the logger ring, shared logger line buffer, RTC crash
 
 ## Scope and next steps
 
-Prioritize service lifetime and queue ownership together. Then evaluate moving logger delivery to the existing loop owner. Treat HTTP queued-resource retirement as a separate SDK-dependent investigation; do not infer its correctness from application handle lifetime or replace it with another registry.
+Validate the integrated mailbox/service-mutation correction on target, then evaluate moving logger delivery to the existing loop owner. Treat HTTP queued-resource retirement as a separate SDK-dependent investigation; do not infer its correctness from application handle lifetime or replace it with another registry.
 
 The review did not inspect every allocation in dependency cryptography, provisioning, mDNS, GDOLIB, or the Arduino SDK, and did not measure stack headroom, heap capabilities, queue retention, or worst-case execution time. These are explicit validation gaps, not evidence that a device is recovered.
 
@@ -74,11 +76,11 @@ The resource reviewer identified the preserved Rev1 ELF's `StaticQueue_t` as 92 
 
 Light/laser mailboxes retain latest state. Detection channels retain one pending detected state followed by latest clear state; repeated detections can merge while the consumer stalls. Each recreated service starts from current state rather than replaying historical detections collected while absent. Notification consumers only call `setVal`; actuator calls remain in explicit HomeKit update callbacks. DHT readings now reach `setVal` from the HomeSpan owner rather than the web task.
 
-Optional mutation requests return to the existing Arduino loop. `homekit_loop()` checks pending work, tries the existing HomeSpan shared pause without waiting, and processes one requested group per iteration with round-robin admission. Busy polling leaves requests pending. During OTA service suspension it avoids reacquiring the pause held across upload callbacks. The root integration must call this ESP32 hook before other application locks. Runtime room-occupancy creation now updates the HomeSpan database so its loop is registered.
+Optional mutation requests return to the existing Arduino loop. `homekit_loop()` checks pending work, tries the existing HomeSpan shared pause without waiting, and processes one requested group per iteration with round-robin admission. Busy polling leaves requests pending. During OTA service suspension it avoids reacquiring the pause held across upload callbacks. The ESP32 hook is integrated at the start of the Arduino loop before other application locks (`src/ratgdo.cpp`, commit `ed7c0df`). Runtime room-occupancy creation now updates the HomeSpan database so its loop is registered.
 
-Verification performed: seven host regressions pass; the optional producer/helper/consumer/drain methods are extracted from production source. The create/delete regression compiled against `7931509` fails specifically at `allocations.load()==0` after 1,000 cycles. The permanent queue-allocation failure case exercises the production garage service consumer. Tests cover publication while absent, producer/deletion overlap, current state after recreation, delayed latest state, preserved true/false detection, nonblocking deferred mutation under a busy poll lock, and suspended mutation during OTA. AddressSanitizer/UndefinedBehaviorSanitizer passed on the host notification suite; ThreadSanitizer passed on the producer/deletion overlap case. The existing explicit HomeKit actuator-write regression also passes.
+Verification performed: eight lifecycle host regressions and the focused adapter regression pass; the optional producer/helper/consumer/drain methods are extracted from production source. The create/delete regression compiled against `7931509` fails specifically at `allocations.load()==0` after 1,000 cycles. The permanent queue-allocation failure case exercises the production garage service consumer. Tests cover publication while absent, producer/deletion overlap, current state after recreation, room occupancy reset/recreation, delayed latest state, preserved true/false detection, nonblocking deferred mutation under a busy poll lock, and suspended mutation during OTA. AddressSanitizer/UndefinedBehaviorSanitizer passed on the host notification suite; ThreadSanitizer passed on the producer/deletion overlap case of the earlier atomic candidate; the portMUX adapter itself has the separate contract-shim coverage described below. The existing explicit HomeKit actuator-write regression also passes.
 
-The host fixture substitutes inert characteristic, allocation, and HomeSpan deletion boundaries. It models the verified SDK pause contract but does not run HomeSpan network polling or actual FreeRTOS allocation. It therefore does not establish target timing, capability-specific heap savings, HAP delivery behavior, runtime recovery, or hardware safety. No PlatformIO build or hardware action was performed by this investigation.
+The host fixture substitutes inert characteristic, allocation, and HomeSpan deletion boundaries. It models the verified SDK pause contract but does not run HomeSpan network polling or actual FreeRTOS allocation. It therefore does not establish target timing, capability-specific heap savings, HAP delivery behavior, runtime recovery, or hardware safety. The target build record belongs to the coordinating integration work; this host investigation performs no hardware actions.
 
 ### Pinned target atomic correction
 
