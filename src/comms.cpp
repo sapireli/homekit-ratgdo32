@@ -283,8 +283,37 @@ void cancelFunctionDelay()
     functionDelayNextTick = 0;
     functionDelayFinalWait = false;
 }
-static Ticker checkDoorMoving = Ticker();
-static Ticker checkDoorCompleted = Ticker();
+// These callbacks are dispatched only by comms_loop. detach() cannot race an
+// SDK timer task destroying or invoking a std::function callback.
+class PolledDoorDeadline
+{
+public:
+    void detach() { callback = nullptr; }
+    void once_ms(uint32_t milliseconds, void (*next)())
+    {
+        deadline = _millis() + milliseconds;
+        callback = next;
+    }
+    void process()
+    {
+        FunctionDelayLock lock;
+#ifdef ESP8266
+        const bool waiting = static_cast<int32_t>(_millis() - deadline) < 0;
+#else
+        const bool waiting = _millis() < deadline;
+#endif
+        if (!callback || waiting)
+            return;
+        auto next = callback;
+        callback = nullptr;
+        if (comms_setup_done)
+            next();
+    }
+private:
+    _millis_t deadline = 0;
+    void (*callback)() = nullptr;
+};
+static PolledDoorDeadline checkDoorMoving, checkDoorCompleted;
 bool TTCwasLightOn = false;
 static Ticker builtInTTCcountdown = Ticker();
 static _millis_t partialDuration = 0, partialStartDeadline = 0, partialStopDeadline = 0;
@@ -987,6 +1016,8 @@ void shutdown_comms()
         // Cancel old work and reject new door commands before teardown starts.
         cancelFunctionDelay();
         cancelPartialOpen();
+        checkDoorMoving.detach();
+        checkDoorCompleted.detach();
 #ifndef USE_GDOLIB
         doorLifecycle.reset();
         pendingDoorCommand = false;
@@ -1225,8 +1256,10 @@ void update_door_state(GarageDoorCurrentState current_state)
         break;
     } // end switch
 
-    // Always terminate the door moving timer, since we are getting a new state.
-    checkDoorMoving.detach();
+    // Unchanged cached status does not confirm that a queued command moved.
+    const bool stateChanged = current_state != garage_door.current_state;
+    if (stateChanged)
+        checkDoorMoving.detach();
     switch (current_state)
     {
     case GarageDoorCurrentState::CURR_CLOSING:
@@ -1246,11 +1279,13 @@ void update_door_state(GarageDoorCurrentState current_state)
     case GarageDoorCurrentState::CURR_OPEN:
     case GarageDoorCurrentState::CURR_CLOSED:
         // If timer that checks door completely opens/closes is active, cancel it.
-        checkDoorCompleted.detach();
+        if (stateChanged)
+            checkDoorCompleted.detach();
         break;
     case GarageDoorCurrentState::CURR_STOPPED:
         // If timer that checks door completely opens/closes is active, cancel it.
-        checkDoorCompleted.detach();
+        if (stateChanged)
+            checkDoorCompleted.detach();
         break;
     default:
         // We logged an error in the previous switch()
@@ -2513,6 +2548,8 @@ void comms_loop()
 {
     processFunctionDelay();
     processPartialOpen();
+    checkDoorMoving.process();
+    checkDoorCompleted.process();
 #ifndef USE_GDOLIB
     processPendingDoorIntent();
 #endif
@@ -2940,13 +2977,12 @@ void door_command_close()
         checkDoorCompleted.once_ms((garage_door.closeDuration + 3) * 1000, []()
                                    {
                                        // If this timer fires (was not cancelled when we get notification that door has stopped) then
-                                       // we probably missed a status mesage, assume it's closed.
-                                       ESP_LOGW(TAG, "Door did not close in expected time, assuming it is closed");
-                                       pendingDoorCommand = false;
-                                       notify_homekit_current_door_state_change(GarageDoorCurrentState::CURR_CLOSED);
+                                       // Request feedback; elapsed time cannot establish physical position.
+                                       ESP_LOGW(TAG, "Door did not confirm closing in expected time; querying actual state");
+                                       cancelPendingDoorIntent();
+                                       notify_homekit_current_door_state_change(garage_door.current_state);
                                        if (!wpDisconnectOnTx)
-                                           write_status_pin(STATUS_DOOR_PIN, LOW);
-                                       notify_homekit_target_door_state_change(GarageDoorTargetState::TGT_CLOSED);
+                                           write_status_pin(STATUS_DOOR_PIN, garage_door.current_state == GarageDoorCurrentState::CURR_CLOSED ? LOW : HIGH);
                                        send_get_status(); // query in case we're wrong and it's stopped (Sec+2.0)
                                    });
     }
@@ -2957,7 +2993,7 @@ void door_command_close()
                                 // If this timer fires (was not cancelled when we get notification that door is closing) then
                                 // it is likely that there is an error and door did not move from its open state.
                                 checkDoorCompleted.detach();
-                                pendingDoorCommand = false;
+                                cancelPendingDoorIntent();
                                 ESP_LOGE(TAG, "Door is supposed to be closing but is not.  Current state: %s", DOOR_STATE(garage_door.current_state));
                                 notify_homekit_current_door_state_change(garage_door.current_state);
                                 if (!wpDisconnectOnTx && (doorControlType != DOOR_CONTROL_DRY_CONTACT))
@@ -2994,13 +3030,12 @@ bool startDoorOpenCommand()
         checkDoorCompleted.once_ms((garage_door.openDuration + 3) * 1000, []()
                                    {
                                        // If this timer fires (was not cancelled when we get notification that door has stopped) then
-                                       // we probably missed a status mesage, assume it's open.
-                                       ESP_LOGW(TAG, "Door did not open in expected time, assuming it is open");
-                                       pendingDoorCommand = false;
-                                       notify_homekit_current_door_state_change(GarageDoorCurrentState::CURR_OPEN);
+                                       // Request feedback; elapsed time cannot establish physical position.
+                                       ESP_LOGW(TAG, "Door did not confirm opening in expected time; querying actual state");
+                                       cancelPendingDoorIntent();
+                                       notify_homekit_current_door_state_change(garage_door.current_state);
                                        if (!wpDisconnectOnTx)
-                                           write_status_pin(STATUS_DOOR_PIN, HIGH);
-                                       notify_homekit_target_door_state_change(GarageDoorTargetState::TGT_OPEN);
+                                           write_status_pin(STATUS_DOOR_PIN, garage_door.current_state == GarageDoorCurrentState::CURR_CLOSED ? LOW : HIGH);
                                        send_get_status(); // query in case we're wrong and it's stopped (Sec+2.0)
                                    });
     }
@@ -3011,7 +3046,7 @@ bool startDoorOpenCommand()
                                 // If this timer fires (was not cancelled when we get notification that door is opening) then
                                 // it is likely that there is an error and door did not move from its closed state.
                                 checkDoorCompleted.detach();
-                                pendingDoorCommand = false;
+                                cancelPendingDoorIntent();
                                 ESP_LOGE(TAG, "Door is supposed to be opening but is not.  Current state: %s", DOOR_STATE(garage_door.current_state));
                                 notify_homekit_current_door_state_change(garage_door.current_state);
                                 if (!wpDisconnectOnTx && (doorControlType != DOOR_CONTROL_DRY_CONTACT))
