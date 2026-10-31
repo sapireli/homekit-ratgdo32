@@ -26,8 +26,7 @@
 #include "comms.h"
 #include "led.h"
 #ifdef ESP32
-#include "gdo_uart_policy.h"
-#include "gdo_uart_esp32.h"
+#include "gdo_uart.h"
 #endif
 
 #ifdef USE_GDOLIB
