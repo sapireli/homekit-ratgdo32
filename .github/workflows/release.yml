@@ -87,6 +87,8 @@ jobs:
         run: pip install platformio==6.2.0
       - name: Build firmware
         run: pio run -e ${{ matrix.environment }}
+      - name: Test installed SDK multipart parser
+        run: python tests/test_webserver_multipart.py --source "$HOME/.platformio/packages/framework-arduinoespressif32/libraries/WebServer/src/Parsing.cpp"
       - name: Test installed HomeSpan transport
         run: |
           python .pio/libdeps/${{ matrix.environment }}/HomeSpan/tests/test_hap_output.py
