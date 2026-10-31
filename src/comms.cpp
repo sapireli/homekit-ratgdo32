@@ -189,6 +189,19 @@ inline bool txQueuePop(PacketAction *pkt)
 }
 
 // Called with command ownership held, before a new serial session is enabled.
+void reportTxQueueUnavailable()
+{
+    // Rev1 transfers UART0 pins to I2C. Never bypass that ownership state,
+    // including on a later setup retry or when console output is suppressed.
+    if (!serialConsole.isReady() || suppressSerialLog)
+        return;
+#ifdef ESP32
+    esp_rom_printf("TX queue unavailable; transmitter disabled\n");
+#else
+    ets_printf("TX queue unavailable; transmitter disabled\n");
+#endif
+}
+
 inline bool txQueuePrepare()
 {
     if (!txQueueCreate() || !txQueueLock())
@@ -1080,13 +1093,11 @@ void setup_comms()
     // need to make more space available for initialization.
     if (doorControlType != DOOR_CONTROL_DRY_CONTACT && !txQueuePrepare())
     {
-        // Queue exhaustion reporting must not enter an unavailable logger.
 #ifdef ESP32
         quiesce_gdo_tx();
-        esp_rom_printf("TX queue unavailable; transmitter disabled\n");
-#else
-        ets_printf("TX queue unavailable; transmitter disabled\n");
 #endif
+        // No logger, console initialization, or allocation on this failure path.
+        reportTxQueueUnavailable();
         return;
     }
 

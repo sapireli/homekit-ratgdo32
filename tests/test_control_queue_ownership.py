@@ -10,6 +10,40 @@ ROOT = Path(__file__).resolve().parents[1]
 SOURCE = Path(os.environ.get("CONTROL_TEST_SOURCE", ROOT / "src/comms.cpp"))
 
 class ControlQueueOwnership(unittest.TestCase):
+    def test_queue_failure_report_respects_console_pin_ownership(self):
+        source = SOURCE.read_text()
+        if "void reportTxQueueUnavailable()" in source:
+            report = block(source, "void reportTxQueueUnavailable()")
+        else:
+            # Baseline executed this failure body inline during setup. Keep
+            # that production reporting code while selecting the failure path.
+            failure = block(source, "if (doorControlType != DOOR_CONTROL_DRY_CONTACT && !txQueuePrepare())")
+            report = "void reportTxQueueUnavailable()" + failure[failure.index("{"):]
+            report = report.replace("quiesce_gdo_tx();", "")
+        harness = r"""
+#include <cassert>
+#include "serial_console.h"
+SerialConsoleState serialConsole;
+bool suppressSerialLog=false;
+unsigned writes=0;
+void esp_rom_printf(const char *){++writes;}
+void ets_printf(const char *){++writes;}
+""" + report + r"""
+int main(){
+    reportTxQueueUnavailable();assert(writes==1);
+    suppressSerialLog=true;reportTxQueueUnavailable();assert(writes==1);
+    suppressSerialLog=false;serialConsole.disable();
+    reportTxQueueUnavailable();assert(writes==1); // GPIO1/3 may now belong to I2C.
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            cpp, exe = Path(directory)/"report.cpp", Path(directory)/"report"
+            cpp.write_text(harness)
+            for platform in ["ESP32", "ESP8266"]:
+                subprocess.run(["c++","-std=c++17","-fsanitize=address,undefined",
+                                "-D"+platform,"-I",str(ROOT/"lib/ratgdo"),str(cpp),"-o",str(exe)],check=True)
+                subprocess.run([str(exe)],check=True,timeout=5)
+
     def test_production_controls(self):
         source = SOURCE.read_text()
         prefix = QUEUE_HARNESS_PREFIX.replace("PacketData m_data;Packet(", "PacketData m_data;Packet()=default;Packet(").replace("enum class PacketDataType {DoorAction};", "enum class PacketDataType {DoorAction,Light,Lock};")
