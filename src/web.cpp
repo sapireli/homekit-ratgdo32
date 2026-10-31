@@ -1054,11 +1054,15 @@ void web_loop()
 #if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
     const bool ownedRoom = httpOwnedPoll();
     const bool retiredRoom = drainRetiredSSE();
-    if (drainHttpBodies()) return;
+    const bool bodyPending = drainHttpBodies();
     const bool mayHandleClient = retiredRoom && ownedRoom;
 #endif
     if (recoverStoppedOTAServices())
         return;
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+    if (bodyPending)
+        return;
+#endif
 
     // Poll heartbeat deadlines while holding the same lock as slot reuse.
     TAKE_MUTEX(); // JSON must always precede the SSE lock.

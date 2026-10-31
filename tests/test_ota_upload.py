@@ -181,6 +181,8 @@ void _setUpdaterError() { _updaterError="mock flash error"; }
 bool web_setup_done=true;
 bool httpOwnedPoll() { return !httpOwnedPending; }
 bool drainRetiredSSE() { return true; }
+bool bodyPending=false;
+bool drainHttpBodies() { return bodyPending; }
 ''' + loop_prefix + callback + r'''
 void event(UploadStatus status) { server.data.status=status; handle_firmware_upload(); }
 void start(bool verify=false) {
@@ -197,8 +199,10 @@ int main() {
     assert(suspend_service_loop && !vehicle_setup_done && !commsRunning);
     assert(otaRecoveryPending);
     now=OTA_STAGED_RESTART_MS-1; web_loop(); assert(restarts==0);
+    bodyPending=true; // Deferred HTTP output must not suppress service recovery.
     now=OTA_STAGED_RESTART_MS; web_loop();
     assert(restarts==1 && server.stops==1 && !otaRecoveryPending);
+    bodyPending=false;
 
     // A verify request extends a successful staging deadline. No reboot can
     // happen from an active callback, even when its old deadline has expired.
