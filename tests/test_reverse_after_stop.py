@@ -31,7 +31,7 @@ class ReverseAfterStop(unittest.TestCase):
         self.assertLess(notify, first_command, "follow-up must see the new stopped state")
         followup = update.index("if (current_state == GarageDoorCurrentState::CURR_STOPPED &&")
         followup_code = block(update, followup)
-        close_start = text.index("void door_command_close()\n{")
+        close_start = text.index("bool startDoorCloseCommand()\n{")
         close = block(text, close_start)
         decision_start = close.index("    if (", close.index("#else"))
         decision_end = close.index("    if (doorControlType == 2", decision_start)
@@ -54,12 +54,13 @@ _millis_t now=1000, stopSentClosePending=0, stopSentOpenPending=0;
 _millis_t _millis() { return now; }
 int toggles=0, closes=0, opens=0, timers=0;
 bool queueAccepts=true;
-bool door_command(DoorAction a) { if (!queueAccepts) return false; if (a == Toggle) ++toggles; else ++closes; return true; }
+bool door_command(DoorAction a, DoorCommandLifecycle::Intent = DoorCommandLifecycle::Intent::None) { if (!queueAccepts) return false; if (a == Toggle) ++toggles; else ++closes; return true; }
 void door_command_open() { ++opens; }
-void door_command_close() {
+bool closeDecision() {
 """ + decision + r"""
-    ++timers;
+    ++timers;return true;
 }
+void door_command_close(){closeDecision();}
 void follow(GarageDoorCurrentState current_state) {
 """ + followup_code + r"""
 }

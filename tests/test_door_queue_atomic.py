@@ -19,19 +19,7 @@ def block(source, declaration):
     raise AssertionError("unclosed source block")
 
 
-class DoorQueueAtomic(unittest.TestCase):
-    def test_press_release_admission(self):
-        source = SOURCE.read_text()
-        declarations = ["inline bool txQueueCreate()", "inline uint32_t txQueueCount()"]
-        if "inline bool txQueuePushSequence(" in source:
-            declarations += ["inline bool txQueuePushUnlocked(", "inline bool txQueueLock()",
-                             "inline void txQueueUnlock()"]
-        declarations += ["inline bool txQueuePush("]
-        if "inline bool txQueuePushSequence(" in source:
-            declarations += ["inline bool txQueuePushSequence("]
-        declarations += ["bool door_command(DoorAction action)\n{"]
-        functions = "\n".join(block(source, declaration) for declaration in declarations)
-        harness = r'''
+QUEUE_HARNESS_PREFIX = r'''
 #include <atomic>
 #include <cassert>
 #include <cstdint>
@@ -40,6 +28,7 @@ class DoorQueueAtomic(unittest.TestCase):
 #include <mutex>
 #include <thread>
 #define ESP32
+#define ESP_LOGI(...) ((void)0)
 #define ESP_LOGW(...) ((void)0)
 #define ESP_LOGD(...) ((void)0)
 #define ESP_LOGE(...) ((void)0)
@@ -78,9 +67,9 @@ int xQueueSendToBack(QueueHandle_t q,const PacketAction*p,int){
 }
 std::recursive_mutex controlMutex;
 struct FunctionDelayLock {FunctionDelayLock(){controlMutex.lock();}~FunctionDelayLock(){controlMutex.unlock();}};
-struct Ticker {template<class F>void once_ms(unsigned,F){}};
-enum GarageDoorCurrentState{CURR_OPEN,CURR_CLOSED,CURR_STOPPED};
-struct Door{GarageDoorCurrentState current_state=CURR_OPEN;}garage_door;
+struct Ticker {unsigned armed=0;void detach(){armed=0;}template<class F>void once_ms(unsigned,F){++armed;}};
+enum GarageDoorCurrentState{CURR_OPEN,CURR_CLOSED,CURR_OPENING,CURR_CLOSING,CURR_STOPPED};
+struct Door{GarageDoorCurrentState current_state=CURR_OPEN;int target_state=0,openDuration=10,closeDuration=10;bool pinModeObstructionSensor=false;}garage_door;
 std::atomic<bool>pendingDoorCommand{false};
 bool comms_setup_done=true;
 int doorControlType=2;uint32_t id_code=1;
@@ -89,10 +78,25 @@ void write_status_pin(int,int){}
 unsigned pinWrites=0;
 void digitalWrite(int,int){++pinWrites;}
 void delay(unsigned){}
-''' + (SOURCE.parent / "door_command_lifecycle.h").read_text().replace("#pragma once", "") + r'''
+'''
+
+class DoorQueueAtomic(unittest.TestCase):
+    def test_press_release_admission(self):
+        source = SOURCE.read_text()
+        declarations = ["inline bool txQueueCreate()", "inline uint32_t txQueueCount()"]
+        if "inline bool txQueuePushSequence(" in source:
+            declarations += ["inline bool txQueuePushUnlocked(", "inline bool txQueueLock()",
+                             "inline void txQueueUnlock()"]
+        declarations += ["inline bool txQueuePush("]
+        if "inline bool txQueuePushSequence(" in source:
+            declarations += ["inline bool txQueuePushSequence("]
+        declarations += ["bool door_command(DoorAction action, DoorCommandLifecycle::Intent intent)\n{"]
+        functions = "\n".join(block(source, declaration) for declaration in declarations)
+        harness = QUEUE_HARNESS_PREFIX + (SOURCE.parent / "door_command_lifecycle.h").read_text().replace("#pragma once", "") + r'''
 DoorCommandLifecycle doorLifecycle;
 uint32_t _millis(){return 1000;}
 void cancelPendingDoorIntent(){doorLifecycle.cancel();pendingDoorCommand=false;}
+bool door_command(DoorAction action, DoorCommandLifecycle::Intent intent=DoorCommandLifecycle::Intent::None);
 ''' + functions + r'''
 PacketAction pollPacket(){PacketData d{};return {Packet(PacketCommand::DoorAction,d,0),false,0};}
 void reset(unsigned filled){

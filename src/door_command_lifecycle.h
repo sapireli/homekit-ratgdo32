@@ -1,3 +1,20 @@
+/****************************************************************************
+ * RATGDO HomeKit
+ * https://ratcloud.llc
+ * https://github.com/PaulWieland/ratgdo
+ *
+ * Copyright (c) 2023-26 David A Kerr... https://github.com/dkerr64/
+ * All Rights Reserved.
+ * Licensed under terms of the GPL-3.0 License.
+ *
+ * Contributions acknowledged from
+ * Thomas Hagan...     https://github.com/tlhagan
+ * Brandon Matthews... https://github.com/thenewwazoo
+ * Jonathan Stroud...  https://github.com/jgstroud
+ * Mitchell Solomon... https://github.com/mitchjs
+ *
+ */
+
 #pragma once
 #include <stdint.h>
 
@@ -7,12 +24,13 @@ class DoorCommandLifecycle
 {
 public:
     enum class Intent { None, Open, Close, Stop, Toggle };
-    uint32_t begin(int physicalState, uint32_t now)
+    uint32_t begin(int physicalState, uint32_t now, Intent logicalIntent = Intent::None)
     {
         generation = ++nextGeneration;
         if (!generation)
             generation = ++nextGeneration;
         initialState = physicalState;
+        queuedIntent = logicalIntent;
         startedAt = now;
         committed = released = changed = false;
         deferred = Intent::None;
@@ -25,6 +43,8 @@ public:
             return false;
         if (!committed)
         {
+            if (keepsQueuedTarget(intent))
+                return true; // Keep the original pair even when no queue space remains.
             cancel();
             return false;
         }
@@ -98,6 +118,7 @@ public:
     {
         generation = 0;
         deferred = Intent::None;
+        queuedIntent = Intent::None;
         committed = released = changed = false;
     }
     void reset()
@@ -106,6 +127,11 @@ public:
         mandatoryRelease = 0;
     }
     bool pending() const { return generation != 0; }
+    bool keepsQueuedTarget(Intent intent) const
+    {
+        return generation && !committed && intent == queuedIntent &&
+               (intent == Intent::Open || intent == Intent::Close);
+    }
     bool needsRelease(uint32_t token) const { return token && token == mandatoryRelease; }
 private:
     uint32_t nextGeneration = 0, generation = 0, mandatoryRelease = 0;
@@ -113,4 +139,5 @@ private:
     int initialState = 0;
     bool committed = false, released = false, changed = false;
     Intent deferred = Intent::None;
+    Intent queuedIntent = Intent::None;
 };
