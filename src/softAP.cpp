@@ -15,7 +15,7 @@
 
 // Arduino system includes
 #include <cstring>
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+#ifdef ESP32
 #include <atomic>
 #endif
 #include <DNSServer.h>
@@ -60,10 +60,11 @@ bool wifiNetsCmp(const wifiNet_t &a, const wifiNet_t &b)
 }
 std::multiset<wifiNet_t, decltype(&wifiNetsCmp)> wifiNets(&wifiNetsCmp);
 
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
-// A scan or deferred page owns the registry. Rescans wait until the page has
-// consumed its last row, so iterators and radio-button indexes stay stable.
+#ifdef ESP32
+// A scanner or result reader owns the registry; nobody waits for its lease.
 static std::atomic<bool> wifiScanOwned{false};
+#endif
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
 static std::atomic<bool> wifiScanPending{false};
 static std::atomic<bool> wifiScanRunning{false};
 static std::atomic<bool> wifiScanFailed{false};
@@ -164,22 +165,28 @@ static void storeWifiScanResults(int nNets)
 
 bool wifi_scan(bool retainResults)
 {
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+#ifdef ESP32
     bool expected = false;
     if (!wifiScanOwned.compare_exchange_strong(expected, true))
     {
+#if defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
         if (!retainResults)
             wifiScanPending = true;
+#endif
         return false;
     }
+#if defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
     wifiScanPending = false;
+#endif
 #endif
     const int count = WiFi.scanNetworks();
     if (count >= 0)
         storeWifiScanResults(count);
     WiFi.scanDelete();
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+#ifdef ESP32
+#if defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
     wifiScanFailed = count < 0;
+#endif
     if (!retainResults || count < 0)
         wifiScanOwned = false;
 #else
@@ -188,9 +195,23 @@ bool wifi_scan(bool retainResults)
     return count >= 0;
 }
 
+bool acquire_wifi_scan_results()
+{
+#ifdef ESP32
+#if defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+    if (wifiScanPending || wifiScanRunning || wifiScanFailed)
+        return false;
+#endif
+    bool expected = false;
+    return wifiScanOwned.compare_exchange_strong(expected, true);
+#else
+    return true;
+#endif
+}
+
 void release_wifi_scan_results()
 {
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+#ifdef ESP32
     wifiScanOwned = false;
 #endif
 }
@@ -562,6 +583,12 @@ void handle_wifinets()
     finishWifiScanPage(); // Non-reactor callers retain synchronous delivery.
 #endif
 
+    WifiScanResults results;
+    if (!results.acquire())
+    {
+        server.send_P(503, type_txt, PSTR("WiFi scan results busy or unavailable; retry later."));
+        return;
+    }
     bool connected = WiFi.isConnected();
     String previousSSID = "";
     bool match = false;
@@ -631,17 +658,25 @@ void handle_setssid()
     bool advanced = server.arg("advanced").equals("on");
     wifiNet_t wifiNet;
 
-    if (net < wifiNets.size())
     {
-        // User selected network from within scanned range
-        wifiNet = *std::next(wifiNets.begin(), net);
-        ssid = wifiNet.ssid;
-    }
-    else
-    {
-        // Outside scanned range, do not allow locking to access point
-        advanced = false;
-    }
+        WifiScanResults results;
+        if (!results.acquire())
+        {
+            server.send_P(503, type_txt, PSTR("WiFi scan results busy or unavailable; retry later."));
+            return;
+        }
+        if (net < wifiNets.size())
+        {
+            // User selected network from within scanned range
+            wifiNet = *std::next(wifiNets.begin(), net);
+            ssid = wifiNet.ssid;
+        }
+        else
+        {
+            // Outside scanned range, do not allow locking to access point
+            advanced = false;
+        }
+    } // The selected network is now copied; release before reconfiguration.
 
     char *txtBuffer = static_cast<char *>(malloc(TXT_BUFFER_SIZE));
     if (!txtBuffer)

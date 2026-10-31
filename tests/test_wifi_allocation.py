@@ -33,6 +33,7 @@ class WiFiAllocation(unittest.TestCase):
 #include <list>
 #include <map>
 class String:public std::string {public:using std::string::string;String(const std::string&s):std::string(s){}bool equals(const char*s)const{return *this==s;}};
+struct WifiScanResults {bool acquire(){return true;}};
 struct wifiNet_t {String ssid="home";int rssi=-40,channel=1;uint8_t bssid[6]{};};
 std::list<wifiNet_t>wifiNets{{}};
 struct WiFiClass{bool isConnected(){return true;}String SSID(){return "home";}}WiFi;
