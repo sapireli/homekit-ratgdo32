@@ -42,6 +42,7 @@ void cancelPartialOpen(){}
 void cancelPendingDoorIntent(){++cancels;}
 void notify_homekit_current_door_state_change(GarageDoorCurrentState s){++notifications;lastNotified=s;}
 void write_status_pin(int,int){}
+void digitalWrite(int,int){}
 void send_get_status(){++queries;}
 bool door_command(DoorAction){return admit;}
 bool functionDelayActive(){return false;}

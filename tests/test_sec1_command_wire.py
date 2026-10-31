@@ -42,6 +42,7 @@ uint32_t _millis(){return now;}
 int digitalRead(int){return collision;}
 bool isRxPending(){return false;}
 void write_status_pin(int,int){}
+void digitalWrite(int,int){}
 void delay(unsigned ms){now+=ms;}
 struct SerialPort {
     unsigned timeout=1000,writes=0;int echo=-1;
@@ -73,7 +74,7 @@ int main(){
     assert(Sec1Serial.writes==0);
     press.doorGeneration=doorLifecycle.begin(0,now);release.doorGeneration=press.doorGeneration;
     // Missing echo is bounded and counts as an attempted physical Press.
-    const auto before=now;assert(process_PacketAction(press));assert(now-before==50);
+    const auto before=now;assert(process_PacketAction(press));assert(now-before==Sec1Serial.timeout&&Sec1Serial.timeout<=50);
     assert(Sec1Serial.writes==1&&!doorLifecycle.allow(press.doorGeneration,true));
     doorLifecycle.request(DoorCommandLifecycle::Intent::Open,now);
     doorLifecycle.expire(now+3000);

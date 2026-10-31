@@ -65,6 +65,8 @@ bool comms_setup_done=true;
 struct SerialPort{void end(){}}Sec1Serial,sw_serial;
 void quiesce_gdo_tx(){}
 void gpio_reset_pin(int){}
+void gpio_pullup_dis(int){}
+void gpio_pulldown_en(int){}
 void digitalWrite(int,int){}
 void write_status_pin(int,int){}
 struct Door {GarageDoorCurrentState current_state=CURR_OPEN;bool light=false;} garage_door,last_reported_garage_door;
