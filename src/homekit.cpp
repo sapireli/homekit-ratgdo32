@@ -1533,26 +1533,31 @@ void notify_homekit_target_lock(LockTargetState state)
     publish_homekit_target_lock(state);
 }
 
-void notify_homekit_current_lock(LockCurrentState state)
+void publish_homekit_current_lock(LockCurrentState state)
 {
-    garage_door.current_lock = state;
     // Ignore invalid states
     if (state == 0xFF)
         return;
 #ifdef ESP32
-    if (!isPaired)
+    if (!isPaired || !door || !door->lockCurrent)
         return;
 
     GDOEvent e;
     e.c = door->lockCurrent;
-    e.value.u = (uint8_t)garage_door.current_lock;
+    e.value.u = (uint8_t)state;
     queueSendHelper(door->event_q, e, "current lock");
 #else
     if (!arduino_homekit_get_running_server())
         return;
 
-    homekit_characteristic_notify(&current_lock_state, HOMEKIT_UINT8_CPP(garage_door.current_lock));
+    homekit_characteristic_notify(&current_lock_state, HOMEKIT_UINT8_CPP(state));
 #endif
+}
+
+void notify_homekit_current_lock(LockCurrentState state)
+{
+    garage_door.current_lock = state;
+    publish_homekit_current_lock(state);
 }
 
 void notify_homekit_obstruction(bool state)
@@ -1580,17 +1585,22 @@ void notify_homekit_obstruction(bool state)
 #endif
 }
 
-void notify_homekit_light(bool state)
+void publish_homekit_light(bool state)
 {
-    garage_door.light = state;
 #ifdef ESP32
-    mailbox(HomekitSignal::Light).publish(garage_door.light, false);
+    mailbox(HomekitSignal::Light).publish(state, false);
 #else
     if (!arduino_homekit_get_running_server())
         return;
 
-    homekit_characteristic_notify(&light_state, HOMEKIT_BOOL_CPP(garage_door.light));
+    homekit_characteristic_notify(&light_state, HOMEKIT_BOOL_CPP(state));
 #endif
+}
+
+void notify_homekit_light(bool state)
+{
+    garage_door.light = state;
+    publish_homekit_light(state);
 }
 
 void enable_service_homekit_motion(bool reboot)

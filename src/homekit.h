@@ -28,8 +28,10 @@ extern void notify_homekit_current_door_state_change(GarageDoorCurrentState stat
 // Publish accepted/observed target without changing command-owned logical state.
 extern void publish_homekit_target_lock(LockTargetState state);
 extern void notify_homekit_target_lock(LockTargetState state);
+extern void publish_homekit_current_lock(LockCurrentState state);
 extern void notify_homekit_current_lock(LockCurrentState state);
 extern void notify_homekit_obstruction(bool state);
+extern void publish_homekit_light(bool state);
 extern void notify_homekit_light(bool state);
 extern void enable_service_homekit_motion(bool reboot);
 extern void notify_homekit_motion(bool state);
