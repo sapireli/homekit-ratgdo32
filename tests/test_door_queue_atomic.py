@@ -82,10 +82,12 @@ struct Ticker {template<class F>void once_ms(unsigned,F){}};
 enum GarageDoorCurrentState{CURR_OPEN,CURR_CLOSED,CURR_STOPPED};
 struct Door{GarageDoorCurrentState current_state=CURR_OPEN;}garage_door;
 std::atomic<bool>pendingDoorCommand{false};
+bool comms_setup_done=true;
 int doorControlType=2;uint32_t id_code=1;
 void send_get_status(){}
 void write_status_pin(int,int){}
-void digitalWrite(int,int){}
+unsigned pinWrites=0;
+void digitalWrite(int,int){++pinWrites;}
 ''' + functions + r'''
 PacketAction pollPacket(){PacketData d{};return {Packet(PacketCommand::DoorAction,d,0),false,0};}
 void reset(unsigned filled){
@@ -93,6 +95,11 @@ void reset(unsigned filled){
     assert(txQueueCreate());for(unsigned i=0;i<filled;++i)queueState.items.push_back(pollPacket());
 }
 int main(){
+    reset(0);comms_setup_done=false;
+    assert(!door_command(DoorAction::Close)&&queueState.items.empty());
+    doorControlType=DOOR_CONTROL_DRY_CONTACT;
+    assert(!door_command(DoorAction::Toggle)&&pinWrites==0);
+    doorControlType=2;comms_setup_done=true;
     reset(15);
     assert(!door_command(DoorAction::Close));
     assert(queueState.items.size()==15); // Never leave an orphan button press.
