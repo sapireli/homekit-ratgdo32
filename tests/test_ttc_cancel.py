@@ -39,7 +39,9 @@ class TTCCancel(unittest.TestCase):
 #include <thread>
 #include <chrono>
 #include <utility>
+#if !defined(ESP8266) && !defined(ESP32)
 #define ESP32
+#endif
 std::recursive_mutex delayMutex;
 using SemaphoreHandle_t=std::recursive_mutex*;
 constexpr int portMAX_DELAY=0;
@@ -49,7 +51,11 @@ void xSemaphoreGiveRecursive(SemaphoreHandle_t m){m->unlock();}
 #define ESP_LOGI(...) ((void)0)
 #define ESP_LOGD(...) ((void)0)
 #define DOOR_STATE(x) "state"
-using _millis_t=uint64_t;
+#ifdef ESP8266
+using _millis_t=uint32_t;
+#else
+using _millis_t=int64_t;
+#endif
 enum GarageDoorCurrentState { CURR_OPEN, CURR_CLOSED, CURR_OPENING, CURR_CLOSING, CURR_STOPPED };
 enum DoorAction { Stop };
 constexpr int DOOR_CONTROL_DRY_CONTACT=3,DOOR_CONTROL_SEC_PLUS_V1=1;
@@ -79,8 +85,8 @@ bool TTCwasLightOn=false;
 void (*functionDelayCallback)()=nullptr;
 _millis_t functionDelayNextTick=0;
 bool functionDelayPending=false,functionDelayFinalWait=false,functionDelayLight=false,functionDelaySound=false;
-uint64_t now=1000;
-uint64_t _millis(){return now;}
+_millis_t now=1000;
+_millis_t _millis(){return now;}
 void set_light(bool,bool=true){}
 void sec1_light_press(){}
 void sec1_light_release(int){}
@@ -118,6 +124,7 @@ int main(){
     now+=250;processFunctionDelay();now+=500;processFunctionDelay();processFunctionDelay();
     assert(closes==1);
 
+#ifdef ESP32
     // A concurrent Open cannot slip between final acceptance and actuation.
     delayFnCall(0,door_command_close);now+=250;processFunctionDelay();now+=500;
     blockClose=true;
@@ -129,15 +136,24 @@ int main(){
     assert(!openReturned);
     releaseClose=true;executor.join();canceller.join();
     assert(openReturned&&closes==2);
+#endif
+
+    const unsigned beforeWrap=closes;
+    now=UINT32_MAX-100;delayFnCall(0,door_command_close);
+    now+=90;processFunctionDelay();
+    assert(!functionDelayFinalWait&&closes==beforeWrap);
+    now+=160;processFunctionDelay();assert(functionDelayFinalWait);
+    now+=500;processFunctionDelay();assert(closes==beforeWrap+1);
 }
 '''
         with tempfile.TemporaryDirectory() as temp:
             cpp = Path(temp) / "ttc.cpp"
             exe = Path(temp) / "ttc"
             cpp.write_text(harness)
-            subprocess.run(["c++", "-std=c++17", "-fsanitize=address,undefined", "-pthread",
-                            str(cpp), "-o", str(exe)], check=True)
-            subprocess.run([str(exe)], check=True, timeout=5)
+            for define in ["ESP32", "ESP8266"]:
+                subprocess.run(["c++", "-std=c++17", "-fsanitize=address,undefined", "-pthread",
+                                "-D" + define, str(cpp), "-o", str(exe)], check=True)
+                subprocess.run([str(exe)], check=True, timeout=5)
 
 
 if __name__ == "__main__":
