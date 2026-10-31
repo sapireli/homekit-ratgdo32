@@ -3,7 +3,7 @@ name: Firmware
 on:
   pull_request:
   push:
-    branches: [main, integrate-mother-main]
+    branches: [main, integrate-mother-main, refactor/resource-ownership]
     tags: ['v*']
   workflow_dispatch:
     inputs:
