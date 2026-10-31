@@ -91,6 +91,7 @@ _millis_t now=1000;
 _millis_t _millis(){return now;}
 void set_light(bool,bool=true){}
 void cancelPartialOpen(){}
+void cancelDryContactTimers(){} // Physical GPIO pulses are tested separately.
 void sec1_light_press(){}
 void sec1_light_release(int){}
 void sync_and_restart(){

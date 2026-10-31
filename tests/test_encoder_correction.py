@@ -76,6 +76,7 @@ const char *nvram_enc_cal="enc_cal";
 unsigned saves=0,stops=0,opens=0,closes=0;
 void write_door_data(const char*,const void*,size_t){assert(depth);++saves;}
 void noInterrupts(){}
+void cancelDryContactTimers(){} // Physical GPIO pulses are tested separately.
 void interrupts(){}
 void on_encoder_update(int16_t){}
 void cancel_encoder_correction();
