@@ -8,11 +8,9 @@
 
 int main()
 {
-    // Only a bound active subscription emits a heartbeat. No timer work can
-    // leak into a reused slot; rebinding sets a fresh deadline.
+    // Bound subscriptions heartbeat; abandoned registrations retry and expire.
     uint32_t last = 100;
     assert(!takeSSEHeartbeat(false, true, 1, last, 1100));
-    assert(!takeSSEHeartbeat(true, false, 1, last, 1100));
     assert(!takeSSEHeartbeat(true, true, 0, last, 1100));
     assert(!takeSSEHeartbeat(true, true, 61, last, 100000));
     assert(last == 100);
@@ -26,6 +24,10 @@ int main()
     assert(!takeSSEHeartbeat(true, true, 1, last, 498));
     assert(takeSSEHeartbeat(true, true, 1, last, 499));
     assert(last == 499);
+    last = 100;
+    assert(!takeSSEHeartbeat(true, false, 0, last, 1099));
+    for (uint32_t retry = 1; retry <= 6; ++retry)
+        assert(takeSSEHeartbeat(true, false, 0, last, 100 + retry * 1000));
 
     // A stale EventSource request must not replace a reused slot's client.
     std::string uuid = "new-uuid", current = "live-client";
