@@ -794,7 +794,8 @@ bool enable_service_homekit_room_occupancy(bool enable)
         {
             roomOccupancy = nullptr;
             homeSpan.updateDatabase();
-            garage_door.room_occupied = false;
+            // Logical state and lifetime-stable publication retire together.
+            notify_homekit_room_occupancy(false);
             return true;
         }
     }

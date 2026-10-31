@@ -270,6 +270,77 @@ struct DEV_GarageDoor {
             result = subprocess.run([str(binary)],capture_output=True,text=True,timeout=5)
             self.assertEqual(result.returncode,0,result.stderr)
 
+    def test_room_recreation_starts_from_cleared_logical_state(self):
+        source = Path(os.environ.get('HOMEKIT_TEST_SOURCE', 'src/homekit.cpp')).read_text()
+        signatures = ['DEV_Occupancy::DEV_Occupancy(', 'void DEV_Occupancy::loop()',
+                      'void notify_homekit_room_occupancy(bool',
+                      'bool enable_service_homekit_room_occupancy(bool']
+        bodies = function(source, 'static HomekitBooleanMailbox &mailbox(') + '\n'
+        bodies += '\n'.join(function(source, name) for name in signatures)
+        bodies = bodies.replace('new SpanAccessory(HOMEKIT_AID_ROOM_OCCUPANCY);', '(void)0;')
+        bodies = bodies.replace('new DEV_Info("Room Occupancy");', '(void)0;')
+        harness = r"""
+#include "homekit_notifications.h"
+#include <cassert>
+#include <cstdint>
+#define ESP_LOGI(...) ((void)0)
+#define ESP_LOGD(...) ((void)0)
+#define HOMEKIT_AID_ROOM_OCCUPANCY 9
+namespace Service {struct OccupancySensor {};}
+namespace Characteristic {
+struct OccupancyDetected {
+    static constexpr bool NOT_DETECTED=false;
+    bool value;
+    explicit OccupancyDetected(bool value):value(value){}
+    void setVal(bool next){value=next;}
+};
+}
+struct DEV_Occupancy:Service::OccupancySensor {
+    Characteristic::OccupancyDetected *occupied;
+    HomekitSignal signal;
+    explicit DEV_Occupancy(HomekitSignal signal=HomekitSignal::Vehicle);
+    ~DEV_Occupancy(){delete occupied;}
+    void loop();
+};
+DEV_Occupancy *roomOccupancy=nullptr,*vehicle=nullptr;
+struct Motion {} motionService;
+Motion *motion=&motionService;
+struct {bool room_occupied=false;uint32_t room_occupancy_timeout=0;}garage_door;
+struct Config {unsigned getOccupancyDuration(){return 300;}}config;
+Config *userConfig=&config;
+uint32_t _millis(){return 1000;}
+struct HomeSpan {
+    bool deleteAccessory(int){delete roomOccupancy;return true;}
+    void updateDatabase(){}
+}homeSpan;
+static HomekitBooleanMailbox stateMailboxes[static_cast<unsigned>(HomekitSignal::Count)];
+bool deferServiceChange(HomekitService,bool){return false;}
+void notify_homekit_room_occupancy(bool);
+"""
+        main = r"""
+int main(){
+    assert(enable_service_homekit_room_occupancy(true));
+    notify_homekit_room_occupancy(true);roomOccupancy->loop();
+    assert(roomOccupancy->occupied->value&&garage_door.room_occupied);
+    assert(enable_service_homekit_room_occupancy(false));
+    assert(!roomOccupancy&&!garage_door.room_occupied);
+    // No further motion or timer publication occurs while the service is absent.
+    assert(enable_service_homekit_room_occupancy(true));roomOccupancy->loop();
+    assert(!roomOccupancy->occupied->value); // Match the authoritative logical state.
+    assert(!garage_door.room_occupied);
+    enable_service_homekit_room_occupancy(false);
+}
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            cpp, binary = Path(directory)/'room.cpp', Path(directory)/'room'
+            cpp.write_text(harness+bodies+main)
+            subprocess.run([shutil.which('c++'),'-std=c++17',
+                            *shlex.split(os.environ.get('HOMEKIT_TEST_CXXFLAGS', '')),
+                            '-I',str(Path('src').resolve()),str(cpp),'-o',str(binary)],
+                           check=True,capture_output=True)
+            result = subprocess.run([str(binary)],capture_output=True,text=True,timeout=5)
+            self.assertEqual(result.returncode,0,result.stderr)
+
     def test_latest_value_and_detection_pulse(self): self.run_case('mailbox')
     def test_notification_while_service_absent(self): self.run_case('disabled')
     def test_create_delete_releases_queue_resources(self): self.run_case('cycles')
