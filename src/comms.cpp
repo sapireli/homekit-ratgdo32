@@ -1813,6 +1813,15 @@ bool process_send_queue()
             {
                 ESP_LOGE(TAG, "SEC%d TX send failed, exceeded max retry", doorControlType);
                 retryCount = 0;
+                {
+                    FunctionDelayLock lock;
+                    if (!pkt_ac.doorPress && doorLifecycle.needsRelease(pkt_ac.doorGeneration))
+                    {
+                        // A collision must not discard Release after Press was
+                        // written. Keep it ahead of every newer button press.
+                        return false;
+                    }
+                }
                 // Remove TX packet from the queue
                 txQueuePop(&pkt_ac);
             }
