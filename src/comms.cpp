@@ -17,7 +17,6 @@
 
 // Arduino includes
 #include <Ticker.h>
-#include <atomic>
 
 // RATGDO project includes
 #include "ratgdo.h"
@@ -166,8 +165,12 @@ static bool doingPartial = false;
 static const uint32_t TTCinterval = 250;
 static uint32_t TTCiterations = 0;
 static _millis_t TTCendTime = 0;
-static Ticker TTCtimer = Ticker();
-static Ticker callbackDelay = Ticker();
+static void (*functionDelayCallback)() = nullptr;
+static _millis_t functionDelayNextTick = 0;
+static bool functionDelayPending = false;
+static bool functionDelayFinalWait = false;
+static bool functionDelayLight = false, functionDelaySound = false;
+void processFunctionDelay();
 #ifdef ESP32
 static StaticSemaphore_t functionDelayMutexStorage;
 static SemaphoreHandle_t functionDelayMutex()
@@ -195,21 +198,19 @@ public:
 #endif
     }
 };
-// The low bit remains set through the final callback delay. A generation
-// prevents an already-dispatched callback from surviving cancellation/reuse.
-static std::atomic<uint32_t> functionDelayGeneration{0};
-
 bool functionDelayActive()
 {
-    return (functionDelayGeneration.load() & 1u) != 0;
+    FunctionDelayLock lock;
+    return functionDelayPending;
 }
 
 void cancelFunctionDelay()
 {
     FunctionDelayLock lock;
-    functionDelayGeneration.fetch_and(~1u);
-    TTCtimer.detach();
-    callbackDelay.detach();
+    functionDelayPending = false;
+    functionDelayCallback = nullptr;
+    functionDelayNextTick = 0;
+    functionDelayFinalWait = false;
 }
 static Ticker checkDoorMoving = Ticker();
 static Ticker checkDoorCompleted = Ticker();
@@ -2393,6 +2394,7 @@ void comms_loop_drycontact()
 #endif
 void comms_loop()
 {
+    processFunctionDelay();
     if (!comms_setup_done)
         return;
 
@@ -3007,17 +3009,30 @@ GarageDoorCurrentState open_door_partial(int timePercentage)
     return garage_door.current_state;
 }
 
-void TTCtimerFn(void (*callback)(), bool light, bool sound, uint32_t generation)
+void processFunctionDelay()
 {
     FunctionDelayLock lock;
-    if (functionDelayGeneration.load() != generation)
+    const _millis_t now = _millis();
+    if (!functionDelayPending || now < functionDelayNextTick)
         return;
+    // Run delayed actions only from the communications loop. A Ticker
+    // callback can outlive detach() and its captured std::function storage.
+    if (functionDelayFinalWait)
+    {
+        void (*callback)() = functionDelayCallback;
+        cancelFunctionDelay();
+        if (callback == door_command_close && !comms_setup_done)
+            return;
+        if (callback)
+            callback();
+        return;
+    }
     if (TTCiterations > 0)
     {
         // dry contact cannot control lights
         if (doorControlType != DOOR_CONTROL_DRY_CONTACT)
         {
-            if (light && (TTCiterations % 2 == 0))
+            if (functionDelayLight && (TTCiterations % 2 == 0))
             {
 #ifndef USE_GDOLIB
                 // only SEC+1,0
@@ -3035,16 +3050,16 @@ void TTCtimerFn(void (*callback)(), bool light, bool sound, uint32_t generation)
             }
         }
 #ifdef RATGDO32_DISCO
-        if (sound)
+        if (functionDelaySound)
         {
             tone(BEEPER_PIN, 1300, 125);
         }
 #endif
         TTCiterations--;
+        functionDelayNextTick = now + TTCinterval;
     }
     else
     {
-        TTCtimer.detach();
         ESP_LOGI(TAG, "End of function delay timer");
 #ifndef USE_GDOLIB
         // only SEC+1,0
@@ -3055,39 +3070,8 @@ void TTCtimerFn(void (*callback)(), bool light, bool sound, uint32_t generation)
         }
 #endif
         // delay so that set_light() can do its thing
-        callbackDelay.once_ms(TTCinterval * 2, [callback, generation]()
-                              {
-#ifdef ESP8266
-                                  schedule_recurrent_function_us([callback, generation]()
-                                                                 {
-                                                                     FunctionDelayLock lock;
-                                                                     if (callback == sync_and_restart)
-                                                                         ESP_LOGI(TAG, "Calling delayed function: sync_and_restart()");
-                                                                     else if (callback == door_command_close)
-                                                                         ESP_LOGI(TAG, "Calling delayed function: door_command_close()");
-                                                                     else
-                                                                         ESP_LOGI(TAG, "Calling delayed function at: 0x%08lX", (uint32_t)callback);
-
-                                                                     uint32_t expected = generation;
-                                                                     if (functionDelayGeneration.compare_exchange_strong(expected, generation & ~1u) && callback)
-                                                                         callback();
-                                                                     return false; // run the fn only once
-                                                                 },
-                                                                 0); // zero micro seconds (run asap)
-#else
-                                  FunctionDelayLock lock;
-                                  if (callback == sync_and_restart)
-                                      ESP_LOGI(TAG, "Calling delayed function: sync_and_restart()");
-                                  else if (callback == door_command_close)
-                                      ESP_LOGI(TAG, "Calling delayed function: door_command_close()");
-                                  else
-                                      ESP_LOGI(TAG, "Calling delayed function at: 0x%08lX", (uint32_t)callback);
-
-                                  uint32_t expected = generation;
-                                  if (functionDelayGeneration.compare_exchange_strong(expected, generation & ~1u) && callback)
-                                      callback();
-#endif
-                              });
+        functionDelayFinalWait = true;
+        functionDelayNextTick = now + TTCinterval * 2;
     }
 }
 
@@ -3102,28 +3086,15 @@ void delayFnCall(uint32_t ms, void (*callback)())
     bool sound = false; // No sound option for non-disco boards
 #endif
     cancelFunctionDelay();
-    uint32_t previous = functionDelayGeneration.load(), generation;
-    do
-    {
-        generation = (previous + 2u) | 1u;
-    } while (!functionDelayGeneration.compare_exchange_weak(previous, generation));
     TTCiterations = ms / TTCinterval;  // Number of times to go through loop
     TTCwasLightOn = garage_door.light; // Current state of light
     ESP_LOGI(TAG, "Start function delay timer for %lums (%d iterations)", ms, TTCiterations);
     TTCendTime = _millis() + (_millis_t)ms;
-    TTCtimer.attach_ms(TTCinterval, [callback, light, sound, generation]()
-                       {
-#ifdef ESP8266
-                           schedule_recurrent_function_us([callback, light, sound, generation]()
-                                                          {
-                                                              TTCtimerFn(callback, light, sound, generation);
-                                                              return false; // run the fn only once
-                                                          },
-                                                          0); // zero micro seconds (run asap)
-#else
-                           TTCtimerFn(callback, light, sound, generation);
-#endif
-                       });
+    functionDelayCallback = callback;
+    functionDelayLight = light;
+    functionDelaySound = sound;
+    functionDelayPending = true;
+    functionDelayNextTick = _millis() + TTCinterval;
 }
 
 GarageDoorCurrentState close_door(bool bypass_ttc)

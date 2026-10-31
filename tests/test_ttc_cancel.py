@@ -28,7 +28,7 @@ class TTCCancel(unittest.TestCase):
             helpers += "\n".join(block(source, declaration) for declaration in
                                 ["bool functionDelayActive()", "void cancelFunctionDelay()"])
         functions = "\n".join(block(source, declaration) for declaration in
-                              ["GarageDoorCurrentState open_door()", "void TTCtimerFn(", "void delayFnCall(", "void shutdown_comms()"])
+                              ["GarageDoorCurrentState open_door()", "void processFunctionDelay()\n{", "void delayFnCall(", "void shutdown_comms()"])
         harness = r'''
 #include <atomic>
 #include <cassert>
@@ -76,7 +76,9 @@ uint32_t TTCiterations=0;
 constexpr uint32_t TTCinterval=250;
 _millis_t TTCendTime=0,stopSentClosePending=0,stopSentOpenPending=0;
 bool TTCwasLightOn=false;
-std::atomic<uint32_t> functionDelayGeneration{0};
+void (*functionDelayCallback)()=nullptr;
+_millis_t functionDelayNextTick=0;
+bool functionDelayPending=false,functionDelayFinalWait=false,functionDelayLight=false,functionDelaySound=false;
 uint64_t now=1000;
 uint64_t _millis(){return now;}
 void set_light(bool,bool=true){}
@@ -94,36 +96,32 @@ bool door_command(DoorAction){return true;}
 ''' + helpers + functions + r'''
 int main(){
     delayFnCall(0,door_command_close);
-    TTCtimer.fire();
-    assert(!TTCtimer.active() && callbackDelay.active());
-    auto alreadyDispatched=callbackDelay.callback;
+    now+=250;processFunctionDelay();
+    assert(functionDelayActive() && functionDelayFinalWait);
     open_door();
-    callbackDelay.fire();
-    // A dispatched callback can remain in the scheduler after detach().
-    alreadyDispatched();
+    now+=1000;processFunctionDelay();processFunctionDelay();
     printf("close commands after explicit Open cancellation: %u\n",closes);
     assert(closes==0);
 
     delayFnCall(0,door_command_close);
-    TTCtimer.fire();
-    auto replaced=callbackDelay.callback;
+    now+=250;processFunctionDelay();
     delayFnCall(0,nullptr);
-    replaced();
+    now+=250;processFunctionDelay();now+=500;processFunctionDelay();
     assert(closes==0);
 
-    delayFnCall(0,door_command_close);TTCtimer.fire();
-    auto shutdownPending=callbackDelay.callback;
-    shutdown_comms();shutdownPending();
+    delayFnCall(0,door_command_close);now+=250;processFunctionDelay();
+    shutdown_comms();now+=1000;processFunctionDelay();
     assert(closes==0);
 
+    comms_setup_done=true;
     delayFnCall(0,door_command_close);
-    TTCtimer.fire();callbackDelay.fire();
+    now+=250;processFunctionDelay();now+=500;processFunctionDelay();processFunctionDelay();
     assert(closes==1);
 
     // A concurrent Open cannot slip between final acceptance and actuation.
-    delayFnCall(0,door_command_close);TTCtimer.fire();
+    delayFnCall(0,door_command_close);now+=250;processFunctionDelay();now+=500;
     blockClose=true;
-    std::thread executor([]{callbackDelay.fire();});
+    std::thread executor([]{processFunctionDelay();});
     while(!closeEntered)std::this_thread::yield();
     std::atomic<bool> openReturned{false};
     std::thread canceller([&]{open_door();openReturned=true;});
