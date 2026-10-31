@@ -19,7 +19,10 @@ class WifiScanDeliveryTest(unittest.TestCase):
         entry = handler[:handler.index("    bool connected = WiFi.isConnected();")] + "}\n"
         formats = soft[soft.index("static const char softAPhttpPreamble"):soft.index("static const char softAPsuccess")]
         scan = (block(soft, "static void storeWifiScanResults(") +
-                block(soft, "void wifi_scan()\n{") + block(soft, "static void pollWifiScan()"))
+                block(soft, "bool wifi_scan(bool retainResults)") + block(soft, "static void pollWifiScan()"))
+        result_class = block((ROOT / "src/softAP.h").read_text(), "class WifiScanResults") + ";\n"
+        cli = block((ROOT / "src/serialCLI.cpp").read_text(), "uint32_t scanWifi(bool uniqueSSID, WifiScanResults &results)\n{")
+        provision = block((ROOT / "src/provision.cpp").read_text(), "void getAvailableWifiNetworks()")
         pending = block(soft, "void soft_ap_loop()\n{")
         pending = pending[:pending.index("    if (!softAPinitialized)")] + "}\n"
         self.assertIn("setup_http_response_delivery();", block(soft, "void start_soft_ap()\n{"))
@@ -37,6 +40,8 @@ class WifiScanDeliveryTest(unittest.TestCase):
 #include <cstdlib>
 #include <cstring>
 #include <set>
+#include <vector>
+#include <cstdarg>
 #include <string>
 #define ESP32 1
 #define RATGDO_HTTP_LIFECYCLE_EXPERIMENT 1
@@ -44,19 +49,22 @@ class WifiScanDeliveryTest(unittest.TestCase):
 #define PSTR(x) x
 #define ESP_LOGI(...) ((void)0)
 #define TXT_BUFFER_SIZE 1024
-using String=std::string;
+class String:public std::string {public:
+ using std::string::string;using std::string::operator=;
+ String()=default;String(const std::string&s):std::string(s){}String(int n):std::string(std::to_string(n)){}
+};
 struct wifiNet_t {String ssid;int32_t rssi=-40,channel=1;uint8_t bssid[6]{};int encryptionType=0;};
 struct Compare {bool operator()(const wifiNet_t&a,const wifiNet_t&b)const{return a.ssid<b.ssid||(a.ssid==b.ssid&&a.rssi>b.rssi);}};
 std::multiset<wifiNet_t,Compare>wifiNets;
 static std::atomic<bool>wifiScanOwned{false},wifiScanPending{false},wifiScanRunning{false},wifiScanFailed{false};
-constexpr int WIFI_SCAN_RUNNING=-1;
+constexpr int WIFI_SCAN_RUNNING=-1,WIFI_AUTH_OPEN=0;
 unsigned scans=0,asyncScans=0,scanPolls=0;
-int asyncStart=WIFI_SCAN_RUNNING,scanStatus=WIFI_SCAN_RUNNING;
+int asyncStart=WIFI_SCAN_RUNNING,scanStatus=WIFI_SCAN_RUNNING,syncCount=0;
 struct Wifi {
  bool isConnected(){return true;}
  String SSID(){return "registered & <SSID>";}
  String SSID(int){return "new scan";}
- int scanNetworks(bool async=false){if(async){++asyncScans;return asyncStart;}++scans;return 0;}
+ int scanNetworks(bool async=false){if(async){++asyncScans;return asyncStart;}++scans;return syncCount;}
  int scanComplete(){++scanPolls;return scanStatus;}
  int channel(int){return 1;}int RSSI(int){return -40;}
  const uint8_t*BSSID(int){static uint8_t b[6]{};return b;}
@@ -73,6 +81,16 @@ struct Server {unsigned handled=0;Client client(){return {};}
  void handleClient(){++handled;}
 }server;
 const char *type_txt="text/plain";
+bool suppressSerialLog=false;
+void readerProgress();
+struct SerialMock {void println(){} void printf_P(const char*fmt,...){if(std::strstr(fmt,"%3d:"))readerProgress();}}Serial;
+namespace improv {constexpr int ERROR_UNKNOWN=1,GET_WIFI_NETWORKS=2;
+ std::vector<uint8_t>build_rpc_response(int,const std::vector<std::string>&data,bool){return {static_cast<uint8_t>(data.empty()?0:1)};}}
+unsigned responses=0,finalResponses=0,errors=0;
+void send_response(const std::vector<uint8_t>&data){++responses;if(data[0]==0)++finalResponses;}
+void set_error(int){++errors;}
+void delay(unsigned){readerProgress();}
+
 unsigned now=0;
 uint32_t _millis(){return now;}
 struct netconn;struct tcp_pcb;struct ip_addr_t{};
@@ -101,7 +119,12 @@ ssize_t send(int,const void*p,size_t n,int flags){
 }
 """ + formats + fields + r"""
 HttpOwnedResponse httpOwned[2],*httpWriting=&httpOwned[0];
-""" + block(web, "bool defer_http_generated_body(") + block(web, "bool drainHttpBodies()") + block(web, "bool pollHttpResponses()") + block(soft, "void htmlEscape(") + renderer + scan + pending + legacy + entry + block(soft, "void handle_rescan()") + r"""
+""" + "bool wifi_scan(bool retainResults=false);\n" + block(web, "bool defer_http_generated_body(") + block(web, "bool drainHttpBodies()") + block(web, "bool pollHttpResponses()") + block(soft, "void htmlEscape(") + renderer + scan + block(soft, "void release_wifi_scan_results()") + result_class + cli + provision + pending + legacy + entry + block(soft, "void handle_rescan()") + r"""
+void readerProgress(){
+ unsigned before=asyncScans;
+ wifiScanPending=true;pollWifiScan();
+ assert(wifiScanOwned&&asyncScans==before);
+}
 void reset(){
  finishHttpBody(httpOwned[0]);httpOwned[0]=HttpOwnedResponse{};
  httpOwned[0].state=HttpOwnedState::Active;httpOwned[0].fd=7;httpWriting=&httpOwned[0];
@@ -165,6 +188,34 @@ int main(){
  // Renderer overflow returns a failure sentinel, never a truncated span.
  reset();handle_wifinets();uint8_t tiny[4];assert(readWifiScanPage(tiny,sizeof(tiny))==SIZE_MAX);
  finishHttpBody(httpOwned[0]);
+ // Synchronous result readers keep the registry leased through iteration and
+ // the CLI selection scope. The main scanner never waits for that reader.
+ wifiScanPending=false;syncCount=2;
+ {
+   WifiScanResults results;assert(scanWifi(false,results)==2);
+   assert(wifiScanOwned&&!suppressSerialLog&&wifiNets.size()==2);
+   const unsigned before=asyncScans;pollWifiScan();
+   assert(asyncScans==before&&wifiNets.size()==2);
+ }
+ assert(!wifiScanOwned);scanStatus=0;soft_ap_loop();soft_ap_loop();
+ assert(!wifiScanOwned&&!wifiScanRunning);
+ // Busy CLI/Improv must report unavailable, never iterate old results or emit
+ // a successful Improv final marker; suppression always returns to its value.
+ reset();handle_wifinets();
+ for(bool saved:{false,true}){
+   suppressSerialLog=saved;WifiScanResults results;
+   assert(scanWifi(true,results)==UINT32_MAX&&suppressSerialLog==saved);
+ }
+ getAvailableWifiNetworks();assert(errors==1&&responses==0&&finalResponses==0);
+ finishHttpBody(httpOwned[0]);wifiScanPending=false;
+ syncCount=-2;suppressSerialLog=false;
+ {WifiScanResults results;assert(scanWifi(true,results)==UINT32_MAX&&!suppressSerialLog);}
+ assert(!wifiScanOwned);
+ syncCount=0;suppressSerialLog=true;
+ {WifiScanResults results;assert(scanWifi(true,results)==0&&suppressSerialLog&&wifiScanOwned);}
+ assert(!wifiScanOwned);
+ syncCount=2;getAvailableWifiNetworks();
+ assert(!wifiScanOwned&&responses==2&&finalResponses==1&&errors==1);
 }
 """
         with tempfile.TemporaryDirectory() as directory:
