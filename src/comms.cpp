@@ -789,6 +789,9 @@ void setup_comms()
         Sec1Serial.begin(1200, SWSERIAL_8E1, UART_RX_PIN, UART_TX_PIN, true, 32);
         Sec1Serial.onReceive(receiveHandler);
 #endif
+        // One 1200-baud 8E1 echo takes under 10ms. A missing echo must not
+        // retain the command/control lock for Stream's default one second.
+        Sec1Serial.setTimeout(50);
 
         wallPanelDetected = false;
         wallPanelBooting = false;
