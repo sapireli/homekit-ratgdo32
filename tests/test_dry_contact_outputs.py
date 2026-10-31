@@ -38,6 +38,11 @@ class DryContactOutputs(unittest.TestCase):
 #include <vector>
 #include <utility>
 #include <atomic>
+using portMUX_TYPE=int;
+#define portMUX_INITIALIZER_UNLOCKED 0
+int criticalDepth=0;
+void portENTER_CRITICAL(portMUX_TYPE*){assert(criticalDepth++==0);}
+void portEXIT_CRITICAL(portMUX_TYPE*){assert(--criticalDepth==0);}
 #define OUTPUT 1
 #define LOW 0
 #define HIGH 1
@@ -50,12 +55,12 @@ struct esp_timer_create_args_t {void(*callback)(void*);void*arg;int dispatch_met
 inline constexpr int ESP_OK=0,ESP_TIMER_TASK=0;
 Timer storage[3];unsigned creates=0;
 std::vector<Timer*> timers;
-bool failCreate=false,failStart=false,failToggleStart=false;
+bool failCreate=false,failStart=false,failToggleStart=false,expireDuringStart=false;
 int esp_timer_create(const esp_timer_create_args_t*a,esp_timer_handle_t*t){
- if(failCreate)return -1;assert(creates<3);auto*p=&storage[creates++];*p={a->callback,a->arg,false};*t=p;return ESP_OK;}
-int esp_timer_start_once(esp_timer_handle_t t,uint64_t us){assert(us==500000);
- if(failStart||(failToggleStart&&t==&storage[0]))return -1;assert(!t->active);t->active=true;timers.push_back(t);return ESP_OK;}
-int esp_timer_stop(esp_timer_handle_t t){if(!t->active)return -1;t->active=false;return ESP_OK;}
+ assert(!criticalDepth);if(failCreate)return -1;assert(creates<3);auto*p=&storage[creates++];*p={a->callback,a->arg,false};*t=p;return ESP_OK;}
+int esp_timer_start_once(esp_timer_handle_t t,uint64_t us){assert(!criticalDepth&&us==500000);
+ if(failStart||(failToggleStart&&t==&storage[0]))return -1;assert(!t->active);t->active=true;timers.push_back(t);if(expireDuringStart){t->active=false;t->callback(t->arg);}return ESP_OK;}
+int esp_timer_stop(esp_timer_handle_t t){assert(!criticalDepth);if(!t->active)return -1;t->active=false;return ESP_OK;}
 void digitalWrite(int pin,int value) { assert(pin>=0); writes.emplace_back(pin,value); }
 #ifndef ESP32
 struct Ticker {void once_ms(unsigned ms,void(*cb)()){assert(ms==500);cb();}};
@@ -85,8 +90,9 @@ int main() {
       complete();assert(writes.back()==std::make_pair(22,LOW));
     }
     clear();failStart=true;assert(!command(DoorAction::Open));
-    assert((writes==std::vector<std::pair<int,int>>({{22,HIGH},{22,LOW}})));
-    failStart=false;clear();assert(command(DoorAction::Open));
+    assert(writes.empty());
+    failStart=false;clear();expireDuringStart=true;assert(!command(DoorAction::Open)&&writes.empty());
+    complete();expireDuringStart=false;clear();assert(command(DoorAction::Open));
     cancelDryContactTimers();assert(!command(DoorAction::Open));complete();
     setupDryContactTimers();clear();assert(command(DoorAction::Open));
     auto*t=timers.front();t->active=false;cancelDryContactTimers();setupDryContactTimers();

@@ -69,7 +69,7 @@ std::recursive_mutex controlMutex;
 struct FunctionDelayLock {FunctionDelayLock(){controlMutex.lock();}~FunctionDelayLock(){controlMutex.unlock();}};
 struct Ticker {unsigned armed=0;void detach(){armed=0;}template<class F>void once_ms(unsigned,F){++armed;}};
 // These fixtures select Sec+ only; GPIO pulses have a separate source test.
-struct DryContactPulse {bool ready(){assert(false);return false;}bool start(){assert(false);return false;}
+struct DryContactPulse {static bool start(DryContactPulse&,DryContactPulse* = nullptr){assert(false);return false;}
  void cancel(){assert(false);}void setup(int){assert(false);}};
 DryContactPulse dryTogglePulse,dryOpenPulse,dryClosePulse;
 bool dryContactTimersReady=false;
