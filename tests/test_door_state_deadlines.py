@@ -44,7 +44,7 @@ void notify_homekit_current_door_state_change(GarageDoorCurrentState s){++notifi
 void write_status_pin(int,int){}
 void digitalWrite(int,int){}
 void send_get_status(){++queries;}
-bool door_command(DoorAction){return admit;}
+bool door_command(DoorAction,DoorCommandLifecycle::Intent){return admit;}
 bool functionDelayActive(){return false;}
 void cancelFunctionDelay(){}
 void cancel_builtin_TTC_countdown(){}
@@ -71,6 +71,7 @@ int main(){
     checkDoorMoving.process();checkDoorCompleted.process();assert(cancels==3);
 }
 '''
+        harness = (ROOT / "src/door_command_lifecycle.h").read_text().replace("#pragma once", "") + harness
         with tempfile.TemporaryDirectory() as directory:
             cpp, exe = Path(directory) / "deadline.cpp", Path(directory) / "deadline"
             cpp.write_text(harness)

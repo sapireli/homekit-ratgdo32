@@ -41,6 +41,7 @@ struct Config {bool getReverseOnStop(){return false;}int getTTCseconds(){return 
 DoorCommandLifecycle doorLifecycle;
 bool doingPartial=false,partialAwaitingMotion=false;
 _millis_t partialStartDeadline=0,partialStopDeadline=0,partialDuration=0;
+GarageDoorCurrentState rejectDoorCommand(){return garage_door.current_state;}
 void cancelPartialOpen(){doingPartial=false;partialAwaitingMotion=false;}
 void cancel_builtin_TTC_countdown(){}
 bool functionDelayActive(){return false;}
@@ -50,13 +51,15 @@ void delayFnCall(uint32_t,void(*)()){}
 struct Command {DoorAction action;uint32_t token;};
 std::vector<Command> queued;
 bool admit=true;
-bool door_command(DoorAction action){
+bool door_command(DoorAction action, DoorCommandLifecycle::Intent intent=DoorCommandLifecycle::Intent::None){
     if(!admit||pendingDoorCommand)return false;
-    queued.push_back({action,doorLifecycle.begin(garage_door.current_state,now)});
+    queued.push_back({action,doorLifecycle.begin(garage_door.current_state,now,intent)});
     pendingDoorCommand=true;return true;
 }
-void door_command_open(){door_command(DoorAction::Open);}
-void door_command_close(){door_command(DoorAction::Close);}
+bool startDoorOpenCommand(){return door_command(DoorAction::Open,DoorCommandLifecycle::Intent::Open);}
+void door_command_open(){startDoorOpenCommand();}
+bool startDoorCloseCommand(){return door_command(DoorAction::Close,DoorCommandLifecycle::Intent::Close);}
+void door_command_close(){startDoorCloseCommand();}
 GarageDoorCurrentState open_door();
 GarageDoorCurrentState close_door(bool=false);
 GarageDoorCurrentState stop_door();
