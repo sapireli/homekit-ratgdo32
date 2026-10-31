@@ -185,16 +185,32 @@ SoftwareSerial sw_serial;
 // teardown are serialized by FunctionDelayLock; callbacks never take it.
 class DryContactPulse
 {
+    static portMUX_TYPE mux;
     esp_timer_handle_t timer = nullptr;
     int pin = -1;
     bool attempted = false, enabled = false;
-    std::atomic<bool> pending{false};
+    bool pending = false, asserted = false; // Protected by mux.
     static void release(void *arg)
     {
         auto *pulse = static_cast<DryContactPulse *>(arg);
-        digitalWrite(pulse->pin, LOW);
-        // No GPIO access after reopening admission to another command.
-        pulse->pending.store(false, std::memory_order_release);
+        portENTER_CRITICAL(&mux);
+        if (pulse->asserted)
+            digitalWrite(pulse->pin, LOW);
+        pulse->asserted = pulse->pending = false;
+        portEXIT_CRITICAL(&mux);
+    }
+    void abortArm(bool started)
+    {
+        // Timer APIs must never run with the GPIO/state critical section held.
+        const bool stopped = started && timer && esp_timer_stop(timer) == ESP_OK;
+        portENTER_CRITICAL(&mux);
+        if (asserted)
+            digitalWrite(pin, LOW);
+        asserted = false;
+        // An expired callback may still be queued; retain its reservation.
+        if (!started || stopped)
+            pending = false;
+        portEXIT_CRITICAL(&mux);
     }
 public:
     bool setup(int configuredPin)
@@ -213,37 +229,64 @@ public:
             if (esp_timer_create(&args, &timer) != ESP_OK)
                 timer = nullptr;
         }
+        portENTER_CRITICAL(&mux);
         enabled = timer != nullptr && configuredPin == pin;
-        return enabled;
+        const bool available = enabled;
+        portEXIT_CRITICAL(&mux);
+        return available;
     }
-    bool ready() const
+    static bool start(DryContactPulse &toggle, DryContactPulse *discrete = nullptr)
     {
-        return enabled && !pending.load(std::memory_order_acquire);
-    }
-    bool start()
-    {
-        bool expected = false;
-        if (!enabled || !pending.compare_exchange_strong(expected, true, std::memory_order_acquire))
+        portENTER_CRITICAL(&mux);
+        const bool ready = toggle.enabled && !toggle.pending &&
+                           (!discrete || (discrete->enabled && !discrete->pending));
+        if (ready)
+        {
+            toggle.pending = true;
+            if (discrete)
+                discrete->pending = true;
+        }
+        portEXIT_CRITICAL(&mux);
+        if (!ready)
             return false;
-        digitalWrite(pin, HIGH);
-        if (esp_timer_start_once(timer, 500000) == ESP_OK)
-            return true;
-        digitalWrite(pin, LOW);
-        pending.store(false, std::memory_order_release);
-        return false;
+
+        const bool discreteArmed = discrete && esp_timer_start_once(discrete->timer, 500000) == ESP_OK;
+        const bool toggleArmed = (!discrete || discreteArmed) && esp_timer_start_once(toggle.timer, 500000) == ESP_OK;
+        portENTER_CRITICAL(&mux);
+        // Expiry may have run during either SDK call. Both reservations must
+        // still be live before any physical button edge is allowed.
+        const bool accepted = toggleArmed && toggle.pending && (!discrete || discrete->pending);
+        if (accepted)
+        {
+            if (discrete)
+            {
+                digitalWrite(discrete->pin, HIGH);
+                discrete->asserted = true;
+            }
+            digitalWrite(toggle.pin, HIGH);
+            toggle.asserted = true;
+        }
+        portEXIT_CRITICAL(&mux);
+        if (!accepted)
+        {
+            if (discrete)
+                discrete->abortArm(discreteArmed);
+            toggle.abortArm(toggleArmed);
+        }
+        return accepted;
     }
     void cancel()
     {
+        portENTER_CRITICAL(&mux);
         enabled = false;
-        // A successful stop removed an unexpired timer. An already-expired
-        // callback retains admission until it has finished its LOW write.
-        const bool stopped = timer && esp_timer_stop(timer) == ESP_OK;
         if (pin >= 0)
             digitalWrite(pin, LOW);
-        if (stopped)
-            pending.store(false, std::memory_order_release);
+        asserted = false;
+        portEXIT_CRITICAL(&mux);
+        abortArm(true);
     }
 };
+portMUX_TYPE DryContactPulse::mux = portMUX_INITIALIZER_UNLOCKED;
 static DryContactPulse dryTogglePulse, dryOpenPulse, dryClosePulse;
 static bool dryContactTimersReady = false;
 
@@ -3030,20 +3073,8 @@ bool door_command(DoorAction action, DoorCommandLifecycle::Intent intent)
             discrete = &dryClosePulse;
         // Both outputs must be available before either one can be asserted.
         // Active pulses keep their original 500 ms release deadline.
-        if (!dryContactTimersReady || !dryTogglePulse.ready() || (discrete && !discrete->ready()))
+        if (!dryContactTimersReady || !DryContactPulse::start(dryTogglePulse, discrete))
             return false;
-        if (discrete && !discrete->start())
-            return false;
-        if (!dryTogglePulse.start())
-        {
-            if (discrete)
-            {
-                discrete->cancel();
-                // Restore availability after rollback without allocating.
-                discrete->setup(action == DoorAction::Open ? DISCRETE_OPEN_PIN : DISCRETE_CLOSE_PIN);
-            }
-            return false;
-        }
 #else
         if (action == DoorAction::Open)
         {
