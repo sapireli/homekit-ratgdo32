@@ -58,6 +58,16 @@ esp_log_level_t logLevel = ESP_LOG_VERBOSE;
 // Allows us to intercept all ESP_LOGx() even outside our code.
 void esp_log_hook(const char *fmt, va_list args)
 {
+#ifndef ESP8266
+    // Serial setup and fallback output also acquire driver locks. Core-held
+    // logs may only enter the preallocated logger buffer, when it exists.
+    if (sys_thread_tcpip(LWIP_CORE_LOCK_QUERY_HOLDER))
+    {
+        if (ratgdoLogger)
+            ratgdoLogger->logToBuffer(fmt, args);
+        return;
+    }
+#endif
     if (!Serial)
     {
         // Before we can log anything, we need to initialize the serial port.
@@ -248,8 +258,12 @@ void LOG::logToBuffer(const char *fmt, va_list args)
         lineBuffer[LINE_BUFFER_SIZE - 1] = 0;
     }
 
-    //  print line to the serial port
-    SERIAL_PRINT(lineBuffer);
+    // UART output can wait for a driver mutex or TX space. Keep core-held
+    // logging in the preallocated ring without any serial or network I/O.
+#ifndef ESP8266
+    if (!coreLocked)
+#endif
+        SERIAL_PRINT(lineBuffer);
 
     // copy the line into the message save buffer
     size_t len = strlen(lineBuffer);
