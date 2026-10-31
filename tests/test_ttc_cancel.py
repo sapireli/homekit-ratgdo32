@@ -91,7 +91,16 @@ void set_light(bool,bool=true){}
 void cancelPartialOpen(){}
 void sec1_light_press(){}
 void sec1_light_release(int){}
-void sync_and_restart(){}
+void sync_and_restart(){
+#ifdef ESP32
+    // Driver teardown may wait for an event task that needs the control lock.
+    std::atomic<bool> finished{false};
+    std::thread eventTask([&]{std::lock_guard<std::recursive_mutex> lock(delayMutex);finished=true;});
+    for(int i=0;i<100&&!finished;++i)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    assert(finished);
+    eventTask.join();
+#endif
+}
 unsigned closes=0;
 std::atomic<bool> blockClose{false},closeEntered{false},releaseClose{false};
 void door_command_close(){
@@ -137,6 +146,8 @@ int main(){
     assert(!openReturned);
     releaseClose=true;executor.join();canceller.join();
     assert(openReturned&&closes==2);
+    delayFnCall(0,sync_and_restart);now+=250;processFunctionDelay();
+    now+=500;processFunctionDelay();
 #endif
 
     const unsigned beforeWrap=closes;
