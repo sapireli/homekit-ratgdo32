@@ -4,7 +4,15 @@
 
 All notable changes to `homekit-ratgdo32` will be documented in this file. This project tries to adhere to [Semantic Versioning](http://semver.org/).
 
-## v1.4.4 (2026-10-30) - GRGDO1 test release
+## v1.4.5 (unreleased) - GRGDO1 reliability candidate
+
+* Remove temporary SSE frame allocations. Send borrowed spans in one nonblocking ESP32 operation and preserve ESP8266 flushing behavior.
+* Prevent logger/core lock deadlocks when lwIP reports errors: core-held callers never wait for the logger mutex or send SSE/syslog traffic back through lwIP.
+* Retain failed or replaced SSE stream owners through verified core-thread cleanup, covering reconnects and partial headers. Retired streams discard queued payload immediately after ownership checks, without adding more client buffers.
+* Add regression coverage for full cleanup slots, callback overlap, and failed firmware-update progress streams. The native pinned-lwIP test drains ten full send buffers and returns allocator/segment usage to baseline.
+* Hardware soak and confirmation of the complete original failure remain pending. Version 1.4.4 testing is on hold after the confirmed low-memory crash in #19.
+
+## v1.4.4 (2026-10-30) - GRGDO1 test release (testing on hold)
 
 * Enable bounded HTTP response ownership for both board revisions. Release acknowledged responses and clean up verified connections after five seconds without acknowledgement progress, preventing stalled responses from accumulating unchecked.
 * Build regular Rev1/Rev2 firmware without the extra runtime/heap/TCP collectors, Wi-Fi TX tracing, diagnostic HTTP endpoint, or diagnostic version suffix. Keep normal informational, warning, and error logging.
