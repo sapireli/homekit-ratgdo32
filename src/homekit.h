@@ -16,8 +16,12 @@
 
 // RATGDO project includes
 #include "ratgdo.h"
+#ifndef ESP8266
+#include "homekit_notifications.h"
+#endif
 
 void setup_homekit();
+void homekit_loop();
 
 extern void notify_homekit_target_door_state_change(GarageDoorTargetState state);
 extern void notify_homekit_current_door_state_change(GarageDoorCurrentState state);
@@ -33,7 +37,6 @@ extern bool homekit_setup_done;
 
 #ifdef ESP8266
 // On ESP8266 we have our own HomeKit module
-void homekit_loop();
 
 #else // not ESP8266
 // One ESP32 we use HomeSpan module.
@@ -118,7 +121,6 @@ struct DEV_Light : Service::LightBulb
 {
     Characteristic::On *on;
 
-    QueueHandle_t event_q;
     Light_t type;
 
     explicit DEV_Light(Light_t type = Light_t::GDO_LIGHT);
@@ -130,18 +132,18 @@ struct DEV_Motion : Service::MotionSensor
 {
     Characteristic::MotionDetected *motion;
 
-    QueueHandle_t event_q;
     char name[16];
+    HomekitSignal signal;
 
-    explicit DEV_Motion(const char *name);
+    explicit DEV_Motion(const char *name, HomekitSignal signal = HomekitSignal::Motion);
     void loop();
 };
 
 struct DEV_Occupancy : Service::OccupancySensor
 {
     Characteristic::OccupancyDetected *occupied;
-    QueueHandle_t event_q;
-    DEV_Occupancy();
+    HomekitSignal signal;
+    explicit DEV_Occupancy(HomekitSignal signal = HomekitSignal::Vehicle);
     void loop();
 };
 
@@ -150,17 +152,13 @@ struct DEV_TempHumidity : Service::TemperatureSensor
 {
     Characteristic::CurrentTemperature *temperature;
     Characteristic::CurrentRelativeHumidity *humidity;
-    QueueHandle_t event_q;
     DEV_TempHumidity();
     void loop();
-    void setValues(float temp, float hum);
 };
 #endif // USE_DHT22
 struct DEV_Stop : Service::Switch
 {
     Characteristic::On *on;
-
-    QueueHandle_t event_q;
 
     DEV_Stop();
     boolean update();
@@ -171,8 +169,6 @@ struct DEV_Stop : Service::Switch
 struct DEV_ManuallyOperated : Service::ContactSensor
 {
     Characteristic::ContactSensorState *state;
-
-    QueueHandle_t event_q;
 
     DEV_ManuallyOperated();
     void loop();

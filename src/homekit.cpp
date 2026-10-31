@@ -60,6 +60,28 @@ void light_state_set(const homekit_value_t value);
 
 static bool rebooting = false;
 static bool isPaired = false;
+static HomekitBooleanMailbox stateMailboxes[static_cast<unsigned>(HomekitSignal::Count)];
+static HomekitServiceRequests serviceRequests;
+static std::atomic<bool> pollingStarted{false};
+static std::atomic<TaskHandle_t> mutationOwner{nullptr};
+#ifdef USE_DHT22
+static HomekitFloatMailbox temperatureMailbox, humidityMailbox;
+#endif
+
+static HomekitBooleanMailbox &mailbox(HomekitSignal signal)
+{
+    return stateMailboxes[static_cast<unsigned>(signal)];
+}
+
+static bool deferServiceChange(HomekitService service, bool enable)
+{
+    if (!pollingStarted.load(std::memory_order_acquire) ||
+        mutationOwner.load(std::memory_order_acquire) == xTaskGetCurrentTaskHandle())
+        return false;
+    serviceRequests.publish(service, enable);
+    return true;
+}
+
 
 #endif // ESP8266
 
@@ -633,6 +655,7 @@ void testMoveDoor(const char *buf)
  */
 void createMotionAccessories()
 {
+    if (deferServiceChange(HomekitService::Motion, true)) return;
 
     // Exit if already setup
     if (motion)
@@ -647,6 +670,7 @@ void createMotionAccessories()
 #ifdef RATGDO32_DISCO
 void enable_service_homekit_vehicle(bool enable)
 {
+    if (deferServiceChange(HomekitService::Vehicle, enable)) return;
     const bool allowOccupancy = enable && userConfig->getVehicleOccupancyHomeKit();
     const bool allowArriving = enable && userConfig->getVehicleArrivingHomeKit();
     const bool allowDeparting = enable && userConfig->getVehicleDepartingHomeKit();
@@ -661,7 +685,8 @@ void enable_service_homekit_vehicle(bool enable)
             {
                 new SpanAccessory(aid);
                 new DEV_Info(name);
-                sensor = new DEV_Motion(name);
+                sensor = new DEV_Motion(name, aid == HOMEKIT_AID_ARRIVING ?
+                    HomekitSignal::Arriving : HomekitSignal::Departing);
                 databaseChanged = true;
             }
         }
@@ -713,6 +738,7 @@ void enable_service_homekit_vehicle(bool enable)
 
 bool enable_service_homekit_laser(bool enable)
 {
+    if (deferServiceChange(HomekitService::Laser, enable)) return true;
     if (enable)
     {
         if (!assistLaser && LASER_PIN >= 0 && userConfig->getLaserEnabled() && userConfig->getLaserHomeKit())
@@ -746,6 +772,7 @@ bool enable_service_homekit_laser(bool enable)
 
 bool enable_service_homekit_room_occupancy(bool enable)
 {
+    if (deferServiceChange(HomekitService::Room, enable)) return true;
     // Only enable room occupancy if we have a motion sensor as well
     if (enable && motion)
     {
@@ -754,7 +781,8 @@ bool enable_service_homekit_room_occupancy(bool enable)
             // Define the Room Occupancy Sensor accessory...
             new SpanAccessory(HOMEKIT_AID_ROOM_OCCUPANCY);
             new DEV_Info("Room Occupancy");
-            roomOccupancy = new DEV_Occupancy();
+            roomOccupancy = new DEV_Occupancy(HomekitSignal::Room);
+            homeSpan.updateDatabase();
             return true;
         }
     }
@@ -775,6 +803,7 @@ bool enable_service_homekit_room_occupancy(bool enable)
 
 bool enable_service_homekit_light(bool enable)
 {
+    if (deferServiceChange(HomekitService::Light, enable)) return true;
     // Dry contact (security type 3) cannot control lights
     if (userConfig->getGDOSecurityType() == 3)
     {
@@ -811,6 +840,7 @@ bool enable_service_homekit_light(bool enable)
 
 bool enable_service_homekit_motion_sensor(bool enable)
 {
+    if (deferServiceChange(HomekitService::Motion, enable)) return true;
     if (enable)
     {
         if (!motion)
@@ -847,6 +877,7 @@ bool enable_service_homekit_motion_sensor(bool enable)
 
 bool enable_service_homekit_stop(bool enable)
 {
+    if (deferServiceChange(HomekitService::Stop, enable)) return true;
     if (enable)
     {
         if (!stopDoor)
@@ -877,6 +908,7 @@ bool enable_service_homekit_stop(bool enable)
 #ifdef RATGDO_ENCODER
 bool enable_service_homekit_manually_operated(bool enable)
 {
+    if (deferServiceChange(HomekitService::Manual, enable)) return true;
     if (enable)
     {
         if (!manuallyOperatedSensor)
@@ -1041,8 +1073,49 @@ void setup_homekit()
 
     // Auto poll starts up a new FreeRTOS task to do the HomeKit comms
     // so no need to handle in our Arduino loop.
+    pollingStarted.store(true, std::memory_order_release);
     homeSpan.autoPoll((1024 * 16), 1, 0);
     homekit_setup_done = true;
+}
+
+// Called from the existing Arduino loop before application locks. A shared
+// pause excludes HomeSpan traversal; only this task mutates optional services.
+void homekit_loop()
+{
+    if (suspend_service_loop || !pollingStarted.load(std::memory_order_acquire) ||
+        !serviceRequests.hasPending()) return;
+    std::shared_lock<std::shared_mutex> pause(homeSpan.getMutex(), std::try_to_lock);
+    if (!pause.owns_lock()) return;
+    mutationOwner.store(xTaskGetCurrentTaskHandle(), std::memory_order_release);
+    // Apply one requested group per iteration. Rotate admission so a frequently
+    // changed setting cannot starve a later service indefinitely.
+    static unsigned nextService = 0;
+    constexpr unsigned count = static_cast<unsigned>(HomekitService::Count);
+    for (unsigned i = 0; i < count; ++i)
+    {
+        const unsigned index = (nextService + i) % count;
+        const auto service = static_cast<HomekitService>(index);
+        bool enable;
+        if (!serviceRequests.take(service, enable)) continue;
+        nextService = (index + 1) % count;
+        switch (service)
+        {
+        case HomekitService::Light: enable_service_homekit_light(enable); break;
+#ifdef RATGDO32_DISCO
+        case HomekitService::Vehicle: enable_service_homekit_vehicle(enable); break;
+        case HomekitService::Laser: enable_service_homekit_laser(enable); break;
+#endif
+        case HomekitService::Motion: enable_service_homekit_motion_sensor(enable); break;
+        case HomekitService::Room: enable_service_homekit_room_occupancy(enable); break;
+        case HomekitService::Stop: enable_service_homekit_stop(enable); break;
+#ifdef RATGDO_ENCODER
+        case HomekitService::Manual: enable_service_homekit_manually_operated(enable); break;
+#endif
+        default: break;
+        }
+        break;
+    }
+    mutationOwner.store(nullptr, std::memory_order_release);
 }
 
 void queueSendHelper(QueueHandle_t q, GDOEvent e, const char *txt)
@@ -1137,7 +1210,7 @@ boolean DEV_GarageDoor::update()
 void DEV_GarageDoor::loop()
 {
     runtime_diagnostics_homekit_progress();
-    if (uxQueueMessagesWaiting(event_q) > 0)
+    if (event_q && uxQueueMessagesWaiting(event_q) > 0)
     {
         GDOEvent e;
         xQueueReceive(event_q, &e, 0);
@@ -1167,8 +1240,8 @@ DEV_Light::DEV_Light(Light_t type) : Service::LightBulb()
         ESP_LOGI(TAG, "Configuring HomeKit Light Service for GDO Light");
     else if (type == Light_t::ASSIST_LASER)
         ESP_LOGI(TAG, "Configuring HomeKit Light Service for Laser");
-    event_q = xQueueCreate(10, sizeof(GDOEvent));
     DEV_Light::on = new Characteristic::On(DEV_Light::on->OFF);
+    mailbox(type == Light_t::GDO_LIGHT ? HomekitSignal::Light : HomekitSignal::Laser).beginObservation();
 }
 
 boolean DEV_Light::update()
@@ -1197,58 +1270,55 @@ boolean DEV_Light::update()
 
 void DEV_Light::loop()
 {
-    if (uxQueueMessagesWaiting(event_q) > 0)
+    bool value;
+    if (mailbox(type == Light_t::GDO_LIGHT ? HomekitSignal::Light : HomekitSignal::Laser).take(value))
     {
-        GDOEvent e;
-        xQueueReceive(event_q, &e, 0);
         if (this->type == Light_t::GDO_LIGHT)
-            ESP_LOGD(TAG, "Light has turned %s", e.value.b ? "on" : "off");
+            ESP_LOGD(TAG, "Light has turned %s", value ? "on" : "off");
         else if (this->type == Light_t::ASSIST_LASER)
-            ESP_LOGD(TAG, "Parking assist laser has turned %s", e.value.b ? "on" : "off");
-        DEV_Light::on->setVal(e.value.b);
+            ESP_LOGD(TAG, "Parking assist laser has turned %s", value ? "on" : "off");
+        DEV_Light::on->setVal(value);
     }
 }
 
 /****************************************************************************
  * Motion Service Handler
  */
-DEV_Motion::DEV_Motion(const char *name) : Service::MotionSensor()
+DEV_Motion::DEV_Motion(const char *name, HomekitSignal signal) : Service::MotionSensor(), signal(signal)
 {
     ESP_LOGI(TAG, "Configuring HomeKit Motion Service for %s", name);
-    event_q = xQueueCreate(10, sizeof(GDOEvent));
     strlcpy(this->name, name, sizeof(this->name));
     DEV_Motion::motion = new Characteristic::MotionDetected(motion->NOT_DETECTED);
+    mailbox(signal).beginObservation();
 }
 
 void DEV_Motion::loop()
 {
-    if (uxQueueMessagesWaiting(event_q) > 0)
+    bool value;
+    if (mailbox(signal).take(value))
     {
-        GDOEvent e;
-        xQueueReceive(event_q, &e, 0);
-        ESP_LOGD(TAG, "%s %s", name, e.value.b ? "detected" : "reset");
-        DEV_Motion::motion->setVal(e.value.b);
+        ESP_LOGD(TAG, "%s %s", name, value ? "detected" : "reset");
+        DEV_Motion::motion->setVal(value);
     }
 }
 
 /****************************************************************************
  * Occupancy Service Handler
  */
-DEV_Occupancy::DEV_Occupancy() : Service::OccupancySensor()
+DEV_Occupancy::DEV_Occupancy(HomekitSignal signal) : Service::OccupancySensor(), signal(signal)
 {
     ESP_LOGI(TAG, "Configuring HomeKit Occupancy Service");
-    event_q = xQueueCreate(10, sizeof(GDOEvent));
     DEV_Occupancy::occupied = new Characteristic::OccupancyDetected(occupied->NOT_DETECTED);
+    mailbox(signal).beginObservation();
 }
 
 void DEV_Occupancy::loop()
 {
-    if (uxQueueMessagesWaiting(event_q) > 0)
+    bool value;
+    if (mailbox(signal).take(value))
     {
-        GDOEvent e;
-        xQueueReceive(event_q, &e, 0);
-        ESP_LOGD(TAG, "%s occupancy %s", (this == vehicle) ? "Vehicle" : "Room", e.value.b ? "detected" : "reset");
-        DEV_Occupancy::occupied->setVal(e.value.b);
+        ESP_LOGD(TAG, "%s occupancy %s", (this == vehicle) ? "Vehicle" : "Room", value ? "detected" : "reset");
+        DEV_Occupancy::occupied->setVal(value);
     }
 }
 
@@ -1259,7 +1329,6 @@ void DEV_Occupancy::loop()
 DEV_TempHumidity::DEV_TempHumidity() : Service::TemperatureSensor()
 {
     ESP_LOGI(TAG, "Configuring HomeKit Temperature and Humidity Service");
-    event_q = xQueueCreate(10, sizeof(GDOEvent));
     temperature = new Characteristic::CurrentTemperature(0.0);
 
     // Create a separate Humidity Sensor service for the same accessory
@@ -1267,22 +1336,12 @@ DEV_TempHumidity::DEV_TempHumidity() : Service::TemperatureSensor()
     humidity = new Characteristic::CurrentRelativeHumidity(0.0);
 }
 
-void DEV_TempHumidity::setValues(float temp, float hum)
-{
-    ESP_LOGI(TAG, "HomeKit temperature: %.1f°C, humidity: %.1f%%", temp, hum);
-    temperature->setVal(temp);
-    humidity->setVal(hum);
-}
 
 void DEV_TempHumidity::loop()
 {
-    if (uxQueueMessagesWaiting(event_q) > 0)
-    {
-        GDOEvent e;
-        xQueueReceive(event_q, &e, 0);
-        // Event queue not currently used for temp/humidity
-        // Updates happen directly via setValues()
-    }
+    float value;
+    if (temperatureMailbox.take(value)) temperature->setVal(value);
+    if (humidityMailbox.take(value)) humidity->setVal(value);
 }
 #endif // USE_DHT22
 
@@ -1292,7 +1351,6 @@ void DEV_TempHumidity::loop()
 DEV_Stop::DEV_Stop() : Service::Switch()
 {
     ESP_LOGI(TAG, "Configuring HomeKit Switch Service for stop door action");
-    event_q = xQueueCreate(10, sizeof(GDOEvent));
     DEV_Stop::on = new Characteristic::On(DEV_Stop::on->OFF);
 }
 
@@ -1303,22 +1361,18 @@ boolean DEV_Stop::update()
         ESP_LOGD(TAG, "Stop door action triggered from HomeKit");
         stop_door();
         // Now immediately reset the switch to off, so it can be triggered again for the next stop action.
-        GDOEvent e;
-        e.c = nullptr;
-        e.value.b = false;
-        queueSendHelper(this->event_q, e, "stop switch");
+        mailbox(HomekitSignal::Stop).publish(false);
     }
     return true;
 }
 
 void DEV_Stop::loop()
 {
-    if (uxQueueMessagesWaiting(event_q) > 0)
+    bool value;
+    if (mailbox(HomekitSignal::Stop).take(value))
     {
-        GDOEvent e;
-        xQueueReceive(event_q, &e, 0);
-        ESP_LOGD(TAG, "Stop switch has turned %s", e.value.b ? "on" : "off");
-        DEV_Stop::on->setVal(e.value.b);
+        ESP_LOGD(TAG, "Stop switch has turned %s", value ? "on" : "off");
+        DEV_Stop::on->setVal(value);
     }
 }
 
@@ -1329,18 +1383,17 @@ void DEV_Stop::loop()
 DEV_ManuallyOperated::DEV_ManuallyOperated() : Service::ContactSensor()
 {
     ESP_LOGI(TAG, "Configuring HomeKit Contact Sensor Service for manually operated state");
-    event_q = xQueueCreate(10, sizeof(GDOEvent));
     DEV_ManuallyOperated::state = new Characteristic::ContactSensorState(state->DETECTED);
+    mailbox(HomekitSignal::Manual).beginObservation();
 }
 
 void DEV_ManuallyOperated::loop()
 {
-    if (uxQueueMessagesWaiting(event_q) > 0)
+    bool value;
+    if (mailbox(HomekitSignal::Manual).take(value))
     {
-        GDOEvent e;
-        xQueueReceive(event_q, &e, 0);
-        ESP_LOGD(TAG, "Manually Operated contact sensor has turned %s", e.value.b ? "open" : "closed");
-        DEV_ManuallyOperated::state->setVal(e.value.b ? state->NOT_DETECTED : state->DETECTED);
+        ESP_LOGD(TAG, "Manually Operated contact sensor has turned %s", value ? "open" : "closed");
+        DEV_ManuallyOperated::state->setVal(value ? state->NOT_DETECTED : state->DETECTED);
     }
 }
 #endif
@@ -1350,79 +1403,42 @@ void DEV_ManuallyOperated::loop()
  */
 void notify_homekit_vehicle_occupancy(bool vehicleDetected)
 {
-    if (!isPaired || !vehicle)
-        return;
-
-    GDOEvent e;
-    e.c = nullptr;
-    e.value.b = vehicleDetected;
-    queueSendHelper(vehicle->event_q, e, "vehicle");
+    mailbox(HomekitSignal::Vehicle).publish(vehicleDetected, true);
 }
 
 void notify_homekit_room_occupancy(bool occupied)
 {
-    if (!isPaired || !roomOccupancy)
-        return;
-
-    GDOEvent e;
-    e.c = nullptr;
-    e.value.b = garage_door.room_occupied = occupied;
-    garage_door.room_occupancy_timeout = (!occupied) ? 0 : _millis() + userConfig->getOccupancyDuration() * 1000; // convert seconds to milliseconds
-    queueSendHelper(roomOccupancy->event_q, e, "room occupancy");
+    garage_door.room_occupied = occupied;
+    garage_door.room_occupancy_timeout = !occupied ? 0 : _millis() + userConfig->getOccupancyDuration() * 1000;
+    mailbox(HomekitSignal::Room).publish(occupied, true);
 }
 
 void notify_homekit_laser(bool on)
 {
-    if (!isPaired || !assistLaser)
-        return;
-
-    GDOEvent e;
-    e.c = nullptr;
-    e.value.b = on;
-    queueSendHelper(assistLaser->event_q, e, "laser");
+    mailbox(HomekitSignal::Laser).publish(on, false);
 }
 
 void notify_homekit_vehicle_arriving(bool vehicleArriving)
 {
-    if (!isPaired || !arriving)
-        return;
-
-    GDOEvent e;
-    e.c = nullptr;
-    e.value.b = vehicleArriving;
-    queueSendHelper(arriving->event_q, e, "arriving");
+    mailbox(HomekitSignal::Arriving).publish(vehicleArriving, true);
 }
 
 void notify_homekit_vehicle_departing(bool vehicleDeparting)
 {
-    if (!isPaired || !departing)
-        return;
-
-    GDOEvent e;
-    e.c = nullptr;
-    e.value.b = vehicleDeparting;
-    queueSendHelper(departing->event_q, e, "departing");
+    mailbox(HomekitSignal::Departing).publish(vehicleDeparting, true);
 }
 
 #ifdef USE_DHT22
 void notify_homekit_temperature_humidity(float temp, float hum)
 {
-    if (!isPaired || !tempHumidity)
-        return;
-
-    tempHumidity->setValues(temp, hum);
+    temperatureMailbox.publish(temp);
+    humidityMailbox.publish(hum);
 }
 #endif // USE_DHT22
 #ifdef RATGDO_ENCODER
 void notify_homekit_manually_operated(bool state)
 {
-    if (!isPaired || !manuallyOperatedSensor)
-        return;
-
-    GDOEvent e;
-    e.c = nullptr;
-    e.value.b = state;
-    queueSendHelper(manuallyOperatedSensor->event_q, e, "manually operated");
+    mailbox(HomekitSignal::Manual).publish(state, true);
 }
 #endif
 
@@ -1561,13 +1577,7 @@ void notify_homekit_light(bool state)
 {
     garage_door.light = state;
 #ifdef ESP32
-    if (!isPaired || !light)
-        return;
-
-    GDOEvent e;
-    e.c = nullptr;
-    e.value.b = garage_door.light;
-    queueSendHelper(light->event_q, e, "light");
+    mailbox(HomekitSignal::Light).publish(garage_door.light, false);
 #else
     if (!arduino_homekit_get_running_server())
         return;
@@ -1607,13 +1617,7 @@ void notify_homekit_motion(bool state)
     garage_door.motion = state;
     garage_door.motion_timer = (!state) ? 0 : _millis() + MOTION_TIMER_DURATION;
 #ifdef ESP32
-    if (!isPaired || !motion)
-        return;
-
-    GDOEvent e;
-    e.c = nullptr;
-    e.value.b = garage_door.motion;
-    queueSendHelper(motion->event_q, e, "motion");
+    mailbox(HomekitSignal::Motion).publish(garage_door.motion, true);
 #else
     if (!arduino_homekit_get_running_server())
         return;
