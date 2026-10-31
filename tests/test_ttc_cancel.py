@@ -28,7 +28,7 @@ class TTCCancel(unittest.TestCase):
             helpers += "\n".join(block(source, declaration) for declaration in
                                 ["bool functionDelayActive()", "void cancelFunctionDelay()"])
         functions = "\n".join(block(source, declaration) for declaration in
-                              ["GarageDoorCurrentState open_door()", "void processFunctionDelay()\n{", "void delayFnCall(", "void shutdown_comms()"])
+                              ["GarageDoorCurrentState open_door()", "void processFunctionDelay()\n{", "void delayFnCall(", "void cancel_builtin_TTC_countdown()", "void shutdown_comms()"])
         harness = r'''
 #include <atomic>
 #include <cassert>
@@ -69,7 +69,7 @@ void gpio_pullup_dis(int){}
 void gpio_pulldown_en(int){}
 void digitalWrite(int,int){}
 void write_status_pin(int,int){}
-struct Door {GarageDoorCurrentState current_state=CURR_OPEN;bool light=false;} garage_door,last_reported_garage_door;
+struct Door {GarageDoorCurrentState current_state=CURR_OPEN;bool light=false;uint32_t builtInTTCremaining=0;bool builtInTTChold=false;} garage_door,last_reported_garage_door;
 struct Config {bool getReverseOnStop(){return false;}bool getTTClight(){return false;}} config,*userConfig=&config;
 struct Ticker {
     std::function<void()> callback;
@@ -87,6 +87,8 @@ bool TTCwasLightOn=false;
 void (*functionDelayCallback)()=nullptr;
 _millis_t functionDelayNextTick=0;
 bool functionDelayPending=false,functionDelayFinalWait=false,functionDelayLight=false,functionDelaySound=false;
+bool builtInTTCcountdownActive=false;
+_millis_t builtInTTClastTick=0;
 _millis_t now=1000;
 _millis_t _millis(){return now;}
 void set_light(bool,bool=true){}
@@ -137,7 +139,10 @@ int main(){
     assert(closes==0);
 
     delayFnCall(0,door_command_close);now+=250;processFunctionDelay();
+    builtInTTCcountdownActive=true;builtInTTClastTick=now;
+    garage_door.builtInTTCremaining=17;garage_door.builtInTTChold=true;
     shutdown_comms();now+=1000;processFunctionDelay();
+    assert(!builtInTTCcountdownActive&&!garage_door.builtInTTCremaining&&!garage_door.builtInTTChold&&!builtInTTClastTick);
     assert(closes==0);
 
     comms_setup_done=true;
