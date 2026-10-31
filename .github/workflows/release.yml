@@ -76,7 +76,7 @@ jobs:
           python -m unittest discover -s tests -v
           node --check src/www/functions.js
           node --check src/www/logs.js
-          node --test tests/firmware-selection.test.cjs
+          node --test tests/firmware-selection.test.cjs tests/wifi-scan-polling.test.cjs
           c++ -std=c++17 -Wall -Wextra -Isrc tests/json_float.cpp -o /tmp/json-test
           /tmp/json-test
           c++ -std=c++17 -Wall -Wextra -Isrc tests/gdo_uart.cpp -o /tmp/uart-test

@@ -7,6 +7,7 @@ All notable changes to `homekit-ratgdo32` will be documented in this file. This 
 ## v1.4.6 (test candidate) - GRGDO1 reliability audit
 
 * Stream web assets and diagnostic logs without blocking the main loop or copying the full log. Retain response ownership through failed writes and cleanup.
+* Render large Wi-Fi scan pages incrementally, run HTTP rescans asynchronously, and protect scan results through page generation and network selection.
 * Preserve rapid and repeated door targets, admit complete button press/release pairs, and report physical state when commands are rejected. Keep real obstruction state during HomeKit writes.
 * Cancel stale delayed closes, partial-opening stops, and encoder corrections when newer commands replace them. Keep watchdogs tied to observed motion.
 * Remove concurrent timer callback replacement from control, heartbeat, LED, and physical pulse paths. Physical output releases remain independent of the main loop.
