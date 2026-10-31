@@ -68,6 +68,11 @@ int xQueueSendToBack(QueueHandle_t q,const PacketAction*p,int){
 std::recursive_mutex controlMutex;
 struct FunctionDelayLock {FunctionDelayLock(){controlMutex.lock();}~FunctionDelayLock(){controlMutex.unlock();}};
 struct Ticker {unsigned armed=0;void detach(){armed=0;}template<class F>void once_ms(unsigned,F){++armed;}};
+// These fixtures select Sec+ only; GPIO pulses have a separate source test.
+struct DryContactPulse {bool ready(){assert(false);return false;}bool start(){assert(false);return false;}
+ void cancel(){assert(false);}void setup(int){assert(false);}};
+DryContactPulse dryTogglePulse,dryOpenPulse,dryClosePulse;
+bool dryContactTimersReady=false;
 enum GarageDoorCurrentState{CURR_OPEN,CURR_CLOSED,CURR_OPENING,CURR_CLOSING,CURR_STOPPED};
 struct Door{GarageDoorCurrentState current_state=CURR_OPEN;int target_state=0,openDuration=10,closeDuration=10;bool pinModeObstructionSensor=false;}garage_door;
 std::atomic<bool>pendingDoorCommand{false};

@@ -93,6 +93,7 @@ void set_light(bool,bool=true){}
 void cancelPartialOpen(){}
 constexpr int BEEPER_PIN=5;
 void tone(int,int,int){}
+void cancelDryContactTimers(){} // Physical GPIO pulses are tested separately.
 void sec1_light_press(){}
 void sec1_light_release(int){}
 void sync_and_restart(){

@@ -28,6 +28,9 @@
 #include "config.h"
 #include "comms.h"
 #include "led.h"
+#ifdef ESP32
+#include <esp_timer.h>
+#endif
 
 #ifdef USE_GDOLIB
 #include "gdo.h"
@@ -175,6 +178,85 @@ inline bool txQueuePop(PacketAction *pkt)
 SoftwareSerial sw_serial;
 
 #endif // not USE_GDOLIB
+
+#if defined(ESP32) && !defined(USE_GDOLIB)
+// Stable timer callbacks only release their configured GPIO. Commands and
+// teardown are serialized by FunctionDelayLock; callbacks never take it.
+class DryContactPulse
+{
+    esp_timer_handle_t timer = nullptr;
+    int pin = -1;
+    bool attempted = false, enabled = false;
+    std::atomic<bool> pending{false};
+    static void release(void *arg)
+    {
+        auto *pulse = static_cast<DryContactPulse *>(arg);
+        digitalWrite(pulse->pin, LOW);
+        // No GPIO access after reopening admission to another command.
+        pulse->pending.store(false, std::memory_order_release);
+    }
+public:
+    bool setup(int configuredPin)
+    {
+        if (configuredPin < 0)
+            return true;
+        if (!attempted)
+        {
+            attempted = true;
+            pin = configuredPin;
+            esp_timer_create_args_t args{};
+            args.callback = release;
+            args.arg = this;
+            args.dispatch_method = ESP_TIMER_TASK;
+            args.name = "Dry contact";
+            if (esp_timer_create(&args, &timer) != ESP_OK)
+                timer = nullptr;
+        }
+        enabled = timer != nullptr && configuredPin == pin;
+        return enabled;
+    }
+    bool ready() const
+    {
+        return enabled && !pending.load(std::memory_order_acquire);
+    }
+    bool start()
+    {
+        bool expected = false;
+        if (!enabled || !pending.compare_exchange_strong(expected, true, std::memory_order_acquire))
+            return false;
+        digitalWrite(pin, HIGH);
+        if (esp_timer_start_once(timer, 500000) == ESP_OK)
+            return true;
+        digitalWrite(pin, LOW);
+        pending.store(false, std::memory_order_release);
+        return false;
+    }
+    void cancel()
+    {
+        enabled = false;
+        // A successful stop removed an unexpired timer. An already-expired
+        // callback retains admission until it has finished its LOW write.
+        const bool stopped = timer && esp_timer_stop(timer) == ESP_OK;
+        if (pin >= 0)
+            digitalWrite(pin, LOW);
+        if (stopped)
+            pending.store(false, std::memory_order_release);
+    }
+};
+static DryContactPulse dryTogglePulse;
+static bool dryContactTimersReady = false;
+
+static void setupDryContactTimers()
+{
+    dryContactTimersReady = dryTogglePulse.setup(UART_TX_PIN);
+}
+
+static void cancelDryContactTimers()
+{
+    dryContactTimersReady = false;
+    dryTogglePulse.cancel();
+}
+#endif
 
 // times in miliseconds
 #define SECPLUS1_DIGITAL_WALLPLATE_TIMEOUT 15000
@@ -790,6 +872,9 @@ void setup_comms()
     {
         ESP_LOGI(TAG, "=== Setting up comms for dry contact protocol");
         pinMode(UART_TX_PIN, OUTPUT);
+#ifdef ESP32
+        setupDryContactTimers();
+#endif
     }
     force_recover.push_count = 0;
     force_recover.enable = true;
@@ -959,6 +1044,9 @@ void shutdown_comms()
     bool wasReady;
     {
         FunctionDelayLock lock;
+#if defined(ESP32) && !defined(USE_GDOLIB)
+        cancelDryContactTimers();
+#endif
         // Cancel old work and reject new door commands before teardown starts.
         cancelFunctionDelay();
             checkDoorMoving.detach();
@@ -2720,11 +2808,18 @@ bool door_command(DoorAction action, DoorCommandLifecycle::Intent intent)
     }
     else
     {
-        // Dry contact commands (only toggle functionality, open/close/toggle/stop -> toggle)
+        // Preserve legacy toggle-only wiring for every dry-contact action.
+#ifdef ESP32
+        if (!dryContactTimersReady || !dryTogglePulse.ready())
+            return false;
+        if (!dryTogglePulse.start())
+            return false;
+#else
         // Toggle signal
         digitalWrite(UART_TX_PIN, HIGH);
         delay(500);
         digitalWrite(UART_TX_PIN, LOW);
+#endif
     }
     return true;
 }
