@@ -1,44 +1,59 @@
 #pragma once
-#include <atomic>
 #include <cstdint>
 #include <cstring>
 
-static_assert(std::atomic<uint32_t>::is_always_lock_free, "HomeKit publication requires lock-free words");
+// All producers run in task context (Arduino, HomeSpan, network event or
+// ESP timer task). Keep one explicit lock instead of implementation-hidden
+// libatomic locks. No caller may perform I/O, allocation, callbacks or nested
+// mailbox work inside this guard. The longest body reads seven request words.
+#ifdef ESP32
+#include <esp_idf_version.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/portmacro.h>
+#if ESP_IDF_VERSION_MAJOR != 5 || ESP_IDF_VERSION_MINOR != 5
+#error "Review notification critical-section adapter for this ESP-IDF version"
+#endif
+static_assert(sizeof(portMUX_TYPE) == 8, "Review notification spinlock resource budget");
+inline portMUX_TYPE homekitNotificationMux = portMUX_INITIALIZER_UNLOCKED;
+class HomekitNotificationGuard {
+public:
+    HomekitNotificationGuard() { portENTER_CRITICAL(&homekitNotificationMux); }
+    ~HomekitNotificationGuard() { portEXIT_CRITICAL(&homekitNotificationMux); }
+    HomekitNotificationGuard(const HomekitNotificationGuard &) = delete;
+    HomekitNotificationGuard &operator=(const HomekitNotificationGuard &) = delete;
+};
+#else
+#include <mutex>
+inline std::mutex homekitNotificationMux;
+class HomekitNotificationGuard {
+    std::lock_guard<std::mutex> guard{homekitNotificationMux};
+};
+#endif
 
 // Lifetime-stable state publication. Optional services never own producer handles.
 // Pulse channels retain a detected state until one consumer observes it, then
 // deliver the latest clear state. Repeated pulses may merge while polling stalls.
 class HomekitBooleanMailbox {
-    std::atomic<uint32_t> pending{0};
+    uint32_t pending = 0;
 public:
     void publish(bool value, bool preservePulse = false) {
-        if (!preservePulse) {
-            pending.store(value ? 3 : 1, std::memory_order_release);
-        } else if (value) {
-            pending.fetch_or(7, std::memory_order_release);
-        } else {
-            // Preserve a pending detection while recording the latest clear.
-            // A consumer between these operations may see a duplicate clear.
-            pending.fetch_and(~uint32_t(2), std::memory_order_acq_rel);
-            pending.fetch_or(1, std::memory_order_release);
-        }
+        HomekitNotificationGuard guard;
+        pending = 1 | (value ? 2 : 0) |
+                  (preservePulse ? ((pending & 4) | (value ? 4 : 0)) : 0);
     }
-    // A new/recreated service starts from current state, rather than replaying
-    // detections accumulated before it existed. New publications after this
-    // boundary keep their normal pulse behavior.
+    // Recreated services start from current state, rather than replaying
+    // detections accumulated before this observation boundary.
     void beginObservation() {
-        pending.fetch_and(~uint32_t(4), std::memory_order_acq_rel);
-        pending.fetch_or(1, std::memory_order_release);
+        HomekitNotificationGuard guard;
+        pending = (pending & ~uint32_t(4)) | 1;
     }
     bool take(bool &value) {
-        uint32_t old = pending.load(std::memory_order_acquire);
-        while (old & 1) {
-            value = old & (4 | 2);
-            const uint32_t next = (old & 2) | ((old & 4) && !(old & 2) ? 1 : 0);
-            if (pending.compare_exchange_weak(old, next, std::memory_order_acq_rel,
-                                            std::memory_order_acquire)) return true;
-        }
-        return false;
+        HomekitNotificationGuard guard;
+        const uint32_t old = pending;
+        if (!(old & 1)) return false;
+        value = old & (4 | 2);
+        pending = (old & 2) | ((old & 4) && !(old & 2) ? 1 : 0);
+        return true;
     }
 };
 
@@ -46,16 +61,22 @@ public:
 // sample; callers already reject NaN sensor readings before publishing.
 class HomekitFloatMailbox {
     static constexpr uint32_t Empty = 0x7fc00000;
-    std::atomic<uint32_t> pending{Empty};
+    uint32_t pending = Empty;
 public:
     void publish(float value) {
         uint32_t bits;
         static_assert(sizeof(bits) == sizeof(value), "32-bit float required");
         std::memcpy(&bits, &value, sizeof(bits));
-        pending.store(bits, std::memory_order_release);
+        HomekitNotificationGuard guard;
+        pending = bits;
     }
     bool take(float &value) {
-        uint32_t bits = pending.exchange(Empty, std::memory_order_acq_rel);
+        uint32_t bits;
+        {
+            HomekitNotificationGuard guard;
+            bits = pending;
+            pending = Empty;
+        }
         if (bits == Empty) return false;
         std::memcpy(&value, &bits, sizeof(bits));
         return true;
@@ -70,18 +91,23 @@ enum class HomekitService : uint8_t {
 };
 
 class HomekitServiceRequests {
-    std::atomic<uint32_t> pending[static_cast<unsigned>(HomekitService::Count)]{};
+    uint32_t pending[static_cast<unsigned>(HomekitService::Count)]{};
 public:
     bool hasPending() const {
+        HomekitNotificationGuard guard;
         for (const auto &request : pending)
-            if (request.load(std::memory_order_acquire)) return true;
+            if (request) return true;
         return false;
     }
     void publish(HomekitService service, bool enable) {
-        pending[static_cast<unsigned>(service)].store(enable ? 2 : 1, std::memory_order_release);
+        HomekitNotificationGuard guard;
+        pending[static_cast<unsigned>(service)] = enable ? 2 : 1;
     }
     bool take(HomekitService service, bool &enable) {
-        const auto value = pending[static_cast<unsigned>(service)].exchange(0, std::memory_order_acq_rel);
+        HomekitNotificationGuard guard;
+        auto &request = pending[static_cast<unsigned>(service)];
+        const auto value = request;
+        request = 0;
         enable = value == 2;
         return value != 0;
     }

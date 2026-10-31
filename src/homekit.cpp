@@ -19,6 +19,9 @@
 #include <ESP8266WiFi.h>
 #endif // ESP8266
 
+// Shared lifecycle flags use atomic load/store separately from mailbox storage.
+#include <atomic>
+
 // RATGDO project includes
 #include "ratgdo.h"
 #include "runtime_diagnostics.h"
