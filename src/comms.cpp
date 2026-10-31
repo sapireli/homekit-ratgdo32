@@ -3062,7 +3062,12 @@ void processFunctionDelay()
 {
     FunctionDelayLock lock;
     const _millis_t now = _millis();
-    if (!functionDelayPending || now < functionDelayNextTick)
+#ifdef ESP8266
+    const bool waiting = static_cast<int32_t>(now - functionDelayNextTick) < 0;
+#else
+    const bool waiting = now < functionDelayNextTick;
+#endif
+    if (!functionDelayPending || waiting)
         return;
     // Run delayed actions only from the communications loop. A Ticker
     // callback can outlive detach() and its captured std::function storage.
