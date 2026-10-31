@@ -27,7 +27,7 @@
 static const char *TAG = "ratgdo-serialCLI";
 
 // forward declarations
-uint32_t scanWifi(bool uniqueSSID);
+uint32_t scanWifi(bool uniqueSSID, WifiScanResults &results);
 bool areYouSure(const char *txt);
 
 // Serial Command Line Interface
@@ -262,7 +262,10 @@ void serialCLI(char cmd)
 
     case 'W':
     {
-        uint32_t count = scanWifi(true);
+        WifiScanResults results;
+        uint32_t count = scanWifi(true, results);
+        if (count == UINT32_MAX)
+            break;
         if (count == 0)
         {
             Serial.printf_P(PSTR("No networks found!\n"));
@@ -342,7 +345,10 @@ void serialCLI(char cmd)
 
     case 'Z':
     {
-        uint32_t count = scanWifi(false);
+        WifiScanResults results;
+        uint32_t count = scanWifi(false, results);
+        if (count == UINT32_MAX)
+            break;
         if (count == 0)
         {
             Serial.printf_P(PSTR("No networks found!\n"));
@@ -394,17 +400,23 @@ bool areYouSure(const char *txt)
     return (confirm.equalsIgnoreCase("Y") || confirm.equalsIgnoreCase("YES"));
 }
 
-uint32_t scanWifi(bool uniqueSSID)
+uint32_t scanWifi(bool uniqueSSID, WifiScanResults &results)
 {
     String currentSSID = "";
     int32_t count = 0;
     bool saved = suppressSerialLog;
     suppressSerialLog = true;
     Serial.printf_P(PSTR("Scanning WiFi Networks...\n"));
-    wifi_scan();
+    if (!results.scan())
+    {
+        Serial.printf_P(PSTR("WiFi scan busy or failed; retry later.\n"));
+        suppressSerialLog = saved;
+        return UINT32_MAX;
+    }
     if (wifiNets.size() == 0)
     {
         Serial.printf_P(PSTR("No networks found!\n"));
+        suppressSerialLog = saved;
         return 0;
     }
     else

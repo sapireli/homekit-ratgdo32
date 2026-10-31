@@ -162,14 +162,15 @@ static void storeWifiScanResults(int nNets)
     }
 }
 
-void wifi_scan()
+bool wifi_scan(bool retainResults)
 {
 #if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
     bool expected = false;
     if (!wifiScanOwned.compare_exchange_strong(expected, true))
     {
-        wifiScanPending = true;
-        return;
+        if (!retainResults)
+            wifiScanPending = true;
+        return false;
     }
     wifiScanPending = false;
 #endif
@@ -179,6 +180,17 @@ void wifi_scan()
     WiFi.scanDelete();
 #if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
     wifiScanFailed = count < 0;
+    if (!retainResults || count < 0)
+        wifiScanOwned = false;
+#else
+    (void)retainResults;
+#endif
+    return count >= 0;
+}
+
+void release_wifi_scan_results()
+{
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
     wifiScanOwned = false;
 #endif
 }
@@ -395,8 +407,10 @@ void handle_rescan()
         wifiScanPending = true;
     server.send_P(202, type_txt, "Scan pending.");
 #else
-    wifi_scan();
-    server.send_P(200, type_txt, "Scan complete.");
+    if (wifi_scan())
+        server.send_P(200, type_txt, "Scan complete.");
+    else
+        server.send_P(503, type_txt, "WiFi scan failed.");
 #endif
 }
 
