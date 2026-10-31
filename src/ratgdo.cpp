@@ -161,6 +161,12 @@ void setup()
     tone(BEEPER_PIN, 1300, 500);
 #endif
 #endif // ESP32
+    // Arduino has initialized esp_timer before setup(). Create stable handles
+    // before GDO communications or the HomeSpan task can request a flash.
+    led.setupFlashTimer();
+#ifdef RATGDO32_DISCO
+    laser.setupFlashTimer();
+#endif
     // led on during setup
     led.on();
     ESP_LOGI(TAG, "=== Starting RATGDO Homekit version %s", AUTO_VERSION);
