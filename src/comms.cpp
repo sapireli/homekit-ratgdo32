@@ -28,6 +28,7 @@
 #include "led.h"
 #ifdef ESP32
 #include <freertos/semphr.h>
+#include <esp_timer.h>
 #endif
 
 #ifdef USE_GDOLIB
@@ -178,6 +179,90 @@ inline bool txQueuePop(PacketAction *pkt)
 SoftwareSerial sw_serial;
 
 #endif // not USE_GDOLIB
+
+#if defined(ESP32) && !defined(USE_GDOLIB)
+// Stable timer callbacks only release their configured GPIO. Commands and
+// teardown are serialized by FunctionDelayLock; callbacks never take it.
+class DryContactPulse
+{
+    esp_timer_handle_t timer = nullptr;
+    int pin = -1;
+    bool attempted = false, enabled = false;
+    std::atomic<bool> pending{false};
+    static void release(void *arg)
+    {
+        auto *pulse = static_cast<DryContactPulse *>(arg);
+        digitalWrite(pulse->pin, LOW);
+        // No GPIO access after reopening admission to another command.
+        pulse->pending.store(false, std::memory_order_release);
+    }
+public:
+    bool setup(int configuredPin)
+    {
+        if (configuredPin < 0)
+            return true;
+        if (!attempted)
+        {
+            attempted = true;
+            pin = configuredPin;
+            esp_timer_create_args_t args{};
+            args.callback = release;
+            args.arg = this;
+            args.dispatch_method = ESP_TIMER_TASK;
+            args.name = "Dry contact";
+            if (esp_timer_create(&args, &timer) != ESP_OK)
+                timer = nullptr;
+        }
+        enabled = timer != nullptr && configuredPin == pin;
+        return enabled;
+    }
+    bool ready() const
+    {
+        return enabled && !pending.load(std::memory_order_acquire);
+    }
+    bool start()
+    {
+        bool expected = false;
+        if (!enabled || !pending.compare_exchange_strong(expected, true, std::memory_order_acquire))
+            return false;
+        digitalWrite(pin, HIGH);
+        if (esp_timer_start_once(timer, 500000) == ESP_OK)
+            return true;
+        digitalWrite(pin, LOW);
+        pending.store(false, std::memory_order_release);
+        return false;
+    }
+    void cancel()
+    {
+        enabled = false;
+        // A successful stop removed an unexpired timer. An already-expired
+        // callback retains admission until it has finished its LOW write.
+        const bool stopped = timer && esp_timer_stop(timer) == ESP_OK;
+        if (pin >= 0)
+            digitalWrite(pin, LOW);
+        if (stopped)
+            pending.store(false, std::memory_order_release);
+    }
+};
+static DryContactPulse dryTogglePulse, dryOpenPulse, dryClosePulse;
+static bool dryContactTimersReady = false;
+
+static void setupDryContactTimers()
+{
+    const bool toggle = dryTogglePulse.setup(UART_TX_PIN);
+    const bool open = dryOpenPulse.setup(DISCRETE_OPEN_PIN);
+    const bool close = dryClosePulse.setup(DISCRETE_CLOSE_PIN);
+    dryContactTimersReady = toggle && open && close;
+}
+
+static void cancelDryContactTimers()
+{
+    dryContactTimersReady = false;
+    dryTogglePulse.cancel();
+    dryOpenPulse.cancel();
+    dryClosePulse.cancel();
+}
+#endif
 
 // times in miliseconds
 #define SECPLUS1_DIGITAL_WALLPLATE_TIMEOUT 15000
@@ -860,6 +945,9 @@ void setup_comms()
         digitalWrite(DISCRETE_OPEN_PIN, LOW);
         pinMode(DISCRETE_CLOSE_PIN, OUTPUT);
         digitalWrite(DISCRETE_CLOSE_PIN, LOW);
+#ifdef ESP32
+        setupDryContactTimers();
+#endif
     }
     force_recover.push_count = 0;
     force_recover.enable = true;
@@ -1030,6 +1118,9 @@ void shutdown_comms()
     bool wasReady;
     {
         FunctionDelayLock lock;
+#if defined(ESP32) && !defined(USE_GDOLIB)
+        cancelDryContactTimers();
+#endif
         // Cancel old work and reject new door commands before teardown starts.
         cancelFunctionDelay();
         cancelPartialOpen();
@@ -2878,9 +2969,11 @@ bool door_command(DoorAction action, DoorCommandLifecycle::Intent intent)
     else
     {
         // Dry contact commands
+#ifndef ESP32
         static Ticker discreteOpenTimer = Ticker();
         static Ticker discreteCloseTimer = Ticker();
         static Ticker toggleTimer = Ticker();
+#endif
 
         if (action == DoorAction::Open && garage_door.current_state == GarageDoorCurrentState::CURR_OPEN)
         {
@@ -2893,6 +2986,29 @@ bool door_command(DoorAction action, DoorCommandLifecycle::Intent intent)
             return false;
         }
 
+#ifdef ESP32
+        DryContactPulse *discrete = nullptr;
+        if (action == DoorAction::Open && DISCRETE_OPEN_PIN >= 0)
+            discrete = &dryOpenPulse;
+        else if (action == DoorAction::Close && DISCRETE_CLOSE_PIN >= 0)
+            discrete = &dryClosePulse;
+        // Both outputs must be available before either one can be asserted.
+        // Active pulses keep their original 500 ms release deadline.
+        if (!dryContactTimersReady || !dryTogglePulse.ready() || (discrete && !discrete->ready()))
+            return false;
+        if (discrete && !discrete->start())
+            return false;
+        if (!dryTogglePulse.start())
+        {
+            if (discrete)
+            {
+                discrete->cancel();
+                // Restore availability after rollback without allocating.
+                discrete->setup(action == DoorAction::Open ? DISCRETE_OPEN_PIN : DISCRETE_CLOSE_PIN);
+            }
+            return false;
+        }
+#else
         if (action == DoorAction::Open)
         {
             // Discrete open control
@@ -2915,6 +3031,7 @@ bool door_command(DoorAction action, DoorCommandLifecycle::Intent intent)
         digitalWrite(UART_TX_PIN, HIGH);
         toggleTimer.once_ms(500, []()
                             { digitalWrite(UART_TX_PIN, LOW); });
+#endif
     }
     return true;
 }
