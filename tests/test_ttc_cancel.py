@@ -114,7 +114,10 @@ bool door_command(DoorAction){return true;}
 ''' + (SOURCE.parent / "door_command_lifecycle.h").read_text().replace("#pragma once", "") + r'''
 DoorCommandLifecycle doorLifecycle;
 bool pendingDoorCommand=false;
+GarageDoorCurrentState rejectDoorCommand(){return garage_door.current_state;}
+bool startDoorOpenCommand(){return true;}
 bool requestPendingDoorIntent(DoorCommandLifecycle::Intent){return false;}
+bool door_command(DoorAction,DoorCommandLifecycle::Intent){return true;}
 ''' + helpers + functions + r'''
 int main(){
     delayFnCall(0,door_command_close);
