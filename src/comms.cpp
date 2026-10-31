@@ -574,19 +574,19 @@ bool requestPendingDoorIntent(DoorCommandLifecycle::Intent intent)
     if (doorControlType == DOOR_CONTROL_DRY_CONTACT)
         return false;
     const bool wasPending = doorLifecycle.pending();
-    if (wasPending)
+    const bool handled = doorLifecycle.request(intent, static_cast<uint32_t>(_millis()));
+    if (wasPending && !doorLifecycle.keepsQueuedTarget(intent))
     {
         stopSentClosePending = 0;
         stopSentOpenPending = 0;
     }
-    const bool deferred = doorLifecycle.request(intent, static_cast<uint32_t>(_millis()));
     pendingDoorCommand = doorLifecycle.pending();
     if (wasPending && !pendingDoorCommand)
     {
         checkDoorMoving.detach();
         checkDoorCompleted.detach();
     }
-    return deferred;
+    return handled;
 }
 void markDoorPacketWriting()
 {
@@ -604,7 +604,7 @@ void markDoorPacketWriting()
 
 // prototypes
 bool process_PacketAction(PacketAction &pkt_ac);
-bool door_command(DoorAction action);
+bool door_command(DoorAction action, DoorCommandLifecycle::Intent intent = DoorCommandLifecycle::Intent::None);
 void door_command_open();
 void door_command_close();
 bool transmitSec1(byte toSend);
@@ -2812,7 +2812,7 @@ bool process_PacketAction(PacketAction &pkt_ac)
     return sent;
 }
 
-bool door_command(DoorAction action)
+bool door_command(DoorAction action, DoorCommandLifecycle::Intent intent)
 {
     FunctionDelayLock lock;
     if (!comms_setup_done)
@@ -2837,7 +2837,7 @@ bool door_command(DoorAction action)
         Packet pkt = Packet(PacketCommand::DoorAction, data, id_code);
         PacketAction pkt_ac = {pkt, false, 0};
         PacketAction sequence[2] = {pkt_ac, pkt_ac};
-        const uint32_t generation = doorLifecycle.begin(static_cast<int>(garage_door.current_state), static_cast<uint32_t>(_millis()));
+        const uint32_t generation = doorLifecycle.begin(static_cast<int>(garage_door.current_state), static_cast<uint32_t>(_millis()), intent);
         sequence[0].doorGeneration = generation;
         sequence[0].doorPress = true;
 
@@ -2949,40 +2949,49 @@ void processPendingDoorIntent()
 
 #endif // not USE_GDOLIB
 
-void door_command_close()
+GarageDoorCurrentState rejectDoorCommand()
+{
+    FunctionDelayLock lock;
+    notify_homekit_current_door_state_change(garage_door.current_state);
+    notify_homekit_target_door_state_change(garage_door.target_state);
+    return garage_door.current_state;
+}
+
+bool startDoorCloseCommand()
 {
     FunctionDelayLock lock;
     if (!comms_setup_done)
-        return;
+        return false;
     // cancel partial open
     cancelPartialOpen();
 
 #ifdef USE_GDOLIB
-    gdo_door_close();
+    if (gdo_door_close() != ESP_OK)
+        return false;
 #else
     if ((doorControlType == DOOR_CONTROL_DRY_CONTACT) || (garage_door.pinModeObstructionSensor && !userConfig->getUseToggle()))
     {
         ESP_LOGD(TAG, "Closing door");
-        if (!door_command(DoorAction::Close))
-            return;
+        if (!door_command(DoorAction::Close, DoorCommandLifecycle::Intent::Close))
+            return false;
     }
     else
     {
         ESP_LOGD(TAG, "Toggle from current state: %s, target state: %s", DOOR_STATE(garage_door.current_state), DOOR_STATE(garage_door.target_state));
         if (garage_door.current_state == GarageDoorCurrentState::CURR_OPEN)
         {
-            if (!door_command(DoorAction::Toggle))
-                return;
+            if (!door_command(DoorAction::Toggle, DoorCommandLifecycle::Intent::Close))
+                return false;
         }
         else if (garage_door.current_state == GarageDoorCurrentState::CURR_STOPPED)
         {
-            if (!door_command(DoorAction::Toggle))
-                return;
+            if (!door_command(DoorAction::Toggle, DoorCommandLifecycle::Intent::Close))
+                return false;
         }
         else
         {
             ESP_LOGI(TAG, "Ignoring close request for current and target state");
-            return;
+            return false;
         }
     }
 
@@ -3017,7 +3026,13 @@ void door_command_close()
                                 if (!wpDisconnectOnTx && (doorControlType != DOOR_CONTROL_DRY_CONTACT))
                                     write_status_pin(STATUS_DOOR_PIN, garage_door.current_state == GarageDoorCurrentState::CURR_CLOSED ? LOW : HIGH); });
 #endif
-    return;
+    return true;
+}
+
+void door_command_close()
+{
+    if (!startDoorCloseCommand())
+        rejectDoorCommand();
 }
 
 bool startDoorOpenCommand()
@@ -3036,7 +3051,7 @@ bool startDoorOpenCommand()
     if (gdo_door_open() != ESP_OK)
         return false;
 #else
-    if (!door_command(DoorAction::Open))
+    if (!door_command(DoorAction::Open, DoorCommandLifecycle::Intent::Open))
         return false;
 
     if (doorControlType == DOOR_CONTROL_SEC_PLUS_V2 && garage_door.openDuration > 0)
@@ -3075,7 +3090,8 @@ bool startDoorOpenCommand()
 
 void door_command_open()
 {
-    startDoorOpenCommand();
+    if (!startDoorOpenCommand())
+        rejectDoorCommand();
 }
 
 GarageDoorCurrentState open_door()
@@ -3085,7 +3101,7 @@ GarageDoorCurrentState open_door()
     cancel_encoder_correction();
 #endif
     if (!comms_setup_done)
-        return garage_door.current_state;
+        return rejectDoorCommand();
 #ifndef USE_GDOLIB
     if (requestPendingDoorIntent(DoorCommandLifecycle::Intent::Open))
         return garage_door.current_state;
@@ -3117,11 +3133,13 @@ GarageDoorCurrentState open_door()
     {
         ESP_LOGI(TAG, "Door is closing; do stop");
 #ifdef USE_GDOLIB
-        gdo_door_stop();
+        if (gdo_door_stop() != ESP_OK)
+            return rejectDoorCommand();
 #else
         checkDoorMoving.detach();
         checkDoorCompleted.detach();
-        door_command(DoorAction::Stop);
+        if (!door_command(DoorAction::Stop, DoorCommandLifecycle::Intent::Open))
+            return rejectDoorCommand();
 #endif
         if (userConfig->getReverseOnStop())
         {
@@ -3134,11 +3152,12 @@ GarageDoorCurrentState open_door()
         }
         return GarageDoorCurrentState::CURR_STOPPED;
     }
+    if (!startDoorOpenCommand())
+        return rejectDoorCommand();
 #ifdef RATGDO_ENCODER
     if (encoder_enabled)
         encoder_set_intended_open();
 #endif
-    door_command_open();
     return GarageDoorCurrentState::CURR_OPENING;
 }
 
@@ -3149,7 +3168,7 @@ GarageDoorCurrentState stop_door()
     cancel_encoder_correction();
 #endif
     if (!comms_setup_done)
-        return garage_door.current_state;
+        return rejectDoorCommand();
 #ifndef USE_GDOLIB
     if (requestPendingDoorIntent(DoorCommandLifecycle::Intent::Stop))
         return garage_door.current_state;
@@ -3166,11 +3185,13 @@ GarageDoorCurrentState stop_door()
 
     ESP_LOGI(TAG, "Door is moving; do stop");
 #ifdef USE_GDOLIB
-    gdo_door_stop();
+    if (gdo_door_stop() != ESP_OK)
+        return rejectDoorCommand();
 #else
     checkDoorMoving.detach();
     checkDoorCompleted.detach();
-    door_command(DoorAction::Stop);
+    if (!door_command(DoorAction::Stop, DoorCommandLifecycle::Intent::Stop))
+        return rejectDoorCommand();
 #endif
 
     return GarageDoorCurrentState::CURR_STOPPED;
@@ -3396,7 +3417,7 @@ GarageDoorCurrentState close_door(bool bypass_ttc)
     cancel_encoder_correction();
 #endif
     if (!comms_setup_done)
-        return garage_door.current_state;
+        return rejectDoorCommand();
 #ifndef USE_GDOLIB
     if (requestPendingDoorIntent(DoorCommandLifecycle::Intent::Close))
         return garage_door.current_state;
@@ -3416,11 +3437,13 @@ GarageDoorCurrentState close_door(bool bypass_ttc)
     {
         ESP_LOGI(TAG, "Door already opening; do stop");
 #ifdef USE_GDOLIB
-        gdo_door_stop();
+        if (gdo_door_stop() != ESP_OK)
+            return rejectDoorCommand();
 #else
         checkDoorMoving.detach();
         checkDoorCompleted.detach();
-        door_command(DoorAction::Stop);
+        if (!door_command(DoorAction::Stop, DoorCommandLifecycle::Intent::Close))
+            return rejectDoorCommand();
 #endif
         if (userConfig->getReverseOnStop())
         {
@@ -3449,11 +3472,12 @@ GarageDoorCurrentState close_door(bool bypass_ttc)
             ESP_LOGD(TAG, "Bypassing time-to-close delay");
         }
         ESP_LOGD(TAG, "Closing door");
+        if (!startDoorCloseCommand())
+            return rejectDoorCommand();
 #ifdef RATGDO_ENCODER
         if (encoder_enabled)
             encoder_set_intended_close();
 #endif
-        door_command_close();
     }
     else
     {
@@ -3522,7 +3546,7 @@ GarageDoorCurrentState toggle_door(bool bypass_ttc)
         ESP_LOGI(TAG, "Bypassing time-to-close delay for hardwired toggle");
     }
 
-    door_command(DoorAction::Toggle);
+    door_command(DoorAction::Toggle, DoorCommandLifecycle::Intent::Toggle);
     return garage_door.current_state;
 }
 #endif

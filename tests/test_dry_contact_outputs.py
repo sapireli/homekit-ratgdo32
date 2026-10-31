@@ -26,7 +26,7 @@ class DryContactOutputs(unittest.TestCase):
             "inline void write_status_pin(", "inline void setup_status_pin(",
             "inline void configure_dry_contact_output("])
         source = (ROOT / "src/comms.cpp").read_text()
-        start = source.index("        // Dry contact commands\n", source.index("bool door_command(DoorAction action)\n{"))
+        start = source.index("        // Dry contact commands\n", source.index("bool door_command(DoorAction action, DoorCommandLifecycle::Intent intent)\n{"))
         end = source.index("\n    }\n    return true;", start)
         command = source[start:end]
         harness = r'''
