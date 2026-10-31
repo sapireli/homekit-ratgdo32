@@ -17,6 +17,7 @@
 
 // Arduino includes
 #include <Ticker.h>
+#include <atomic>
 
 // RATGDO project includes
 #include "ratgdo.h"
@@ -26,6 +27,7 @@
 #include "comms.h"
 #include "led.h"
 #ifdef ESP32
+#include <freertos/semphr.h>
 #include "gdo_uart.h"
 #endif
 
@@ -175,6 +177,49 @@ static uint32_t TTCiterations = 0;
 static _millis_t TTCendTime = 0;
 static Ticker TTCtimer = Ticker();
 static Ticker callbackDelay = Ticker();
+#ifdef ESP32
+static StaticSemaphore_t functionDelayMutexStorage;
+static SemaphoreHandle_t functionDelayMutex()
+{
+    static SemaphoreHandle_t mutex = xSemaphoreCreateRecursiveMutexStatic(&functionDelayMutexStorage);
+    return mutex;
+}
+#endif
+
+// Cancel/replacement and final callback acceptance use the same lock. It is
+// recursive because a delayed door command may cancel another delayed action.
+class FunctionDelayLock
+{
+public:
+    FunctionDelayLock()
+    {
+#ifdef ESP32
+        xSemaphoreTakeRecursive(functionDelayMutex(), portMAX_DELAY);
+#endif
+    }
+    ~FunctionDelayLock()
+    {
+#ifdef ESP32
+        xSemaphoreGiveRecursive(functionDelayMutex());
+#endif
+    }
+};
+// The low bit remains set through the final callback delay. A generation
+// prevents an already-dispatched callback from surviving cancellation/reuse.
+static std::atomic<uint32_t> functionDelayGeneration{0};
+
+bool functionDelayActive()
+{
+    return (functionDelayGeneration.load() & 1u) != 0;
+}
+
+void cancelFunctionDelay()
+{
+    FunctionDelayLock lock;
+    functionDelayGeneration.fetch_and(~1u);
+    TTCtimer.detach();
+    callbackDelay.detach();
+}
 static Ticker checkDoorMoving = Ticker();
 static Ticker checkDoorCompleted = Ticker();
 bool TTCwasLightOn = false;
@@ -828,6 +873,8 @@ void setup_comms()
  */
 void shutdown_comms()
 {
+    // A timer must not issue a delayed close after communications shut down.
+    cancelFunctionDelay();
 #ifdef ESP32
     // Disconnect the UART before teardown can block or flush any pending bytes.
     quiesce_gdo_tx();
@@ -1026,6 +1073,7 @@ inline void handle_protocol_door_state(GarageDoorCurrentState state)
 
 void update_door_state(GarageDoorCurrentState current_state)
 {
+    FunctionDelayLock lock;
     static _millis_t start_opening = 0;
     static _millis_t start_closing = 0;
     _millis_t now = _millis();
@@ -1065,10 +1113,10 @@ void update_door_state(GarageDoorCurrentState current_state)
     {
     case GarageDoorCurrentState::CURR_CLOSING:
         // If we are in a time-to-close delay timeout, cancel the timeout
-        if (TTCtimer.active())
+        if (functionDelayActive())
         {
             ESP_LOGI(TAG, "Door closing, canceling TTC delay timer");
-            TTCtimer.detach();
+            cancelFunctionDelay();
             // This will force us to send current state to browser, so it reports correct state.
             last_reported_garage_door.current_state = (GarageDoorCurrentState)0xFF;
         }
@@ -1472,7 +1520,7 @@ void sec1_process_message(uint8_t key, uint8_t value = 0xFF)
 
         static uint8_t prevLightLock = 0xFF;  // for two-in-a-row detection
         static uint8_t lastLightState = 0xff; // for change detection
-        if (TTCtimer.active())
+        if (functionDelayActive())
         {
             // As we flash lights during TTC delay, avoid lots of updates to clients
             ESP_LOGV(TAG, "Ignoring light/lock status change during time-to-close delay");
@@ -2788,12 +2836,13 @@ void door_command_open()
 
 GarageDoorCurrentState open_door()
 {
-    if (TTCtimer.active())
+    FunctionDelayLock lock;
+    if (functionDelayActive())
     {
         // We are in a time-to-close delay timeout.
         // Effect of open is to cancel the timeout (leaving door open)
         ESP_LOGI(TAG, "Door assumed to be open, canceling TTC delay timer");
-        TTCtimer.detach();
+        cancelFunctionDelay();
         // Reset light to state it was at before delay start.
         set_light(TTCwasLightOn);
         // This will force us to send current state to browser, so it reports correct state.
@@ -2841,6 +2890,7 @@ GarageDoorCurrentState open_door()
 
 GarageDoorCurrentState stop_door()
 {
+    FunctionDelayLock lock;
 
     if (!(garage_door.current_state == GarageDoorCurrentState::CURR_CLOSING || garage_door.current_state == GarageDoorCurrentState::CURR_OPENING))
     {
@@ -2940,8 +2990,11 @@ GarageDoorCurrentState open_door_partial(int timePercentage)
     return garage_door.current_state;
 }
 
-void TTCtimerFn(void (*callback)(), bool light, bool sound)
+void TTCtimerFn(void (*callback)(), bool light, bool sound, uint32_t generation)
 {
+    FunctionDelayLock lock;
+    if (functionDelayGeneration.load() != generation)
+        return;
     if (TTCiterations > 0)
     {
         // dry contact cannot control lights
@@ -2985,11 +3038,12 @@ void TTCtimerFn(void (*callback)(), bool light, bool sound)
         }
 #endif
         // delay so that set_light() can do its thing
-        callbackDelay.once_ms(TTCinterval * 2, [callback]()
+        callbackDelay.once_ms(TTCinterval * 2, [callback, generation]()
                               {
 #ifdef ESP8266
-                                  schedule_recurrent_function_us([callback]()
+                                  schedule_recurrent_function_us([callback, generation]()
                                                                  {
+                                                                     FunctionDelayLock lock;
                                                                      if (callback == sync_and_restart)
                                                                          ESP_LOGI(TAG, "Calling delayed function: sync_and_restart()");
                                                                      else if (callback == door_command_close)
@@ -2997,12 +3051,14 @@ void TTCtimerFn(void (*callback)(), bool light, bool sound)
                                                                      else
                                                                          ESP_LOGI(TAG, "Calling delayed function at: 0x%08lX", (uint32_t)callback);
 
-                                                                     if (callback)
+                                                                     uint32_t expected = generation;
+                                                                     if (functionDelayGeneration.compare_exchange_strong(expected, generation & ~1u) && callback)
                                                                          callback();
                                                                      return false; // run the fn only once
                                                                  },
                                                                  0); // zero micro seconds (run asap)
 #else
+                                  FunctionDelayLock lock;
                                   if (callback == sync_and_restart)
                                       ESP_LOGI(TAG, "Calling delayed function: sync_and_restart()");
                                   else if (callback == door_command_close)
@@ -3010,7 +3066,8 @@ void TTCtimerFn(void (*callback)(), bool light, bool sound)
                                   else
                                       ESP_LOGI(TAG, "Calling delayed function at: 0x%08lX", (uint32_t)callback);
 
-                                  if (callback)
+                                  uint32_t expected = generation;
+                                  if (functionDelayGeneration.compare_exchange_strong(expected, generation & ~1u) && callback)
                                       callback();
 #endif
                               });
@@ -3020,34 +3077,41 @@ void TTCtimerFn(void (*callback)(), bool light, bool sound)
 // Call function after ms milliseconds during which we flash and beep
 void delayFnCall(uint32_t ms, void (*callback)())
 {
+    FunctionDelayLock lock;
     bool light = userConfig->getTTClight(); // Whether to flash light during delay
 #ifdef RATGDO32_DISCO
     bool sound = userConfig->getTTCsound(); // Whether to beep during delay
 #else
     bool sound = false; // No sound option for non-disco boards
 #endif
-    TTCtimer.detach();                 // Terminate existing timer if any
+    cancelFunctionDelay();
+    uint32_t previous = functionDelayGeneration.load(), generation;
+    do
+    {
+        generation = (previous + 2u) | 1u;
+    } while (!functionDelayGeneration.compare_exchange_weak(previous, generation));
     TTCiterations = ms / TTCinterval;  // Number of times to go through loop
     TTCwasLightOn = garage_door.light; // Current state of light
     ESP_LOGI(TAG, "Start function delay timer for %lums (%d iterations)", ms, TTCiterations);
     TTCendTime = _millis() + (_millis_t)ms;
-    TTCtimer.attach_ms(TTCinterval, [callback, light, sound]()
+    TTCtimer.attach_ms(TTCinterval, [callback, light, sound, generation]()
                        {
 #ifdef ESP8266
-                           schedule_recurrent_function_us([callback, light, sound]()
+                           schedule_recurrent_function_us([callback, light, sound, generation]()
                                                           {
-                                                              TTCtimerFn(callback, light, sound);
+                                                              TTCtimerFn(callback, light, sound, generation);
                                                               return false; // run the fn only once
                                                           },
                                                           0); // zero micro seconds (run asap)
 #else
-                           TTCtimerFn(callback, light, sound);
+                           TTCtimerFn(callback, light, sound, generation);
 #endif
                        });
 }
 
 GarageDoorCurrentState close_door(bool bypass_ttc)
 {
+    FunctionDelayLock lock;
     if (garage_door.current_state == GarageDoorCurrentState::CURR_CLOSED || garage_door.current_state == GarageDoorCurrentState::CURR_CLOSING)
     {
         ESP_LOGD(TAG, "Door already %s; ignored request", DOOR_STATE(garage_door.current_state));
@@ -3080,10 +3144,10 @@ GarageDoorCurrentState close_door(bool bypass_ttc)
         return GarageDoorCurrentState::CURR_STOPPED;
     }
 
-    if (bypass_ttc && TTCtimer.active())
+    if (bypass_ttc && functionDelayActive())
     {
         ESP_LOGD(TAG, "Canceling running TTC delay timer");
-        TTCtimer.detach();
+        cancelFunctionDelay();
         set_light(TTCwasLightOn);
     }
 
@@ -3103,13 +3167,13 @@ GarageDoorCurrentState close_door(bool bypass_ttc)
     }
     else
     {
-        if (TTCtimer.active())
+        if (functionDelayActive())
         {
             // We are in a time-to-close delay timeout, cancel the timeout
             ESP_LOGD(TAG, "Door in time-to-close delay, request to close ignored, TTC will continue");
             /* two closes in-a-row shoud not cancel TTC? Require an open request to cancel TTC
             ESP_LOGI(TAG, "Close: Canceling TTC delay timer");
-            TTCtimer.detach();
+            cancelFunctionDelay();
             // Reset light to state it was at before delay start.
             set_light(TTCwasLightOn);
             return GarageDoorCurrentState::CURR_OPEN;
@@ -3138,6 +3202,7 @@ GarageDoorCurrentState close_door(bool bypass_ttc)
 #if defined(ESP8266) || !defined(USE_GDOLIB)
 GarageDoorCurrentState toggle_door(bool bypass_ttc)
 {
+    FunctionDelayLock lock;
     ESP_LOGI(TAG, "Toggling door via hardwired control");
     if (doorControlType == DOOR_CONTROL_DRY_CONTACT)
     {
@@ -3145,10 +3210,10 @@ GarageDoorCurrentState toggle_door(bool bypass_ttc)
         return garage_door.current_state;
     }
 
-    if (TTCtimer.active())
+    if (functionDelayActive())
     {
         ESP_LOGI(TAG, "Canceling TTC delay timer prior to toggle");
-        TTCtimer.detach();
+        cancelFunctionDelay();
         set_light(TTCwasLightOn);
     }
 
@@ -3482,7 +3547,7 @@ void manual_recovery()
         return;
 
     // Don't check for manual recovery if in midst of a time-to-close delay
-    if (TTCtimer.active())
+    if (functionDelayActive())
         return;
 
     // Increment counter every time button is pushed.  If we hit 5 in 3 seconds,
@@ -3510,7 +3575,8 @@ void manual_recovery()
 
 uint32_t is_ttc_active()
 {
-    if (!TTCtimer.active())
+    FunctionDelayLock lock;
+    if (!functionDelayActive())
         return 0;
     // return number of seconds remaining in the time-to-close timer
     return (uint32_t)std::max((int32_t)1, (int32_t)((TTCendTime + 1000 - _millis()) / 1000));
