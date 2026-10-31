@@ -1,5 +1,11 @@
 # Major resource refactor handoff
 
+## Parked by user decision, 2026-10-31
+
+Preserve this branch. Active work is limited to observed failures and small fixes with strong evidence of serious impact. This refactor has no demonstrated issue19 cause or measured CPU improvement. Do not integrate or release it for that investigation. Revisit individual changes only with a concrete supported-use reproduction and a small patch.
+
+The narrower candidate is `fix/issue19-focused`. Existing tested source and artifacts remain preserved below.
+
 ## Preserved work
 
 The pre-refactor baseline is commit `7931509b0bc3bacab385337231850bb372fb48d0`.
