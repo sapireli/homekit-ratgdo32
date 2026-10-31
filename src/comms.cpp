@@ -17,6 +17,10 @@
 
 // Arduino includes
 #include <Ticker.h>
+#include <atomic>
+#ifdef ESP32
+#include <freertos/semphr.h>
+#endif
 
 // RATGDO project includes
 #include "ratgdo.h"
@@ -33,6 +37,7 @@
 #include "secplus2.h"
 #include "Packet.h"
 #include "drycontact.h"
+#include "door_command_lifecycle.h"
 #endif // USE_GDOLIB
 
 #ifdef ESP8266
@@ -50,6 +55,8 @@ struct __attribute__((aligned(4))) PacketAction
     Packet pkt;
     bool inc_counter;
     uint32_t delay;
+    uint32_t doorGeneration = 0;
+    bool doorPress = false;
 };
 
 // On ESP32 we use the FreeRTOS queues.  This is not available on our ESP8266 builds.
@@ -57,13 +64,20 @@ struct __attribute__((aligned(4))) PacketAction
 #define COMMAND_QUEUE_SIZE 16
 #ifdef ESP32
 QueueHandle_t pkt_q;
+static StaticSemaphore_t txQueueMutexStorage;
+static SemaphoreHandle_t txQueueMutex = nullptr;
 #else
 Queue_t pkt_q;
+static bool txQueueBusy = false;
 #endif // ESP32
 
 inline bool txQueueCreate()
 {
 #ifdef ESP32
+    if (!txQueueMutex)
+        txQueueMutex = xSemaphoreCreateMutexStatic(&txQueueMutexStorage);
+    if (!txQueueMutex)
+        return false;
     pkt_q = xQueueCreate(COMMAND_QUEUE_SIZE, sizeof(PacketAction));
     return pkt_q != NULL;
 #else
@@ -80,13 +94,56 @@ inline uint32_t txQueueCount()
 #endif
 }
 
-inline bool txQueuePush(PacketAction *pkt)
+inline bool txQueuePushUnlocked(PacketAction *pkt)
 {
 #ifdef ESP32
     return xQueueSendToBack(pkt_q, pkt, 0) == pdTRUE;
 #else
     return q_push(&pkt_q, pkt);
 #endif
+}
+
+inline bool txQueueLock()
+{
+#ifdef ESP32
+    return txQueueMutex && xSemaphoreTake(txQueueMutex, 0) == pdTRUE;
+#else
+    if (txQueueBusy)
+        return false;
+    txQueueBusy = true;
+    return true;
+#endif
+}
+
+inline void txQueueUnlock()
+{
+#ifdef ESP32
+    xSemaphoreGive(txQueueMutex);
+#else
+    txQueueBusy = false;
+#endif
+}
+
+inline bool txQueuePush(PacketAction *pkt)
+{
+    if (!txQueueLock())
+        return false;
+    const bool accepted = txQueuePushUnlocked(pkt);
+    txQueueUnlock();
+    return accepted;
+}
+
+inline bool txQueuePushSequence(PacketAction *packets, uint32_t count)
+{
+    if (count > COMMAND_QUEUE_SIZE || !txQueueLock())
+        return false;
+    // All producers use this lock. Consumers may only free more space, so
+    // a successful reservation guarantees the entire essential sequence fits.
+    bool accepted = COMMAND_QUEUE_SIZE - txQueueCount() >= count;
+    for (uint32_t i = 0; accepted && i < count; ++i)
+        accepted = txQueuePushUnlocked(&packets[i]);
+    txQueueUnlock();
+    return accepted;
 }
 
 inline bool txQueuePeek(PacketAction *pkt)
@@ -149,10 +206,92 @@ static bool door_moving = false;
 static const uint32_t TTCinterval = 250;
 static uint32_t TTCiterations = 0;
 static _millis_t TTCendTime = 0;
-static Ticker TTCtimer = Ticker();
-static Ticker callbackDelay = Ticker();
-static Ticker checkDoorMoving = Ticker();
-static Ticker checkDoorCompleted = Ticker();
+static void (*functionDelayCallback)() = nullptr;
+static _millis_t functionDelayNextTick = 0;
+static bool functionDelayPending = false;
+static bool functionDelayFinalWait = false;
+static bool functionDelayLight = false, functionDelaySound = false;
+void processFunctionDelay();
+#ifdef ESP32
+static StaticSemaphore_t functionDelayMutexStorage;
+static SemaphoreHandle_t functionDelayMutex()
+{
+    static SemaphoreHandle_t mutex = xSemaphoreCreateRecursiveMutexStatic(&functionDelayMutexStorage);
+    return mutex;
+}
+#endif
+
+// Cancel/replacement and final callback acceptance use the same lock. It is
+// recursive because a delayed door command may cancel another delayed action.
+class FunctionDelayLock
+{
+public:
+    FunctionDelayLock()
+    {
+#ifdef ESP32
+        xSemaphoreTakeRecursive(functionDelayMutex(), portMAX_DELAY);
+#endif
+    }
+    ~FunctionDelayLock()
+    {
+        unlock();
+    }
+    void unlock()
+    {
+#ifdef ESP32
+        if (held)
+            xSemaphoreGiveRecursive(functionDelayMutex());
+#endif
+        held = false;
+    }
+private:
+    bool held = true;
+};
+bool functionDelayActive()
+{
+    FunctionDelayLock lock;
+    return functionDelayPending;
+}
+
+void cancelFunctionDelay()
+{
+    FunctionDelayLock lock;
+    functionDelayPending = false;
+    functionDelayCallback = nullptr;
+    functionDelayNextTick = 0;
+    functionDelayFinalWait = false;
+}
+// These callbacks are dispatched only by comms_loop. detach() cannot race an
+// SDK timer task destroying or invoking a std::function callback.
+class PolledDoorDeadline
+{
+public:
+    void detach() { callback = nullptr; }
+    void once_ms(uint32_t milliseconds, void (*next)())
+    {
+        deadline = _millis() + milliseconds;
+        callback = next;
+    }
+    void process()
+    {
+        FunctionDelayLock lock;
+#ifdef ESP8266
+        const bool waiting = static_cast<int32_t>(_millis() - deadline) < 0;
+#else
+        const bool waiting = _millis() < deadline;
+#endif
+        if (!callback || waiting)
+            return;
+        auto next = callback;
+        callback = nullptr;
+        if (comms_setup_done)
+            next();
+    }
+private:
+    _millis_t deadline = 0;
+    void (*callback)() = nullptr;
+};
+static PolledDoorDeadline checkDoorMoving, checkDoorCompleted;
 bool TTCwasLightOn = false;
 static Ticker builtInTTCcountdown = Ticker();
 
@@ -311,6 +450,7 @@ uint32_t last_saved_code = 0;
 #define MAX_CODES_WITHOUT_FLASH_WRITE 10
 
 static _millis_t stopSentClosePending = 0;
+static _millis_t stopSentOpenPending = 0;
 
 /******************************* SECURITY 1.0 *********************************/
 #ifndef USE_GDOLIB
@@ -362,6 +502,41 @@ enum secplus1Codes : uint8_t
     Unknown = 0xFF // (when rx fails parity test)
 };
 
+static std::atomic<bool> pendingDoorCommand{false};
+static DoorCommandLifecycle doorLifecycle;
+static PacketAction *writingDoorPacket = nullptr;
+void processPendingDoorIntent();
+void cancelPendingDoorIntent()
+{
+    FunctionDelayLock lock;
+    doorLifecycle.cancel();
+    pendingDoorCommand = false;
+}
+bool requestPendingDoorIntent(DoorCommandLifecycle::Intent intent)
+{
+    if (doorControlType == 3)
+        return false;
+    const bool wasPending = doorLifecycle.pending();
+    if (wasPending)
+    {
+        stopSentClosePending = 0;
+        stopSentOpenPending = 0;
+    }
+    const bool deferred = doorLifecycle.request(intent, static_cast<uint32_t>(_millis()));
+    pendingDoorCommand = doorLifecycle.pending();
+    if (wasPending && !pendingDoorCommand)
+    {
+        checkDoorMoving.detach();
+        checkDoorCompleted.detach();
+    }
+    return deferred;
+}
+void markDoorPacketWriting()
+{
+    if (writingDoorPacket)
+        doorLifecycle.writing(writingDoorPacket->doorGeneration, writingDoorPacket->doorPress);
+}
+
 #define SEC1_CMD(s) (s == secplus1Codes::DoorButtonPress)      ? "door press"    \
                     : (s == secplus1Codes::DoorButtonRelease)  ? "door release"  \
                     : (s == secplus1Codes::LightButtonPress)   ? "light press"   \
@@ -372,7 +547,7 @@ enum secplus1Codes : uint8_t
 
 // prototypes
 bool process_PacketAction(PacketAction &pkt_ac);
-void door_command(DoorAction action);
+bool door_command(DoorAction action);
 bool transmitSec1(byte toSend);
 bool transmitSec2(PacketAction &pkt_ac);
 void obstruction_timer();
@@ -779,10 +954,22 @@ void setup_comms()
  */
 void shutdown_comms()
 {
-    if (!comms_setup_done)
+    bool wasReady;
+    {
+        FunctionDelayLock lock;
+        // Cancel old work and reject new door commands before teardown starts.
+        cancelFunctionDelay();
+            checkDoorMoving.detach();
+        checkDoorCompleted.detach();
+#ifndef USE_GDOLIB
+        doorLifecycle.reset();
+        pendingDoorCommand = false;
+#endif
+        wasReady = comms_setup_done;
+        comms_setup_done = false;
+    }
+    if (!wasReady)
         return;
-
-    comms_setup_done = false;
 #ifdef USE_GDOLIB
     // Shutdown GDO comms
     gdo_deinit();
@@ -948,11 +1135,14 @@ void wallPlate_Emulation()
 
 void update_door_state(GarageDoorCurrentState current_state)
 {
+    FunctionDelayLock lock;
     static _millis_t start_opening = 0;
     static _millis_t start_closing = 0;
     _millis_t now = _millis();
 
     GarageDoorTargetState target_state = garage_door.target_state;
+    doorLifecycle.status(static_cast<int>(current_state));
+    pendingDoorCommand = doorLifecycle.pending();
 
     // Determine target state
     switch (current_state)
@@ -979,34 +1169,36 @@ void update_door_state(GarageDoorCurrentState current_state)
         break;
     } // end switch
 
-    // Terminate any timers started to check for success
+    // Unchanged cached status does not confirm that a queued command moved.
+    const bool stateChanged = current_state != garage_door.current_state;
+    if (stateChanged)
+        checkDoorMoving.detach();
     switch (current_state)
     {
     case GarageDoorCurrentState::CURR_CLOSING:
         // If we are in a time-to-close delay timeout, cancel the timeout
-        if (TTCtimer.active())
+        if (functionDelayActive())
         {
             ESP_LOGI(TAG, "Door closing, canceling TTC delay timer");
-            TTCtimer.detach();
+            cancelFunctionDelay();
             // This will force us to send current state to browser, so it reports correct state.
             last_reported_garage_door.current_state = (GarageDoorCurrentState)0xFF;
         }
         // If we were in a automatic close timeout, cancel and reset that.
         cancel_builtin_TTC_countdown();
-        // Fall through to "opening"
-    case GarageDoorCurrentState::CURR_OPENING:
-        // Terminate the timer that confirms that a door open/close actually worked.
-        checkDoorMoving.detach();
         break;
-
+    case GarageDoorCurrentState::CURR_OPENING:
+        break;
     case GarageDoorCurrentState::CURR_OPEN:
     case GarageDoorCurrentState::CURR_CLOSED:
+        // If timer that checks door completely opens/closes is active, cancel it.
+        if (stateChanged)
+            checkDoorCompleted.detach();
+        break;
     case GarageDoorCurrentState::CURR_STOPPED:
         // If timer that checks door completely opens/closes is active, cancel it.
-        if (checkDoorCompleted.active())
-        {
+        if (stateChanged)
             checkDoorCompleted.detach();
-        }
         break;
     default:
         // We logged an error in the previous switch()
@@ -1090,7 +1282,36 @@ void update_door_state(GarageDoorCurrentState current_state)
 
     // Update the global
     doorState = current_state;
+    // A follow-up command must observe the stopped state just reported above.
+    if (current_state == GarageDoorCurrentState::CURR_STOPPED &&
+        (stopSentClosePending || stopSentOpenPending))
+    {
+        const _millis_t stopTime = stopSentClosePending + stopSentOpenPending;
+        const bool reverseOpen = stopSentOpenPending != 0;
+        stopSentClosePending = 0;
+        stopSentOpenPending = 0;
+        if (_millis() - stopTime < 2000)
+        {
+#ifndef USE_GDOLIB
+            if (doorLifecycle.pending())
+                doorLifecycle.defer(reverseOpen ? DoorCommandLifecycle::Intent::Open : DoorCommandLifecycle::Intent::Close,
+                                    static_cast<uint32_t>(_millis()));
+            else
+#endif
+            {
+                if (reverseOpen)
+                    door_command_open();
+                else
+                    door_command_close();
+            }
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Door did not respond to our stop command in time (2 seconds), do not send door command");
+        }
+    }
 }
+
 
 void sec1_process_message(uint8_t key, uint8_t value = 0xFF)
 {
@@ -1371,7 +1592,7 @@ void sec1_process_message(uint8_t key, uint8_t value = 0xFF)
 
         static uint8_t prevLightLock = 0xFF;  // for two-in-a-row detection
         static uint8_t lastLightState = 0xff; // for change detection
-        if (TTCtimer.active())
+        if (functionDelayActive())
         {
             // As we flash lights during TTC delay, avoid lots of updates to clients
             ESP_LOGV(TAG, "Ignoring light/lock status change during time-to-close delay");
@@ -1510,6 +1731,15 @@ bool process_send_queue()
             {
                 ESP_LOGE(TAG, "SEC%d TX send failed, exceeded max retry", doorControlType);
                 retryCount = 0;
+                {
+                    FunctionDelayLock lock;
+                    if (!pkt_ac.doorPress && doorLifecycle.needsRelease(pkt_ac.doorGeneration))
+                    {
+                        // A collision must not discard Release after Press was
+                        // written. Keep it ahead of every newer button press.
+                        return false;
+                    }
+                }
                 // Remove TX packet from the queue
                 txQueuePop(&pkt_ac);
             }
@@ -1783,20 +2013,7 @@ void comms_loop_sec2()
                 }
             }
 
-            if (stopSentClosePending)
-            {
-                if (_millis() - stopSentClosePending < 1000)
-                {
-                    // We sent a stop command, and have received a response from the GDO. So now will followup with the close command.
-                    stopSentClosePending = 0;
-                    close_door();
-                }
-                else
-                {
-                    stopSentClosePending = 0;
-                    ESP_LOGI(TAG, "Door did not respond to our stop command in time (1 second), do not send close command");
-                }
-            }
+
 
             if (!comms_status_done && comms_status_start)
             {
@@ -2183,6 +2400,12 @@ void comms_loop_drycontact()
 #endif
 void comms_loop()
 {
+    processFunctionDelay();
+    checkDoorMoving.process();
+    checkDoorCompleted.process();
+#ifndef USE_GDOLIB
+    processPendingDoorIntent();
+#endif
     if (!comms_setup_done)
         return;
 
@@ -2293,6 +2516,7 @@ bool transmitSec1(byte toSend)
 
     // aprox 10ms to write byte
     // every byte we send echos, but want the echo on polls to id the GDO response
+    markDoorPacketWriting();
     Sec1Serial.write(toSend);
     // timestamp tx
     last_tx = _millis();
@@ -2390,6 +2614,7 @@ bool transmitSec2(PacketAction &pkt_ac)
     {
         // Use LED to signal activity
         led.flash(FLASH_ACTIVITY_MS);
+        markDoorPacketWriting();
         sw_serial.write(buf, SECPLUS2_CODE_LEN);
         delayMicroseconds(100);
         // timestamp tx
@@ -2407,19 +2632,34 @@ bool transmitSec2(PacketAction &pkt_ac)
 
 bool process_PacketAction(PacketAction &pkt_ac)
 {
+    FunctionDelayLock lock;
+    if (!comms_setup_done || !doorLifecycle.allow(pkt_ac.doorGeneration, pkt_ac.doorPress))
+        return true; // Discard a cancelled or already-written button press.
+    writingDoorPacket = &pkt_ac;
+    bool sent = false;
     if (doorControlType == 2)
     {
-        return transmitSec2(pkt_ac);
+        sent = transmitSec2(pkt_ac);
     }
     else if (pkt_ac.pkt.m_data.value.cmd)
     {
-        return transmitSec1(pkt_ac.pkt.m_data.value.cmd);
+        sent = transmitSec1(pkt_ac.pkt.m_data.value.cmd);
     }
-    return false;
+    writingDoorPacket = nullptr;
+    return sent;
 }
 
-void door_command(DoorAction action)
+bool door_command(DoorAction action)
 {
+    FunctionDelayLock lock;
+    if (!comms_setup_done)
+        return false;
+    if (pendingDoorCommand)
+    {
+        ESP_LOGW(TAG, "Pending door command exists, dropping new command");
+        return false;
+    }
+
     if (doorControlType != 3)
     {
         // SECURITY1.0/2.0 commands
@@ -2433,11 +2673,10 @@ void door_command(DoorAction action)
 
         Packet pkt = Packet(PacketCommand::DoorAction, data, id_code);
         PacketAction pkt_ac = {pkt, false, 0};
-        if (!txQueuePush(&pkt_ac))
-        {
-            ESP_LOGE(TAG, "packet queue full, dropping door command pressed pkt");
-            return;
-        }
+        PacketAction sequence[2] = {pkt_ac, pkt_ac};
+        const uint32_t generation = doorLifecycle.begin(static_cast<int>(garage_door.current_state), static_cast<uint32_t>(_millis()));
+        sequence[0].doorGeneration = generation;
+        sequence[0].doorPress = true;
 
         /* Removing this section as testing with 398LM (a 0x37 wall panel) was never successful.
         if (is_0x37_panel && (garage_door.current_state == GarageDoorCurrentState::CURR_CLOSED ||
@@ -2454,11 +2693,16 @@ void door_command(DoorAction action)
         if (doorControlType == 1)
             pkt_ac.pkt.m_data.value.cmd = secplus1Codes::DoorButtonRelease;
         pkt_ac.inc_counter = true;
-        if (!txQueuePush(&pkt_ac))
+        sequence[1] = pkt_ac;
+        sequence[1].doorGeneration = generation;
+        if (!txQueuePushSequence(sequence, 2))
         {
-            ESP_LOGE(TAG, "packet queue full, dropping door command release pkt");
-            return;
+            ESP_LOGE(TAG, "packet queue full, dropping complete door command");
+            cancelPendingDoorIntent();
+            return false;
         }
+        pendingDoorCommand = true;
+        pkt_ac.doorGeneration = generation;
 
         // if sec+1.0, repeat the release
         if (doorControlType == 1)
@@ -2466,7 +2710,8 @@ void door_command(DoorAction action)
             if (!txQueuePush(&pkt_ac))
             {
                 ESP_LOGE(TAG, "packet queue full, dropping door command release pkt");
-                return;
+                // The press and first release were already queued.
+                return true;
             }
         }
         send_get_status();
@@ -2479,33 +2724,67 @@ void door_command(DoorAction action)
         delay(500);
         digitalWrite(UART_TX_PIN, LOW);
     }
+    return true;
+}
+
+void processPendingDoorIntent()
+{
+    FunctionDelayLock lock;
+    if (!comms_setup_done)
+    {
+        doorLifecycle.reset();
+        pendingDoorCommand = false;
+        return;
+    }
+    // A command timeout must retire its intent as well as the legacy flag.
+    if (!pendingDoorCommand)
+        doorLifecycle.cancel();
+    const auto intent = doorLifecycle.poll(static_cast<uint32_t>(_millis()));
+    pendingDoorCommand = doorLifecycle.pending();
+    switch (intent)
+    {
+    case DoorCommandLifecycle::Intent::Open: open_door(); break;
+    case DoorCommandLifecycle::Intent::Close: close_door(); break;
+    case DoorCommandLifecycle::Intent::Stop: stop_door(); break;
+    case DoorCommandLifecycle::Intent::Toggle: toggle_door(); break;
+    case DoorCommandLifecycle::Intent::None: break;
+    }
 }
 
 #endif // not USE_GDOLIB
 
 void door_command_close()
 {
+    FunctionDelayLock lock;
+    if (!comms_setup_done)
+        return;
+
 #ifdef USE_GDOLIB
     gdo_door_close();
 #else
-    if (garage_door.pinModeObstructionSensor && !userConfig->getUseToggle())
+    if ((doorControlType == 3) || (garage_door.pinModeObstructionSensor && !userConfig->getUseToggle()))
     {
-        door_command(DoorAction::Close);
+        ESP_LOGD(TAG, "Closing door");
+        if (!door_command(DoorAction::Close))
+            return;
     }
     else
     {
-        ESP_LOGI(TAG, "Toggle from current state: %s, target state: %s", DOOR_STATE(garage_door.current_state), DOOR_STATE(garage_door.target_state));
+        ESP_LOGD(TAG, "Toggle from current state: %s, target state: %s", DOOR_STATE(garage_door.current_state), DOOR_STATE(garage_door.target_state));
         if (garage_door.current_state == GarageDoorCurrentState::CURR_OPEN)
         {
-            door_command(DoorAction::Toggle);
+            if (!door_command(DoorAction::Toggle))
+                return;
         }
         else if (garage_door.current_state == GarageDoorCurrentState::CURR_STOPPED)
         {
-            door_command(DoorAction::Toggle);
+            if (!door_command(DoorAction::Toggle))
+                return;
         }
         else
         {
             ESP_LOGI(TAG, "Ignoring close request for current and target state");
+            return;
         }
     }
 
@@ -2518,36 +2797,43 @@ void door_command_close()
         checkDoorCompleted.once_ms((garage_door.closeDuration + 3) * 1000, []()
                                    {
                                        // If this timer fires (was not cancelled when we get notification that door has stopped) then
-                                       // we probably missed a status mesage, assume it's closed.
-                                       ESP_LOGW(TAG, "Door did not close in expected time, assuming it is closed");
-                                       notify_homekit_current_door_state_change(GarageDoorCurrentState::CURR_CLOSED);
-                                       notify_homekit_target_door_state_change(GarageDoorTargetState::TGT_CLOSED);
+                                       // Request feedback; elapsed time cannot establish physical position.
+                                       ESP_LOGW(TAG, "Door did not confirm closing in expected time; querying actual state");
+                                       cancelPendingDoorIntent();
+                                       notify_homekit_current_door_state_change(garage_door.current_state);
                                        send_get_status(); // query in case we're wrong and it's stopped (Sec+2.0)
                                    });
     }
     // Check door starts to close
     checkDoorMoving.detach(); // just in case!
-    checkDoorMoving.once_ms(2000, []()
+    checkDoorMoving.once_ms(3000, []()
                             {
                                 // If this timer fires (was not cancelled when we get notification that door is closing) then
                                 // it is likely that there is an error and door did not move from its open state.
                                 checkDoorCompleted.detach();
+                                cancelPendingDoorIntent();
                                 ESP_LOGE(TAG, "Door is supposed to be closing but is not.  Current state: %s", DOOR_STATE(garage_door.current_state));
-                                notify_homekit_current_door_state_change(GarageDoorCurrentState::CURR_OPEN);
-                                notify_homekit_target_door_state_change(GarageDoorTargetState::TGT_OPEN); });
+                                notify_homekit_current_door_state_change(garage_door.current_state); });
 #endif
     return;
 }
 
-void door_command_open()
+bool startDoorOpenCommand()
 {
+    FunctionDelayLock lock;
+    if (!comms_setup_done)
+        return false;
+    ESP_LOGI(TAG, "Opening door");
+
 #ifdef USE_GDOLIB
     if (doorControlType == 2 && userConfig->getBuiltInTTC())
         gdo_set_time_to_close(0);
 
-    gdo_door_open();
+    if (gdo_door_open() != ESP_OK)
+        return false;
 #else
-    door_command(DoorAction::Open);
+    if (!door_command(DoorAction::Open))
+        return false;
 
     if (doorControlType == 2 && garage_door.openDuration > 0)
     {
@@ -2558,35 +2844,47 @@ void door_command_open()
         checkDoorCompleted.once_ms((garage_door.openDuration + 3) * 1000, []()
                                    {
                                        // If this timer fires (was not cancelled when we get notification that door has stopped) then
-                                       // we probably missed a status mesage, assume it's open.
-                                       ESP_LOGW(TAG, "Door did not open in expected time, assuming it is open");
-                                       notify_homekit_current_door_state_change(GarageDoorCurrentState::CURR_OPEN);
-                                       notify_homekit_target_door_state_change(GarageDoorTargetState::TGT_OPEN);
+                                       // Request feedback; elapsed time cannot establish physical position.
+                                       ESP_LOGW(TAG, "Door did not confirm opening in expected time; querying actual state");
+                                       cancelPendingDoorIntent();
+                                       notify_homekit_current_door_state_change(garage_door.current_state);
                                        send_get_status(); // query in case we're wrong and it's stopped (Sec+2.0)
                                    });
     }
     // Check door starts to open
     checkDoorMoving.detach(); // just in case!
-    checkDoorMoving.once_ms(2000, []()
+    checkDoorMoving.once_ms(3000, []()
                             {
                                 // If this timer fires (was not cancelled when we get notification that door is opening) then
                                 // it is likely that there is an error and door did not move from its closed state.
                                 checkDoorCompleted.detach();
+                                cancelPendingDoorIntent();
                                 ESP_LOGE(TAG, "Door is supposed to be opening but is not.  Current state: %s", DOOR_STATE(garage_door.current_state));
-                                notify_homekit_current_door_state_change(GarageDoorCurrentState::CURR_CLOSED);
-                                notify_homekit_target_door_state_change(GarageDoorTargetState::TGT_CLOSED); });
+                                notify_homekit_current_door_state_change(garage_door.current_state); });
 #endif
-    return;
+    return true;
+}
+
+void door_command_open()
+{
+    startDoorOpenCommand();
 }
 
 GarageDoorCurrentState open_door()
 {
-    if (TTCtimer.active())
+    FunctionDelayLock lock;
+    if (!comms_setup_done)
+        return garage_door.current_state;
+#ifndef USE_GDOLIB
+    if (requestPendingDoorIntent(DoorCommandLifecycle::Intent::Open))
+        return garage_door.current_state;
+#endif
+    if (functionDelayActive())
     {
         // We are in a time-to-close delay timeout.
         // Effect of open is to cancel the timeout (leaving door open)
         ESP_LOGI(TAG, "Door assumed to be open, canceling TTC delay timer");
-        TTCtimer.detach();
+        cancelFunctionDelay();
         // Reset light to state it was at before delay start.
         set_light(TTCwasLightOn);
         // This will force us to send current state to browser, so it reports correct state.
@@ -2595,12 +2893,12 @@ GarageDoorCurrentState open_door()
     }
 
     // safety
-    if (garage_door.current_state == GarageDoorCurrentState::CURR_OPEN)
+    if (garage_door.current_state == GarageDoorCurrentState::CURR_OPEN || garage_door.current_state == GarageDoorCurrentState::CURR_OPENING)
     {
-        ESP_LOGI(TAG, "Door already open; ignored request");
+        ESP_LOGD(TAG, "Door already %s; ignored request", DOOR_STATE(garage_door.current_state));
         // Reset last reported to we will update browser with actual state.
         last_reported_garage_door.current_state = (GarageDoorCurrentState)0xFF;
-        return GarageDoorCurrentState::CURR_OPEN;
+        return garage_door.current_state;
     }
 
     if (garage_door.current_state == GarageDoorCurrentState::CURR_CLOSING)
@@ -2609,23 +2907,81 @@ GarageDoorCurrentState open_door()
 #ifdef USE_GDOLIB
         gdo_door_stop();
 #else
+        checkDoorMoving.detach();
+        checkDoorCompleted.detach();
         door_command(DoorAction::Stop);
 #endif
         return GarageDoorCurrentState::CURR_STOPPED;
     }
-    ESP_LOGI(TAG, "Opening door");
     door_command_open();
     return GarageDoorCurrentState::CURR_OPENING;
 }
 
-void TTCtimerFn(void (*callback)(), bool light)
+GarageDoorCurrentState stop_door()
 {
+    FunctionDelayLock lock;
+    if (!comms_setup_done)
+        return garage_door.current_state;
+#ifndef USE_GDOLIB
+    if (requestPendingDoorIntent(DoorCommandLifecycle::Intent::Stop))
+        return garage_door.current_state;
+#endif
+
+    if (!(garage_door.current_state == GarageDoorCurrentState::CURR_CLOSING || garage_door.current_state == GarageDoorCurrentState::CURR_OPENING))
+    {
+        ESP_LOGI(TAG, "Door is not moving; ignored stop request");
+        // Reset last reported to we will update browser with actual state.
+        last_reported_garage_door.current_state = (GarageDoorCurrentState)0xFF;
+        return garage_door.current_state;
+    }
+
+    ESP_LOGI(TAG, "Door is moving; do stop");
+#ifdef USE_GDOLIB
+    gdo_door_stop();
+#else
+    checkDoorMoving.detach();
+    checkDoorCompleted.detach();
+    door_command(DoorAction::Stop);
+#endif
+
+    return GarageDoorCurrentState::CURR_STOPPED;
+}
+
+void processFunctionDelay()
+{
+    FunctionDelayLock lock;
+    const _millis_t now = _millis();
+#ifdef ESP8266
+    const bool waiting = static_cast<int32_t>(now - functionDelayNextTick) < 0;
+#else
+    const bool waiting = now < functionDelayNextTick;
+#endif
+    if (!functionDelayPending || waiting)
+        return;
+    // Run delayed actions only from the communications loop. A Ticker
+    // callback can outlive detach() and its captured std::function storage.
+    if (functionDelayFinalWait)
+    {
+        void (*callback)() = functionDelayCallback;
+        cancelFunctionDelay();
+        if (callback == door_command_close && !comms_setup_done)
+            return;
+        // Restart/network callbacks may tear down a driver and wait for its
+        // event task. Do not hold a control lock while waiting for that task.
+        // Door Close keeps the lock across acceptance and actuation so an Open
+        // cannot cancel between the two steps.
+        if (callback != door_command_close)
+            lock.unlock();
+        if (callback)
+            callback();
+        return;
+    }
     if (TTCiterations > 0)
     {
         // dry contact cannot control lights
         if (doorControlType != 3)
         {
-            if (light && (TTCiterations % 2 == 0))
+            if (functionDelayLight && (TTCiterations % 2 == 0))
             {
 #ifndef USE_GDOLIB
                 // only SEC+1,0
@@ -2643,13 +2999,16 @@ void TTCtimerFn(void (*callback)(), bool light)
             }
         }
 #ifdef RATGDO32_DISCO
-        tone(BEEPER_PIN, 1300, 125);
+        if (functionDelaySound)
+        {
+            tone(BEEPER_PIN, 1300, 125);
+        }
 #endif
         TTCiterations--;
+        functionDelayNextTick = now + TTCinterval;
     }
     else
     {
-        TTCtimer.detach();
         ESP_LOGI(TAG, "End of function delay timer");
 #ifndef USE_GDOLIB
         // only SEC+1,0
@@ -2660,71 +3019,48 @@ void TTCtimerFn(void (*callback)(), bool light)
         }
 #endif
         // delay so that set_light() can do its thing
-        callbackDelay.once_ms(TTCinterval * 2, [callback]()
-                              {
-#ifdef ESP8266
-                                  schedule_recurrent_function_us([callback]()
-                                                                 {
-                                                                     if (callback == sync_and_restart)
-                                                                         ESP_LOGI(TAG, "Calling delayed function: sync_and_restart()");
-                                                                     else if (callback == door_command_close)
-                                                                         ESP_LOGI(TAG, "Calling delayed function: door_command_close()");
-                                                                     else
-                                                                         ESP_LOGI(TAG, "Calling delayed function at: 0x%08lX", (uint32_t)callback);
-
-                                                                     if (callback)
-                                                                         callback();
-                                                                     return false; // run the fn only once
-                                                                 },
-                                                                 0); // zero micro seconds (run asap)
-#else
-                                  if (callback == sync_and_restart)
-                                      ESP_LOGI(TAG, "Calling delayed function: sync_and_restart()");
-                                  else if (callback == door_command_close)
-                                      ESP_LOGI(TAG, "Calling delayed function: door_command_close()");
-                                  else
-                                      ESP_LOGI(TAG, "Calling delayed function at: 0x%08lX", (uint32_t)callback);
-
-                                  if (callback)
-                                      callback();
-#endif
-                              });
+        functionDelayFinalWait = true;
+        functionDelayNextTick = now + TTCinterval * 2;
     }
 }
 
 // Call function after ms milliseconds during which we flash and beep
 void delayFnCall(uint32_t ms, void (*callback)())
 {
+    FunctionDelayLock lock;
     bool light = userConfig->getTTClight(); // Whether to flash light during delay
-
-    TTCtimer.detach();                 // Terminate existing timer if any
+#ifdef RATGDO32_DISCO
+    bool sound = true; // Preserve the existing Disco countdown beep
+#else
+    bool sound = false; // No sound option for non-disco boards
+#endif
+    cancelFunctionDelay();
     TTCiterations = ms / TTCinterval;  // Number of times to go through loop
     TTCwasLightOn = garage_door.light; // Current state of light
     ESP_LOGI(TAG, "Start function delay timer for %lums (%d iterations)", ms, TTCiterations);
     TTCendTime = _millis() + (_millis_t)ms;
-    TTCtimer.attach_ms(TTCinterval, [callback, light]()
-                       {
-#ifdef ESP8266
-                           schedule_recurrent_function_us([callback, light]()
-                                                          {
-                                                              TTCtimerFn(callback, light);
-                                                              return false; // run the fn only once
-                                                          },
-                                                          0); // zero micro seconds (run asap)
-#else
-                           TTCtimerFn(callback, light);
-#endif
-                       });
+    functionDelayCallback = callback;
+    functionDelayLight = light;
+    functionDelaySound = sound;
+    functionDelayPending = true;
+    functionDelayNextTick = _millis() + TTCinterval;
 }
 
 GarageDoorCurrentState close_door(bool bypass_ttc)
 {
-    if (garage_door.current_state == GarageDoorCurrentState::CURR_CLOSED)
+    FunctionDelayLock lock;
+    if (!comms_setup_done)
+        return garage_door.current_state;
+#ifndef USE_GDOLIB
+    if (requestPendingDoorIntent(DoorCommandLifecycle::Intent::Close))
+        return garage_door.current_state;
+#endif
+    if (garage_door.current_state == GarageDoorCurrentState::CURR_CLOSED || garage_door.current_state == GarageDoorCurrentState::CURR_CLOSING)
     {
-        ESP_LOGI(TAG, "Door already closed; ignored request");
+        ESP_LOGD(TAG, "Door already %s; ignored request", DOOR_STATE(garage_door.current_state));
         // Reset last reported to we will update browser with actual state.
         last_reported_garage_door.current_state = (GarageDoorCurrentState)0xFF;
-        return GarageDoorCurrentState::CURR_CLOSED;
+        return garage_door.current_state;
     }
 
     cancel_builtin_TTC_countdown();
@@ -2735,16 +3071,19 @@ GarageDoorCurrentState close_door(bool bypass_ttc)
 #ifdef USE_GDOLIB
         gdo_door_stop();
 #else
+        checkDoorMoving.detach();
+        checkDoorCompleted.detach();
         door_command(DoorAction::Stop);
 #endif
         stopSentClosePending = _millis();
+        stopSentOpenPending = 0;
         return GarageDoorCurrentState::CURR_STOPPED;
     }
 
-    if (bypass_ttc && TTCtimer.active())
+    if (bypass_ttc && functionDelayActive())
     {
-        ESP_LOGI(TAG, "Canceling TTC delay timer for hardwired control");
-        TTCtimer.detach();
+        ESP_LOGD(TAG, "Canceling running TTC delay timer");
+        cancelFunctionDelay();
         set_light(TTCwasLightOn);
     }
 
@@ -2753,20 +3092,20 @@ GarageDoorCurrentState close_door(bool bypass_ttc)
     {
         if (bypass_ttc && userConfig->getTTCseconds() != 0)
         {
-            ESP_LOGI(TAG, "Bypassing time-to-close delay for hardwired control");
+            ESP_LOGD(TAG, "Bypassing time-to-close delay");
         }
-        ESP_LOGI(TAG, "Closing door");
+        ESP_LOGD(TAG, "Closing door");
         door_command_close();
     }
     else
     {
-        if (TTCtimer.active())
+        if (functionDelayActive())
         {
             // We are in a time-to-close delay timeout, cancel the timeout
-            ESP_LOGI(TAG, "Door in time-to-close delay, request to close ignored, TTC will continue");
+            ESP_LOGD(TAG, "Door in time-to-close delay, request to close ignored, TTC will continue");
             /* two closes in-a-row shoud not cancel TTC? Require an open request to cancel TTC
             ESP_LOGI(TAG, "Close: Canceling TTC delay timer");
-            TTCtimer.detach();
+            cancelFunctionDelay();
             // Reset light to state it was at before delay start.
             set_light(TTCwasLightOn);
             return GarageDoorCurrentState::CURR_OPEN;
@@ -2795,6 +3134,13 @@ GarageDoorCurrentState close_door(bool bypass_ttc)
 #if defined(ESP8266) || !defined(USE_GDOLIB)
 GarageDoorCurrentState toggle_door(bool bypass_ttc)
 {
+    FunctionDelayLock lock;
+    if (!comms_setup_done)
+        return garage_door.current_state;
+#ifndef USE_GDOLIB
+    if (requestPendingDoorIntent(DoorCommandLifecycle::Intent::Toggle))
+        return garage_door.current_state;
+#endif
     ESP_LOGI(TAG, "Toggling door via hardwired control");
     if (doorControlType == 3)
     {
@@ -2802,10 +3148,10 @@ GarageDoorCurrentState toggle_door(bool bypass_ttc)
         return garage_door.current_state;
     }
 
-    if (TTCtimer.active())
+    if (functionDelayActive())
     {
         ESP_LOGI(TAG, "Canceling TTC delay timer prior to toggle");
-        TTCtimer.detach();
+        cancelFunctionDelay();
         set_light(TTCwasLightOn);
     }
 
@@ -3099,7 +3445,7 @@ void manual_recovery()
         return;
 
     // Don't check for manual recovery if in midst of a time-to-close delay
-    if (TTCtimer.active())
+    if (functionDelayActive())
         return;
 
     // Increment counter every time button is pushed.  If we hit 5 in 3 seconds,
@@ -3127,7 +3473,8 @@ void manual_recovery()
 
 uint32_t is_ttc_active()
 {
-    if (!TTCtimer.active())
+    FunctionDelayLock lock;
+    if (!functionDelayActive())
         return 0;
     // return number of seconds remaining in the time-to-close timer
     return (uint32_t)std::max((int32_t)1, (int32_t)((TTCendTime + 1000 - _millis()) / 1000));
