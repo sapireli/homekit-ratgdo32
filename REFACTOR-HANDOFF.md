@@ -61,3 +61,7 @@ Opposite light/lock requests now cancel unwritten work or defer until fresh type
 3. Aggregate SDK TCP retention, capability-specific heap/largest block, task stack headroom, critical/loop latency, and sustained recovery remain unmeasured. Native regressions and builds do not satisfy those runtime gates.
 
 The original complete freeze cause remains under investigation. Existing post-power-cycle symptoms and improvement after re-pairing/reflashing are not explained by these source mechanisms alone. Keep this refactor separate from the established testing/release track until its remaining validation is complete.
+
+## Exact tested build
+
+Both clean local builds are from `b42a938540236eff4f1ef3d5acc0afaea666d4fd`. Matched BIN/ELF pairs, maps, dependency records, logs and checksum manifests are under `/Users/eliransapir/Downloads/GRGDO1-Resource-Refactor/b42a938540236eff4f1ef3d5acc0afaea666d4fd`. Embedded ELF hashes were verified against the saved ELFs. Later commits only enable this branch's existing CI workflow and record this provenance; they do not change production source. Local validation passes; no GitHub CI result or hardware recovery is claimed here.
