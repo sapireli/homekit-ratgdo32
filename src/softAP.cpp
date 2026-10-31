@@ -335,11 +335,16 @@ void handle_wifinets()
     }
     ESP_LOGI(TAG, "Number of WiFi networks: %d", wifiNets.size());
     String currentSSID = "";
+    char *txtBuffer = static_cast<char *>(malloc(TXT_BUFFER_SIZE));
+    if (!txtBuffer)
+    {
+        server.send_P(503, type_txt, PSTR("Insufficient memory for WiFi scan page"));
+        return;
+    }
     server.client().setNoDelay(true);
     server.sendContent(softAPhttpPreamble, strlen(softAPhttpPreamble));
     server.sendContent(softAPtableHead, strlen(softAPtableHead));
     int i = 0;
-    char *txtBuffer = static_cast<char *>(malloc(TXT_BUFFER_SIZE));
     for (wifiNet_t net : wifiNets)
     {
         bool hide = true;
@@ -397,6 +402,11 @@ void handle_setssid()
     }
 
     char *txtBuffer = static_cast<char *>(malloc(TXT_BUFFER_SIZE));
+    if (!txtBuffer)
+    {
+        server.send_P(503, type_txt, PSTR("Insufficient memory to change WiFi settings"));
+        return;
+    }
     if (advanced)
     {
         ESP_LOGI(TAG, "Requested WiFi SSID: %s (%d) at AP: %02x:%02x:%02x:%02x:%02x:%02x",
