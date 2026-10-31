@@ -319,6 +319,11 @@ void setup()
 void loop()
 {
     runtime_diagnostics_phase(1);
+#ifdef ESP32
+    // Apply optional accessory changes outside application locks and HomeSpan's
+    // service traversal. A busy HomeSpan task leaves the request pending.
+    homekit_loop();
+#endif
     static bool setup_after_IP_done = false;
 
     // Some initialization is postponed until after we have an IP address
