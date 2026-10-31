@@ -260,6 +260,21 @@ public:
 private:
     bool held = true;
 };
+#ifdef RATGDO_ENCODER
+void encoder_control_loop()
+{
+    FunctionDelayLock lock;
+    encoder_loop();
+}
+
+void reset_encoder_cal()
+{
+    // The web reset helper invokes this without a JSON/configuration lock.
+    FunctionDelayLock lock;
+    reset_encoder_cal_locked();
+}
+#endif
+
 bool functionDelayActive()
 {
     FunctionDelayLock lock;
@@ -1030,6 +1045,9 @@ void shutdown_comms()
     bool wasReady;
     {
         FunctionDelayLock lock;
+#ifdef RATGDO_ENCODER
+        cancel_encoder_correction();
+#endif
         // Cancel old work and reject new door commands before teardown starts.
         cancelFunctionDelay();
         cancelPartialOpen();
@@ -3077,6 +3095,9 @@ void door_command_open()
 GarageDoorCurrentState open_door()
 {
     FunctionDelayLock lock;
+#ifdef RATGDO_ENCODER
+    cancel_encoder_correction();
+#endif
     if (!comms_setup_done)
         return garage_door.current_state;
 #ifndef USE_GDOLIB
@@ -3138,6 +3159,9 @@ GarageDoorCurrentState open_door()
 GarageDoorCurrentState stop_door()
 {
     FunctionDelayLock lock;
+#ifdef RATGDO_ENCODER
+    cancel_encoder_correction();
+#endif
     if (!comms_setup_done)
         return garage_door.current_state;
 #ifndef USE_GDOLIB
@@ -3169,6 +3193,9 @@ GarageDoorCurrentState stop_door()
 GarageDoorCurrentState open_door_partial(int timePercentage)
 {
     FunctionDelayLock lock;
+#ifdef RATGDO_ENCODER
+    cancel_encoder_correction();
+#endif
     if (!comms_setup_done)
         return garage_door.current_state;
     _millis_t dtime = 0;
@@ -3379,6 +3406,9 @@ void delayFnCall(uint32_t ms, void (*callback)())
 GarageDoorCurrentState close_door(bool bypass_ttc)
 {
     FunctionDelayLock lock;
+#ifdef RATGDO_ENCODER
+    cancel_encoder_correction();
+#endif
     if (!comms_setup_done)
         return garage_door.current_state;
 #ifndef USE_GDOLIB
@@ -3477,6 +3507,9 @@ GarageDoorCurrentState close_door(bool bypass_ttc)
 GarageDoorCurrentState toggle_door(bool bypass_ttc)
 {
     FunctionDelayLock lock;
+#ifdef RATGDO_ENCODER
+    cancel_encoder_correction();
+#endif
     if (!comms_setup_done)
         return garage_door.current_state;
 #ifndef USE_GDOLIB
