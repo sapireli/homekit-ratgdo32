@@ -374,7 +374,7 @@ void loop()
     drycontact_loop();
 #endif
 #ifdef RATGDO_ENCODER
-    encoder_loop();
+    encoder_control_loop();
 #endif
 #ifdef ESP8266
     // On ESP8266 we handle WiFi and HomeKit ourselves
