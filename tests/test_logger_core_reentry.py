@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compile the production logger function against bounded host concurrency tests."""
+"""Compile production logger and hook functions against bounded host tests."""
 import os
 from pathlib import Path
 import shutil
@@ -46,6 +46,26 @@ static std::mutex coreMutex;
 static bool recurse=false;
 struct LOG { void logToBuffer(const char *,va_list); };
 static LOG logger;
+static LOG *ratgdoLogger=&logger;
+static bool suppressSerialLog=false;
+struct MockSerial {
+    bool ready=false;
+    unsigned begins=0, checks=0;
+    explicit operator bool() { ++checks; return ready; }
+    void begin(unsigned) { ++begins; ready=true; }
+    void print(const char *) { ++serialWrites; }
+};
+static MockSerial Serial;
+// The Gelidus integration initializes its console through this wrapper.
+struct MockConsoleState {
+    void ensureStarted(MockSerial &port) { if (!port) port.begin(115200); }
+    bool isReady() const { return true; }
+};
+static MockConsoleState serialConsole;
+void esp_log_hook(const char *,va_list);
+static void emitHook(const char *fmt,...) {
+    va_list args; va_start(args,fmt); esp_log_hook(fmt,args); va_end(args);
+}
 static void emit(const char *fmt,...) {
     va_list args; va_start(args,fmt); logger.logToBuffer(fmt,args); va_end(args);
 }
@@ -70,7 +90,7 @@ int main() {
         coreHeld=false;
     }
     assert(sseWrites==oldSSE && syslogWrites==oldSyslog);
-    assert(serialWrites==oldSerial+1 && ring.head>oldHead);
+    assert(serialWrites==oldSerial && ring.head>oldHead);
     // A logger already owns the logger lock and waits for core. The task
     // holding core must drop the contended message instead of waiting back.
     std::atomic<bool> acquired{false};
@@ -96,6 +116,51 @@ int main() {
     const unsigned beforeSSE=sseWrites, beforeSyslog=syslogWrites;
     recurse=true; emit("prefix () recurse\n");
     assert(sseWrites==beforeSSE+1 && syslogWrites==beforeSyslog+1);
+
+    // Ordinary hook startup and initialized logger delivery remain intact.
+    Serial.ready=false;
+    unsigned begins=Serial.begins, sends=sseWrites, syslogs=syslogWrites;
+    emitHook("prefix () hook startup\n");
+    assert(Serial.begins==begins+1 && Serial.ready);
+    assert(sseWrites==sends+1 && syslogWrites==syslogs+1);
+#ifndef ESP8266
+    // Core-held hooks must not inspect/start the UART or enter serial/network
+    // sinks, including the fallback before the logger exists.
+    Serial.ready=false;
+    begins=Serial.begins;
+    const unsigned checks=Serial.checks, writes=serialWrites;
+    sends=sseWrites; syslogs=syslogWrites;
+    size_t head=ring.head;
+    coreHeld=true;
+    emitHook("prefix () core hook\n");
+    assert(ring.head>head);
+    head=ring.head;
+    ratgdoLogger=nullptr;
+    emitHook("prefix () early core hook\n");
+    coreHeld=false;
+    assert(ring.head==head);
+    assert(Serial.begins==begins && Serial.checks==checks && serialWrites==writes);
+    assert(sseWrites==sends && syslogWrites==syslogs);
+#else
+    // ESP8266 still initializes and writes the console normally.
+    coreHeld=true;
+    Serial.ready=false;
+    begins=Serial.begins;
+    sends=sseWrites;
+    emitHook("prefix () ESP8266 hook\n");
+    assert(Serial.begins==begins+1 && sseWrites==sends+1);
+    ratgdoLogger=nullptr;
+    coreHeld=false;
+#endif
+    // Non-core early fallback is preserved on both platforms.
+    Serial.ready=false;
+    begins=Serial.begins;
+    const unsigned fallbackWrites=serialWrites;
+    sends=sseWrites; syslogs=syslogWrites;
+    emitHook("prefix () early normal hook\n");
+    assert(Serial.begins==begins+1 && serialWrites>fallbackWrites);
+    assert(sseWrites==sends && syslogWrites==syslogs);
+    ratgdoLogger=&logger;
 }
 """
 
@@ -108,9 +173,11 @@ class LoggerCoreReentryTest(unittest.TestCase):
         source = (ROOT / "src/log.cpp").read_text()
         start = source.index("void LOG::logToBuffer(")
         body = source[start:source.index("\nvoid LOG::clearCrashLog()", start)]
+        hook_start = source.index("void esp_log_hook(")
+        hook = source[hook_start:source.index("\n#ifdef ESP8266", hook_start)]
         with tempfile.TemporaryDirectory(prefix="ratgdo-logger-test-") as directory:
             cpp = Path(directory) / "logger.cpp"
-            cpp.write_text(HARNESS + body + CASES)
+            cpp.write_text(HARNESS + body + hook + CASES)
             for target in ("ESP32", "ESP8266"):
                 with self.subTest(target=target):
                     binary = Path(directory) / target
