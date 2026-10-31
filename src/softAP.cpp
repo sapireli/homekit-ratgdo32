@@ -65,6 +65,8 @@ std::multiset<wifiNet_t, decltype(&wifiNetsCmp)> wifiNets(&wifiNetsCmp);
 // consumed its last row, so iterators and radio-button indexes stay stable.
 static std::atomic<bool> wifiScanOwned{false};
 static std::atomic<bool> wifiScanPending{false};
+static std::atomic<bool> wifiScanRunning{false};
+static std::atomic<bool> wifiScanFailed{false};
 #endif
 
 static bool softAPinitialized = false;
@@ -128,22 +130,13 @@ const char *encryptionToString(uint16_t e)
 #endif
 }
 
-void wifi_scan()
+static void storeWifiScanResults(int nNets)
 {
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
-    bool expected = false;
-    if (!wifiScanOwned.compare_exchange_strong(expected, true))
-    {
-        wifiScanPending = true;
-        return;
-    }
-    wifiScanPending = false;
-#endif
     // scan for networks
     ESP_LOGI(TAG, "Scanning WiFi Networks...");
     wifiNet_t wifiNet;
     wifiNets.clear();
-    int nNets = std::min((int)WiFi.scanNetworks(), 127);
+    nNets = std::min(nNets, 127);
     if (nNets == 0)
     {
         ESP_LOGI(TAG, "No networks found!");
@@ -167,12 +160,63 @@ void wifi_scan()
             wifiNets.insert(wifiNet);
         }
     }
-    // delete scan from memory
+}
+
+void wifi_scan()
+{
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+    bool expected = false;
+    if (!wifiScanOwned.compare_exchange_strong(expected, true))
+    {
+        wifiScanPending = true;
+        return;
+    }
+    wifiScanPending = false;
+#endif
+    const int count = WiFi.scanNetworks();
+    if (count >= 0)
+        storeWifiScanResults(count);
     WiFi.scanDelete();
 #if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+    wifiScanFailed = count < 0;
     wifiScanOwned = false;
 #endif
 }
+
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+static void pollWifiScan()
+{
+    int count;
+    if (wifiScanRunning)
+    {
+        count = WiFi.scanComplete();
+        if (count == WIFI_SCAN_RUNNING)
+            return;
+    }
+    else
+    {
+        if (!wifiScanPending)
+            return;
+        bool expected = false;
+        if (!wifiScanOwned.compare_exchange_strong(expected, true))
+            return;
+        wifiScanPending = false;
+        wifiScanFailed = false;
+        count = WiFi.scanNetworks(true);
+        if (count == WIFI_SCAN_RUNNING)
+        {
+            wifiScanRunning = true;
+            return;
+        }
+    }
+    if (count >= 0)
+        storeWifiScanResults(count);
+    WiFi.scanDelete();
+    wifiScanFailed = count < 0;
+    wifiScanRunning = false;
+    wifiScanOwned = false;
+}
+#endif
 
 void start_soft_ap()
 {
@@ -209,8 +253,7 @@ void start_soft_ap()
 void soft_ap_loop()
 {
 #if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
-    if (wifiScanPending && !wifiScanOwned)
-        wifi_scan();
+    pollWifiScan();
 #endif
     if (!softAPinitialized)
         return;
@@ -347,8 +390,14 @@ void handle_softAPweb()
 
 void handle_rescan()
 {
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+    if (!wifiScanRunning)
+        wifiScanPending = true;
+    server.send_P(202, type_txt, "Scan pending.");
+#else
     wifi_scan();
     server.send_P(200, type_txt, "Scan complete.");
+#endif
 }
 
 void handle_wifiap()
@@ -473,6 +522,16 @@ static size_t readWifiScanPage(uint8_t *buffer, size_t capacity)
 void handle_wifinets()
 {
 #if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
+    if (wifiScanPending || wifiScanRunning)
+    {
+        server.send_P(202, type_txt, PSTR("Scan pending."));
+        return;
+    }
+    if (wifiScanFailed)
+    {
+        server.send_P(503, type_txt, PSTR("WiFi scan failed; request a new scan."));
+        return;
+    }
     bool expected = false;
     if (!wifiScanOwned.compare_exchange_strong(expected, true))
     {

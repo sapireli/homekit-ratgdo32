@@ -18,7 +18,8 @@ class WifiScanDeliveryTest(unittest.TestCase):
         legacy = "void legacy_page()\n{\n" + handler[handler.index("    bool connected = WiFi.isConnected();"):]
         entry = handler[:handler.index("    bool connected = WiFi.isConnected();")] + "}\n"
         formats = soft[soft.index("static const char softAPhttpPreamble"):soft.index("static const char softAPsuccess")]
-        scan = block(soft, "void wifi_scan()\n{")
+        scan = (block(soft, "static void storeWifiScanResults(") +
+                block(soft, "void wifi_scan()\n{") + block(soft, "static void pollWifiScan()"))
         pending = block(soft, "void soft_ap_loop()\n{")
         pending = pending[:pending.index("    if (!softAPinitialized)")] + "}\n"
         self.assertIn("setup_http_response_delivery();", block(soft, "void start_soft_ap()\n{"))
@@ -47,13 +48,16 @@ using String=std::string;
 struct wifiNet_t {String ssid;int32_t rssi=-40,channel=1;uint8_t bssid[6]{};int encryptionType=0;};
 struct Compare {bool operator()(const wifiNet_t&a,const wifiNet_t&b)const{return a.ssid<b.ssid||(a.ssid==b.ssid&&a.rssi>b.rssi);}};
 std::multiset<wifiNet_t,Compare>wifiNets;
-static std::atomic<bool>wifiScanOwned{false},wifiScanPending{false};
-unsigned scans=0;
+static std::atomic<bool>wifiScanOwned{false},wifiScanPending{false},wifiScanRunning{false},wifiScanFailed{false};
+constexpr int WIFI_SCAN_RUNNING=-1;
+unsigned scans=0,asyncScans=0,scanPolls=0;
+int asyncStart=WIFI_SCAN_RUNNING,scanStatus=WIFI_SCAN_RUNNING;
 struct Wifi {
  bool isConnected(){return true;}
  String SSID(){return "registered & <SSID>";}
  String SSID(int){return "new scan";}
- int scanNetworks(){++scans;return 0;}
+ int scanNetworks(bool async=false){if(async){++asyncScans;return asyncStart;}++scans;return 0;}
+ int scanComplete(){++scanPolls;return scanStatus;}
  int channel(int){return 1;}int RSSI(int){return -40;}
  const uint8_t*BSSID(int){static uint8_t b[6]{};return b;}
  String BSSIDstr(int){return "00:00:00:00:00:00";}
@@ -61,10 +65,11 @@ struct Wifi {
 }WiFi;
 const char *encryptionToString(int){return "";}
 std::string expected;
+int responseStatus=0;
 struct Client {void setNoDelay(bool){}};
 struct Server {unsigned handled=0;Client client(){return {};}
  void sendContent(const char*p,size_t n){expected.append(p,n);}
- void send_P(int,const char*,const char*){assert(false);}
+ void send_P(int status,const char*,const char*){responseStatus=status;}
  void handleClient(){++handled;}
 }server;
 const char *type_txt="text/plain";
@@ -96,7 +101,7 @@ ssize_t send(int,const void*p,size_t n,int flags){
 }
 """ + formats + fields + r"""
 HttpOwnedResponse httpOwned[2],*httpWriting=&httpOwned[0];
-""" + block(web, "bool defer_http_generated_body(") + block(web, "bool drainHttpBodies()") + block(web, "bool pollHttpResponses()") + block(soft, "void htmlEscape(") + renderer + scan + pending + legacy + entry + r"""
+""" + block(web, "bool defer_http_generated_body(") + block(web, "bool drainHttpBodies()") + block(web, "bool pollHttpResponses()") + block(soft, "void htmlEscape(") + renderer + scan + pending + legacy + entry + block(soft, "void handle_rescan()") + r"""
 void reset(){
  finishHttpBody(httpOwned[0]);httpOwned[0]=HttpOwnedResponse{};
  httpOwned[0].state=HttpOwnedState::Active;httpOwned[0].fd=7;httpWriting=&httpOwned[0];
@@ -133,7 +138,20 @@ int main(){
  }while(true);
  assert(delivered==expected&&!wifiScanOwned&&server.handled==1);
  // The deferred scan runs only after the entire old registry was consumed.
- soft_ap_loop();assert(scans==1&&wifiNets.empty()&&!wifiScanPending);
+ soft_ap_loop();assert(asyncScans==1&&scans==0&&wifiNets.size()==127&&wifiScanRunning&&wifiScanOwned);
+ unsigned commsIterations=0;
+ for(unsigned i=0;i<100;++i){++commsIterations;soft_ap_loop();}
+ assert(commsIterations==100&&scanPolls==100&&asyncScans==1&&scans==0);
+ handle_rescan();assert(responseStatus==202&&!wifiScanPending);
+ handle_wifinets();assert(responseStatus==202&&httpOwned[0].body==HttpBody::None);
+ scanStatus=0;soft_ap_loop();assert(wifiNets.empty()&&!wifiScanRunning&&!wifiScanOwned&&!wifiScanFailed);
+ // Start and completion failures release the lease and never serve old results.
+ asyncStart=-2;handle_rescan();soft_ap_loop();assert(wifiScanFailed&&!wifiScanOwned&&!wifiScanRunning);
+ handle_wifinets();assert(responseStatus==503);
+ asyncStart=WIFI_SCAN_RUNNING;scanStatus=-2;handle_rescan();soft_ap_loop();soft_ap_loop();
+ assert(wifiScanFailed&&!wifiScanOwned&&!wifiScanRunning);
+ // Existing serial/Improv calls remain immediate when the registry is free.
+ wifi_scan();assert(scans==1&&!wifiScanFailed&&!wifiScanOwned);
  // Normal web mode includes retirement servicing without duplicate handling.
  web_setup_done=true;unsigned handled=server.handled;pollHttpResponses();
  assert(retirementCalls==1&&server.handled==handled+1);
