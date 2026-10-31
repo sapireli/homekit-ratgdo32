@@ -29,6 +29,7 @@
 #ifdef ESP32
 #include <freertos/semphr.h>
 #include <esp_timer.h>
+#include <esp_rom_sys.h>
 #include "gdo_uart.h"
 #endif
 
@@ -71,10 +72,14 @@ struct __attribute__((aligned(4))) PacketAction
     uint32_t doorGeneration = 0;
     bool doorPress = false;
 };
+static_assert(sizeof(PacketAction) == 44, "Review command queue storage budget");
 
 // On ESP32 we use the FreeRTOS queues.  This is not available on our ESP8266 builds.
 // Define inline functions here so that remaining code is cleaner.
 #define COMMAND_QUEUE_SIZE 16
+static bool txQueueReady = false;
+static std::atomic<bool> lightReleaseReserved{false};
+static bool heldLightReleaseRequired = false;
 #ifdef ESP32
 QueueHandle_t pkt_q;
 static StaticSemaphore_t txQueueMutexStorage;
@@ -86,20 +91,24 @@ static bool txQueueBusy = false;
 
 inline bool txQueueCreate()
 {
+    if (txQueueReady)
+        return true;
 #ifdef ESP32
     if (!txQueueMutex)
         txQueueMutex = xSemaphoreCreateMutexStatic(&txQueueMutexStorage);
     if (!txQueueMutex)
         return false;
     pkt_q = xQueueCreate(COMMAND_QUEUE_SIZE, sizeof(PacketAction));
-    return pkt_q != NULL;
+    return txQueueReady = pkt_q != NULL;
 #else
-    return q_init(&pkt_q, sizeof(PacketAction), COMMAND_QUEUE_SIZE, FIFO, false) != NULL;
+    return txQueueReady = q_init(&pkt_q, sizeof(PacketAction), COMMAND_QUEUE_SIZE, FIFO, false) != NULL;
 #endif
 }
 
 inline uint32_t txQueueCount()
 {
+    if (!txQueueReady)
+        return 0;
 #ifdef ESP32
     return (uint32_t)uxQueueMessagesWaiting(pkt_q);
 #else
@@ -109,6 +118,8 @@ inline uint32_t txQueueCount()
 
 inline bool txQueuePushUnlocked(PacketAction *pkt)
 {
+    if (!txQueueReady || txQueueCount() + unsigned(lightReleaseReserved) >= COMMAND_QUEUE_SIZE)
+        return false;
 #ifdef ESP32
     return xQueueSendToBack(pkt_q, pkt, 0) == pdTRUE;
 #else
@@ -152,7 +163,7 @@ inline bool txQueuePushSequence(PacketAction *packets, uint32_t count)
         return false;
     // All producers use this lock. Consumers may only free more space, so
     // a successful reservation guarantees the entire essential sequence fits.
-    bool accepted = COMMAND_QUEUE_SIZE - txQueueCount() >= count;
+    bool accepted = txQueueReady && COMMAND_QUEUE_SIZE - txQueueCount() >= count + unsigned(lightReleaseReserved);
     for (uint32_t i = 0; accepted && i < count; ++i)
         accepted = txQueuePushUnlocked(&packets[i]);
     txQueueUnlock();
@@ -175,6 +186,18 @@ inline bool txQueuePop(PacketAction *pkt)
 #else
     return q_pop(&pkt_q, pkt);
 #endif
+}
+
+// Called with command ownership held, before a new serial session is enabled.
+inline bool txQueuePrepare()
+{
+    if (!txQueueCreate() || !txQueueLock())
+        return false;
+    PacketAction retired;
+    while (txQueuePop(&retired)) {}
+    lightReleaseReserved = false;
+    txQueueUnlock();
+    return true;
 }
 
 // used by SEC+1.0
@@ -421,6 +444,10 @@ bool functionDelayActive()
 void cancelFunctionDelay()
 {
     FunctionDelayLock lock;
+#ifndef USE_GDOLIB
+    if (lightReleaseReserved)
+        sec1_light_release(2);
+#endif
     functionDelayPending = false;
     functionDelayCallback = nullptr;
     functionDelayNextTick = 0;
@@ -709,12 +736,90 @@ enum secplus1Codes : uint8_t
 
     Unknown = 0xFF // (when rx fails parity test)
 };
-static bool pendingLightOn = false;
-static bool pendingLightOff = false;
-static bool pendingLockOn = false;
-static bool pendingLockOff = false;
-static std::atomic<bool> pendingDoorCommand{false};
 static DoorCommandLifecycle doorLifecycle;
+// BEGIN CONTROL OWNERSHIP
+// Reuse PacketAction's generation/press fields for every physical button.
+// Each owner is 20 bytes; no packet, queue, task, or timer is added.
+class ControlIntent
+{
+public:
+    uint32_t begin(bool value)
+    {
+        FunctionDelayLock lock;
+        generation = ++nextGeneration;
+        if (!generation)
+            generation = ++nextGeneration;
+        requested = value;
+        startedAt = static_cast<uint32_t>(_millis());
+        written = false;
+        return generation;
+    }
+    bool pending(bool value)
+    {
+        FunctionDelayLock lock;
+        expire();
+        return requested == int(value);
+    }
+    void clear() { FunctionDelayLock lock; generation = 0; requested = -1; }
+    void expire()
+    {
+        FunctionDelayLock lock;
+        if (generation && static_cast<uint32_t>(_millis() - startedAt) >= 3000)
+            clear();
+    }
+    bool allow(uint32_t token, bool press)
+    {
+        FunctionDelayLock lock;
+        expire();
+        return !token || (press ? token == generation && !written
+                                : token == generation || token == mandatoryRelease);
+    }
+    void writing(uint32_t token, bool press)
+    {
+        FunctionDelayLock lock;
+        if (token && press)
+        {
+            written = true;
+            mandatoryRelease = token;
+        }
+    }
+    void completed(uint32_t token, bool press)
+    {
+        FunctionDelayLock lock;
+        if (!press && mandatoryRelease == token)
+            mandatoryRelease = 0;
+    }
+    bool needsRelease(uint32_t token) const { FunctionDelayLock lock; return token && token == mandatoryRelease; }
+    void failed(uint32_t token) { FunctionDelayLock lock; if (generation == token) clear(); }
+    void reset() { FunctionDelayLock lock; clear(); mandatoryRelease = 0; }
+private:
+    uint32_t nextGeneration = 0, generation = 0, mandatoryRelease = 0, startedAt = 0;
+    int8_t requested = -1;
+    bool written = false;
+};
+static_assert(sizeof(ControlIntent) == 20, "Review button owner storage budget");
+static ControlIntent lightIntent, lockIntent;
+
+ControlIntent *packetControl(const PacketAction &packet)
+{
+    if (packet.pkt.m_data.type == PacketDataType::Light)
+        return &lightIntent;
+    if (packet.pkt.m_data.type == PacketDataType::Lock)
+        return &lockIntent;
+    return nullptr;
+}
+
+bool packetNeedsRelease(const PacketAction &packet)
+{
+    if (packet.doorPress)
+        return false;
+    if (auto *control = packetControl(packet))
+        return control->needsRelease(packet.doorGeneration) ||
+               (control == &lightIntent && !packet.doorGeneration && heldLightReleaseRequired);
+    return doorLifecycle.needsRelease(packet.doorGeneration);
+}
+// END CONTROL OWNERSHIP
+static std::atomic<bool> pendingDoorCommand{false};
 static PacketAction *writingDoorPacket = nullptr;
 void processPendingDoorIntent();
 void cancelPendingDoorIntent()
@@ -744,7 +849,16 @@ bool requestPendingDoorIntent(DoorCommandLifecycle::Intent intent)
 }
 void markDoorPacketWriting()
 {
-    if (writingDoorPacket)
+    if (!writingDoorPacket)
+        return;
+    if (auto *control = packetControl(*writingDoorPacket))
+    {
+        if (doorControlType == DOOR_CONTROL_SEC_PLUS_V1)
+            control->writing(writingDoorPacket->doorGeneration, writingDoorPacket->doorPress);
+        if (control == &lightIntent && !writingDoorPacket->doorGeneration && writingDoorPacket->doorPress)
+            heldLightReleaseRequired = true;
+    }
+    else
         doorLifecycle.writing(writingDoorPacket->doorGeneration, writingDoorPacket->doorPress);
 }
 
@@ -949,6 +1063,9 @@ void initialize_gdo_codes(uint32_t id)
 
 void setup_comms()
 {
+#ifndef USE_GDOLIB
+    FunctionDelayLock commandLock;
+#endif
     if (comms_setup_done)
         return;
 
@@ -961,7 +1078,17 @@ void setup_comms()
     // available during operations.  We need to carefully monitor useage so as not
     // to exceed available IRAM.  We can adjust the LOG_BUFFER_SIZE (in log.h) if we
     // need to make more space available for initialization.
-    txQueueCreate();
+    if (doorControlType != DOOR_CONTROL_DRY_CONTACT && !txQueuePrepare())
+    {
+        // Queue exhaustion reporting must not enter an unavailable logger.
+#ifdef ESP32
+        quiesce_gdo_tx();
+        esp_rom_printf("TX queue unavailable; transmitter disabled\n");
+#else
+        ets_printf("TX queue unavailable; transmitter disabled\n");
+#endif
+        return;
+    }
 
     if (doorControlType == DOOR_CONTROL_SEC_PLUS_V1)
     {
@@ -1199,6 +1326,9 @@ void shutdown_comms()
         checkDoorCompleted.detach();
 #ifndef USE_GDOLIB
         doorLifecycle.reset();
+        lightIntent.reset();
+        lockIntent.reset();
+        lightReleaseReserved = heldLightReleaseRequired = false;
         pendingDoorCommand = false;
 #endif
         wasReady = comms_setup_done;
@@ -1891,8 +2021,7 @@ void sec1_process_message(uint8_t key, uint8_t value = 0xFF)
             // Force update of light state in any listening client
             last_reported_garage_door.light = !garage_door.light;
             // Clear pending light on/off flags as we have now received an update from the door about the light state
-            pendingLightOn = false;
-            pendingLightOff = false;
+            lightIntent.clear();
             // If user want to trigger motion sensor based on light button, do it now as we know the light state has changed
             if (motionTriggers.bit.lightKey)
             {
@@ -1922,8 +2051,7 @@ void sec1_process_message(uint8_t key, uint8_t value = 0xFF)
             // Force update of lock state in any listening client
             last_reported_garage_door.current_lock = (LockCurrentState)0xFF;
             // Clear pending lock on/off flags as we have now received an update from the door about the lock state
-            pendingLockOn = false;
-            pendingLockOff = false;
+            lockIntent.clear();
             // If user want to trigger motion sensor based on lock button, do it now as we know the lock state has changed
             if (motionTriggers.bit.lockKey)
             {
@@ -1942,6 +2070,8 @@ void sec1_process_message(uint8_t key, uint8_t value = 0xFF)
 
 bool process_send_queue()
 {
+    // Keep peek/write/pop in one command transaction, including retirement.
+    FunctionDelayLock commandLock;
     // PROCESS TRANSMIT QUEUE
     //
     PacketAction pkt_ac;
@@ -2012,12 +2142,15 @@ bool process_send_queue()
                 retryCount = 0;
                 {
                     FunctionDelayLock lock;
-                    if (!pkt_ac.doorPress && doorLifecycle.needsRelease(pkt_ac.doorGeneration))
+                    if (packetNeedsRelease(pkt_ac))
                     {
                         // A collision must not discard Release after Press was
                         // written. Keep it ahead of every newer button press.
                         return false;
                     }
+                    // Terminal rejection retires the associated logical intent.
+                    if (auto *control = packetControl(pkt_ac))
+                        control->failed(pkt_ac.doorGeneration);
                 }
                 // Remove TX packet from the queue
                 txQueuePop(&pkt_ac);
@@ -2260,8 +2393,7 @@ void comms_loop_sec2()
             if (pkt.m_data.value.status.light != garage_door.light)
             {
                 ESP_LOGI(TAG, "Light: %s (%s)", pkt.m_data.value.status.light ? "On" : "Off", timeString());
-                pendingLightOn = false;
-                pendingLightOff = false;
+                lightIntent.clear();
                 notify_homekit_light(pkt.m_data.value.status.light);
             }
 
@@ -2285,8 +2417,7 @@ void comms_loop_sec2()
                 // Force update of lock state in any listening client
                 last_reported_garage_door.current_lock = (LockCurrentState)0xFF;
                 // Clear pending lock on/off flags as we have now received an update from the door about the lock state
-                pendingLockOn = false;
-                pendingLockOff = false;
+                lockIntent.clear();
             }
 
             // Handle obstruction from status packet if pin-based detection not available
@@ -2372,8 +2503,7 @@ void comms_loop_sec2()
                 ESP_LOGD(TAG, "Lock Cmd %d", lock);
                 notify_homekit_target_lock(lock);
                 // Clear pending lock on/off flags as we have now received an update from the door about the lock state
-                pendingLockOn = false;
-                pendingLockOff = false;
+                lockIntent.clear();
                 // If user want to trigger motion sensor based on lock button, do it now as we know the lock state has changed
                 if (motionTriggers.bit.lockKey)
                 {
@@ -2407,8 +2537,7 @@ void comms_loop_sec2()
                 ESP_LOGD(TAG, "Light Cmd %s", l ? "On" : "Off");
                 notify_homekit_light(l);
                 // Clear pending light on/off flags as we have now received an update from the door about the light state
-                pendingLightOn = false;
-                pendingLightOff = false;
+                lightIntent.clear();
                 // If user want to trigger motion sensor based on light button, do it now as we know the light state has changed
                 if (motionTriggers.bit.lightKey)
                 {
@@ -2674,7 +2803,7 @@ void comms_loop_sec2()
                 lastStatusPkt == 0 ||
                 garage_door.current_state == GarageDoorCurrentState::CURR_OPENING ||
                 garage_door.current_state == GarageDoorCurrentState::CURR_CLOSING ||
-                pendingDoorCommand || pendingLightOn || pendingLightOff || pendingLockOn || pendingLockOff)
+                pendingDoorCommand || lightIntent.pending(true) || lightIntent.pending(false) || lockIntent.pending(true) || lockIntent.pending(false))
             {
                 ESP_LOGD(TAG, "Possibly missed a status packet, requesting GDO to resend");
                 send_get_status();
@@ -2733,6 +2862,13 @@ void comms_loop_drycontact()
 #endif
 void comms_loop()
 {
+#ifndef USE_GDOLIB
+    {
+        FunctionDelayLock lock;
+        if (!functionDelayPending && lightReleaseReserved)
+            sec1_light_release(2);
+    }
+#endif
     processFunctionDelay();
     processPartialOpen();
     checkDoorMoving.process();
@@ -2966,7 +3102,9 @@ bool transmitSec2(PacketAction &pkt_ac)
 bool process_PacketAction(PacketAction &pkt_ac)
 {
     FunctionDelayLock lock;
-    if (!comms_setup_done || !doorLifecycle.allow(pkt_ac.doorGeneration, pkt_ac.doorPress))
+    auto *control = packetControl(pkt_ac);
+    if (!comms_setup_done || !(control ? control->allow(pkt_ac.doorGeneration, pkt_ac.doorPress)
+                                      : doorLifecycle.allow(pkt_ac.doorGeneration, pkt_ac.doorPress)))
         return true; // Discard a cancelled or already-written button press.
     writingDoorPacket = &pkt_ac;
     bool sent = false;
@@ -2979,6 +3117,12 @@ bool process_PacketAction(PacketAction &pkt_ac)
         sent = transmitSec1(pkt_ac.pkt.m_data.value.cmd);
     }
     writingDoorPacket = nullptr;
+    if (sent && control)
+    {
+        control->completed(pkt_ac.doorGeneration, pkt_ac.doorPress);
+        if (control == &lightIntent && !pkt_ac.doorGeneration && !pkt_ac.doorPress)
+            heldLightReleaseRequired = false;
+    }
     return sent;
 }
 
@@ -3867,72 +4011,46 @@ bool set_lock(bool value, bool verify)
 #else  // USE_GDOLIB
 bool set_lock(bool value, bool verify)
 {
-    // return value: true = lock state changed, else state unchanged
-    if (verify)
+    FunctionDelayLock lock;
+    if (!comms_setup_done || !txQueueReady)
+        return false;
+    if (verify && (garage_door.current_lock == (value ? CURR_LOCKED : CURR_UNLOCKED) || lockIntent.pending(value)))
     {
-        if (garage_door.current_lock == ((value) ? LockCurrentState::CURR_LOCKED : LockCurrentState::CURR_UNLOCKED))
-        {
-            ESP_LOGD(TAG, "Remote locks already %s; ignored request", (value) ? "locked" : "unlocked");
-            // Reset last reported to we will update browser with actual state.
-            last_reported_garage_door.current_lock = (LockCurrentState)0xFF;
-            return false;
-        }
-        else if ((value && pendingLockOn) || (!value && pendingLockOff))
-        {
-            // We are already in the process of changing the lock state, so ignore duplicate request
-            ESP_LOGD(TAG, "Lock %s command already pending; ignored duplicate request", (value) ? "lock" : "unlock");
-            return false;
-        }
+        last_reported_garage_door.current_lock = (LockCurrentState)0xFF;
+        return false;
     }
-
     PacketData data;
     data.type = PacketDataType::Lock;
-    data.value.lock.lock = (value) ? LockState::On : LockState::Off;
-    garage_door.target_lock = (value) ? TGT_LOCKED : TGT_UNLOCKED;
-    ESP_LOGD(TAG, "Set Garage Door Remote locks: %s", (value) ? "locked" : "unlocked");
-
-    pendingLockOn = (value == true);
-    pendingLockOff = (value == false);
-
-    // SECURITY1.0
+    data.value.lock.lock = value ? LockState::On : LockState::Off;
+    data.value.lock.pressed = true;
+    if (doorControlType == DOOR_CONTROL_SEC_PLUS_V1)
+        data.value.cmd = secplus1Codes::LockButtonPress;
+    PacketAction sequence[2] = {
+        {Packet(PacketCommand::Lock, data, id_code), true, 0},
+        {Packet(PacketCommand::Lock, data, id_code), true, 0}};
+    const auto previous = lockIntent;
+    const auto token = lockIntent.begin(value);
+    sequence[0].doorGeneration = token;
+    sequence[0].doorPress = true;
+    sequence[1].doorGeneration = token;
+    bool accepted;
     if (doorControlType == DOOR_CONTROL_SEC_PLUS_V1)
     {
-        data.value.lock.pressed = true;
-        data.value.cmd = secplus1Codes::LockButtonPress;
-        Packet pkt = Packet(PacketCommand::Lock, data, id_code);
-        PacketAction pkt_ac = {pkt, true, 0};
-
-        if (!txQueuePush(&pkt_ac))
-        {
-            ESP_LOGE(TAG, "packet queue full, dropping lock pkt");
-            return false;
-        }
-        // button release
-        pkt_ac.pkt.m_data.value.lock.pressed = false;
-        pkt_ac.pkt.m_data.value.cmd = secplus1Codes::LockButtonRelease;
-        if (!txQueuePush(&pkt_ac))
-        {
-            ESP_LOGE(TAG, "packet queue full, dropping lock pkt");
-            return false;
-        }
-        // repeat the release
-        if (!txQueuePush(&pkt_ac))
-        {
-            ESP_LOGE(TAG, "packet queue full, dropping lock pkt");
-            return false;
-        }
+        sequence[1].doorPress = false;
+        sequence[1].pkt.m_data.value.lock.pressed = false;
+        sequence[1].pkt.m_data.value.cmd = secplus1Codes::LockButtonRelease;
+        accepted = txQueuePushSequence(sequence, 2);
+        if (accepted)
+            txQueuePush(&sequence[1]); // Optional repeated release.
     }
-    // SECURITY2.0
     else
+        accepted = txQueuePush(&sequence[0]);
+    if (!accepted)
     {
-        Packet pkt = Packet(PacketCommand::Lock, data, id_code);
-        PacketAction pkt_ac = {pkt, true, 0};
-        if (!txQueuePush(&pkt_ac))
-        {
-            ESP_LOGE(TAG, "packet queue full, dropping lock pkt");
-            return false;
-        }
+        lockIntent = previous;
+        return false;
     }
+    garage_door.target_lock = value ? TGT_LOCKED : TGT_UNLOCKED;
     return true;
 }
 #endif // USE_GDOLIB
@@ -3953,93 +4071,100 @@ bool set_light(bool value, bool verify)
 
 void sec1_light_press(uint32_t delay)
 {
+    FunctionDelayLock lock;
+    if (!comms_setup_done || !txQueueReady || !txQueueLock())
+        return;
+    // A TTC press holds one queue slot until cancellation or normal completion
+    // converts it into the essential release. Polls and other producers cannot
+    // consume this slot, including when several held presses are queued.
+    const bool alreadyReserved = lightReleaseReserved;
+    if (!alreadyReserved && txQueueCount() + 2 > COMMAND_QUEUE_SIZE)
+    {
+        txQueueUnlock();
+        return;
+    }
+    lightReleaseReserved = true;
     PacketData data;
     data.type = PacketDataType::Light;
     data.value.light.light = LightState::On;
     data.value.light.pressed = true;
     data.value.cmd = secplus1Codes::LightButtonPress;
-    Packet pkt = Packet(PacketCommand::Light, data, id_code);
-    PacketAction pkt_ac = {pkt, true, delay};
-
-    if (!txQueuePush(&pkt_ac))
-    {
-        ESP_LOGE(TAG, "packet queue full, dropping light press pkt");
-        return;
-    }
-    // this better emulates wall panel
-    if (garage_door.wallPanelEmulated)
-    {
+    PacketAction packet = {Packet(PacketCommand::Light, data, id_code), true, delay};
+    packet.doorPress = true;
+    const bool accepted = txQueuePushUnlocked(&packet);
+    if (!accepted && !alreadyReserved)
+        lightReleaseReserved = false;
+    txQueueUnlock();
+    if (accepted && garage_door.wallPanelEmulated)
         sec1_poll_status(secplus1Codes::QueryLightLockStatus);
-    }
 }
 
 void sec1_light_release(uint8_t howManyReleases, uint32_t delay)
 {
+    FunctionDelayLock lock;
+    if (!txQueueReady || !txQueueLock())
+        return; // Reservation remains owned; comms_loop retries it.
     PacketData data;
     data.type = PacketDataType::Light;
     data.value.light.light = LightState::On;
     data.value.light.pressed = false;
     data.value.cmd = secplus1Codes::LightButtonRelease;
-    Packet pkt = Packet(PacketCommand::Light, data, id_code);
-    PacketAction pkt_ac = {pkt, true, delay};
-
-    for (int numReleases = 0; numReleases < std::max(2, (int)howManyReleases); numReleases++)
-    {
-        if (!txQueuePush(&pkt_ac))
-        {
-            ESP_LOGE(TAG, "packet queue full, dropping light release pkt #%d", numReleases);
-        }
-    }
+    PacketAction packet = {Packet(PacketCommand::Light, data, id_code), true, delay};
+    const bool reserved = lightReleaseReserved;
+    lightReleaseReserved = false;
+    const bool accepted = txQueuePushUnlocked(&packet);
+    if (!accepted && reserved)
+        lightReleaseReserved = true;
+    txQueueUnlock();
+    if (!accepted)
+        return;
+    for (int i = 1; i < std::max(2, int(howManyReleases)); ++i)
+        txQueuePush(&packet); // Repetitions are optional; first release is owned.
 }
 
 bool set_light(bool value, bool verify)
 {
-    // return value: true = light state changed, else state unchanged
-    if (verify)
+    FunctionDelayLock lock;
+    if (!comms_setup_done || !txQueueReady)
+        return false;
+    if (verify && (garage_door.light == value || lightIntent.pending(value)))
     {
-        if (garage_door.light == value)
-        {
-            ESP_LOGD(TAG, "Light already %s; ignored request", (value) ? "on" : "off");
-            // Reset last reported so we will update browser with actual state.
-            last_reported_garage_door.light = !value;
-            return false;
-        }
-        else if ((value && pendingLightOn) || (!value && pendingLightOff))
-        {
-            // We have already sent a command to change the light, but haven't received confirmation yet.  Don't send another command.
-            ESP_LOGD(TAG, "Light %s command already pending; ignored duplicate request", (value) ? "on" : "off");
-            return false;
-        }
+        last_reported_garage_door.light = !value;
+        return false;
     }
-
-    ESP_LOGD(TAG, "Set Garage Door Light: %s", (value) ? "on" : "off");
-
-    pendingLightOn = (value == true);
-    pendingLightOff = (value == false);
-
-    // SECURITY+1.0
+    PacketData data;
+    data.type = PacketDataType::Light;
+    data.value.light.light = value ? LightState::On : LightState::Off;
+    data.value.light.pressed = true;
+    if (doorControlType == DOOR_CONTROL_SEC_PLUS_V1)
+        data.value.cmd = secplus1Codes::LightButtonPress;
+    PacketAction sequence[2] = {
+        {Packet(PacketCommand::Light, data, id_code), true, 0},
+        {Packet(PacketCommand::Light, data, id_code), true, 0}};
+    const auto previous = lightIntent;
+    const auto token = lightIntent.begin(value);
+    sequence[0].doorGeneration = token;
+    sequence[0].doorPress = true;
+    sequence[1].doorGeneration = token;
+    bool accepted;
     if (doorControlType == DOOR_CONTROL_SEC_PLUS_V1)
     {
-        // only can toggle the light
-        sec1_light_press();
-        sec1_light_release();
+        sequence[1].doorPress = false;
+        sequence[1].pkt.m_data.value.light.pressed = false;
+        sequence[1].pkt.m_data.value.cmd = secplus1Codes::LightButtonRelease;
+        accepted = txQueuePushSequence(sequence, 2);
+        if (accepted)
+            txQueuePush(&sequence[1]);
     }
-    // SECURITY+2.0
     else
+        accepted = txQueuePush(&sequence[0]);
+    if (!accepted)
     {
-        PacketData data;
-        data.type = PacketDataType::Light;
-        data.value.light.light = (value) ? LightState::On : LightState::Off;
-        Packet pkt = Packet(PacketCommand::Light, data, id_code);
-        PacketAction pkt_ac = {pkt, true, 0};
-        if (!txQueuePush(&pkt_ac))
-        {
-            ESP_LOGE(TAG, "packet queue full, dropping light pkt");
-            return false;
-        }
-        if (verify)
-            send_get_status();
+        lightIntent = previous;
+        return false;
     }
+    if (verify)
+        send_get_status();
     return true;
 }
 

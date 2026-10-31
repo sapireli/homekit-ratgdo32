@@ -51,17 +51,19 @@ struct SerialPort {
     int readBytes(byte *out,int){if(echo<0){now+=timeout;return 0;}*out=echo;return 1;}
     void flush(){}
 }Sec1Serial;
-struct PacketAction {struct {struct {struct {byte cmd=0x30;}value;}m_data;}pkt;uint32_t doorGeneration=0,delay=0;bool doorPress=false;};
+enum class PacketDataType {DoorAction,Light,Lock};
+struct PacketAction {struct {struct {PacketDataType type=PacketDataType::DoorAction;struct {byte cmd=0x30;}value;}m_data;}pkt;uint32_t doorGeneration=0,delay=0;bool doorPress=false;};
 DoorCommandLifecycle doorLifecycle;
 PacketAction *writingDoorPacket=nullptr;
 std::deque<PacketAction> queue;
+bool heldLightReleaseRequired=false;
 bool wallPanelDetected=false;
 uint32_t tx_minimum_delay=0,msg_start=0;
 unsigned txQueueCount(){return queue.size();}
 bool txQueuePeek(PacketAction *out){*out=queue.front();return true;}
 bool txQueuePop(PacketAction *out){*out=queue.front();queue.pop_front();return true;}
 bool transmitSec2(PacketAction&){return false;}
-''' + functions + r'''
+''' + source[source.index('// BEGIN CONTROL OWNERSHIP'):source.index('// END CONTROL OWNERSHIP')] + functions + r'''
 int main(){
     ''' + timeout_setup + r'''
     PacketAction press;press.doorGeneration=doorLifecycle.begin(0,now);press.doorPress=true;
@@ -91,6 +93,39 @@ int main(){
     assert(queue.size()==1&&Sec1Serial.writes==5);
     collision=false;Sec1Serial.echo=0x31;now+=100;process_send_queue();
     assert(queue.empty()&&Sec1Serial.writes==6);
+    // Actual control press goes through the same UART write boundary.
+    PacketAction lightPress;lightPress.pkt.m_data.type=PacketDataType::Light;
+    lightPress.doorPress=true;lightPress.doorGeneration=lightIntent.begin(true);
+    PacketAction lightRelease=lightPress;lightRelease.doorPress=false;
+    lightRelease.pkt.m_data.value.cmd=0x33;
+    Sec1Serial.echo=0x30;assert(process_PacketAction(lightPress));
+    now+=4000;assert(!lightIntent.pending(true));
+    queue.push_back(lightRelease);collision=true;
+    for(unsigned i=0;i<10;++i){now+=100;process_send_queue();}
+    assert(queue.size()==1); // Expiry cannot discard the physical release.
+    collision=false;Sec1Serial.echo=0x33;now+=100;process_send_queue();assert(queue.empty());
+    // A held TTC release survives terminal collisions with no intent token.
+    lightPress.doorGeneration=0;lightRelease.doorGeneration=0;
+    Sec1Serial.echo=0x30;assert(process_PacketAction(lightPress));
+    assert(heldLightReleaseRequired);queue.push_back(lightRelease);collision=true;
+    for(unsigned i=0;i<10;++i){now+=100;process_send_queue();}assert(queue.size()==1);
+    collision=false;Sec1Serial.echo=0x33;now+=100;process_send_queue();
+    assert(queue.empty()&&!heldLightReleaseRequired);
+    // Two raw transactions can coexist; FIFO releases settle only the
+    // preceding press. The second release must retain its own physical debt.
+    queue.push_back(lightPress);queue.push_back(lightRelease);
+    queue.push_back(lightPress);queue.push_back(lightRelease);
+    Sec1Serial.echo=0x30;now+=100;process_send_queue();assert(heldLightReleaseRequired);
+    Sec1Serial.echo=0x33;now+=100;process_send_queue();assert(!heldLightReleaseRequired);
+    Sec1Serial.echo=0x30;now+=100;process_send_queue();assert(heldLightReleaseRequired);
+    collision=true;for(unsigned i=0;i<10;++i){now+=100;process_send_queue();}
+    assert(queue.size()==1&&heldLightReleaseRequired);
+    collision=false;Sec1Serial.echo=0x33;now+=100;process_send_queue();
+    assert(queue.empty()&&!heldLightReleaseRequired);
+    // Terminal pre-write failure retires intent and allows a fresh request.
+    lightPress.doorGeneration=lightIntent.begin(true);queue.push_back(lightPress);collision=true;
+    for(unsigned i=0;i<3;++i){now+=100;process_send_queue();}
+    assert(queue.empty()&&!lightIntent.pending(true));
 }
 '''
         with tempfile.TemporaryDirectory() as directory:

@@ -50,6 +50,7 @@ using QueueHandle_t=Queue*;
 using StaticSemaphore_t=std::mutex;
 using SemaphoreHandle_t=std::mutex*;
 QueueHandle_t pkt_q=nullptr;
+bool txQueueReady=false,lightReleaseReserved=false,heldLightReleaseRequired=false;
 StaticSemaphore_t txQueueMutexStorage;
 SemaphoreHandle_t txQueueMutex=nullptr;
 SemaphoreHandle_t xSemaphoreCreateMutexStatic(StaticSemaphore_t*p){return p;}
@@ -105,7 +106,7 @@ bool door_command(DoorAction action, DoorCommandLifecycle::Intent intent=DoorCom
 PacketAction pollPacket(){PacketData d{};return {Packet(PacketCommand::DoorAction,d,0),false,0};}
 void reset(unsigned filled){
     pendingDoorCommand=false;pausePress=false;pressQueued=false;continuePress=false;
-    assert(txQueueCreate());for(unsigned i=0;i<filled;++i)queueState.items.push_back(pollPacket());
+    queueState.items.clear();assert(txQueueCreate());for(unsigned i=0;i<filled;++i)queueState.items.push_back(pollPacket());
 }
 int main(){
     reset(0);comms_setup_done=false;

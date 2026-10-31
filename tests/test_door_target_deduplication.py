@@ -52,7 +52,7 @@ void door_command_close();void door_command_open();
 ''' + functions + r'''
 PacketAction pollPacket(){PacketData d{};return {Packet(PacketCommand::DoorAction,d,0),false,0};}
 void reset(unsigned filled,GarageDoorCurrentState state){
-    doorLifecycle.reset();pendingDoorCommand=false;assert(txQueueCreate());
+    doorLifecycle.reset();pendingDoorCommand=false;queueState.items.clear();assert(txQueueCreate());
     for(unsigned i=0;i<filled;++i)queueState.items.push_back(pollPacket());
     garage_door.current_state=state;config.reverse=false;
     garage_door.target_state=(state==CURR_CLOSED||state==CURR_CLOSING)?1:0;
