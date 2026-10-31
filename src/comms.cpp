@@ -244,10 +244,18 @@ public:
     }
     ~FunctionDelayLock()
     {
-#ifdef ESP32
-        xSemaphoreGiveRecursive(functionDelayMutex());
-#endif
+        unlock();
     }
+    void unlock()
+    {
+#ifdef ESP32
+        if (held)
+            xSemaphoreGiveRecursive(functionDelayMutex());
+#endif
+        held = false;
+    }
+private:
+    bool held = true;
 };
 bool functionDelayActive()
 {
@@ -3148,6 +3156,12 @@ void processFunctionDelay()
         cancelFunctionDelay();
         if (callback == door_command_close && !comms_setup_done)
             return;
+        // Restart/network callbacks may tear down a driver and wait for its
+        // event task. Do not hold a control lock while waiting for that task.
+        // Door Close keeps the lock across acceptance and actuation so an Open
+        // cannot cancel between the two steps.
+        if (callback != door_command_close)
+            lock.unlock();
         if (callback)
             callback();
         return;
