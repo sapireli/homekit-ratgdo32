@@ -331,7 +331,7 @@ void web_loop()
     }
 
     TAKE_MUTEX();
-    JSON_START(json);
+    JSON_START(json, LOOP_JSON_BUFFER_SIZE);
 #ifdef USE_DHT22
     // DHT22 sensor read and config
     int dht22Pin = userConfig->contains(cfg_dht22Pin) ? std::get<int>(userConfig->get(cfg_dht22Pin)) : -1;
@@ -757,7 +757,7 @@ void build_status_json(char *json)
 {
     // Build the JSON string
     _millis_t upTime = _millis();
-    JSON_START(json);
+    JSON_START(json, STATUS_JSON_BUFFER_SIZE);
     JSON_ADD_STR("gitRepo", gitRepo);
     JSON_ADD_INT("upTime", upTime);
     JSON_ADD_STR(cfg_deviceName, userConfig->getDeviceName());
@@ -1278,7 +1278,7 @@ void SSEheartbeat(SSESubscription *s)
         static int8_t lastRSSI = 0;
         static char *json = loop_json;
         TAKE_MUTEX();
-        JSON_START(json);
+        JSON_START(json, LOOP_JSON_BUFFER_SIZE);
         JSON_ADD_INT("upTime", _millis());
         JSON_ADD_INT("freeHeap", free_heap);
         JSON_ADD_INT("minHeap", min_heap);
@@ -1775,7 +1775,7 @@ void handle_firmware_upload()
                 {
                     static char *json = loop_json;
                     TAKE_MUTEX();
-                    JSON_START(json);
+                    JSON_START(json, LOOP_JSON_BUFFER_SIZE);
                     JSON_ADD_INT("uploadPercent", uploadPercent);
                     JSON_END();
                     JSON_REMOVE_NL(json);
