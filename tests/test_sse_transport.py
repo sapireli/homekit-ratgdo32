@@ -20,6 +20,7 @@ fixture = r'''
 static unsigned allocations;
 void *operator new(size_t size) { ++allocations; if (void *p = malloc(size)) return p; throw std::bad_alloc(); }
 void operator delete(void *p) noexcept { free(p); }
+void operator delete(void *p, std::size_t) noexcept { free(p); }
 static char captured[20000];
 static size_t capturedLength;
 static unsigned calls, failAt, flushes, closed;
