@@ -399,7 +399,7 @@ static bool pendingDoorCommand = false;
 
 // prototypes
 bool process_PacketAction(PacketAction &pkt_ac);
-void door_command(DoorAction action);
+bool door_command(DoorAction action);
 void door_command_open();
 void door_command_close();
 bool transmitSec1(byte toSend);
@@ -607,7 +607,9 @@ void setup_comms()
     if (doorControlType == DOOR_CONTROL_SEC_PLUS_V1)
     {
         ESP_LOGI(TAG, "=== Setting up comms for SECURITY+1.0 protocol");
+#ifdef ESP32
         gpio_set_level(STATUS_DOOR_PIN, 0);
+#endif
         pinMode(STATUS_DOOR_PIN, OUTPUT);
         digitalWrite(STATUS_DOOR_PIN, LOW); // initial state, LOW == door closed or wall panel connected
         wpDisconnectOnTx = userConfig->getWpDisconnectOnTx();
@@ -639,7 +641,9 @@ void setup_comms()
     else if (doorControlType == DOOR_CONTROL_SEC_PLUS_V2)
     {
         ESP_LOGI(TAG, "=== Setting up comms for SECURITY+2.0 protocol");
+#ifdef ESP32
         gpio_set_level(STATUS_DOOR_PIN, 0);
+#endif
         pinMode(STATUS_DOOR_PIN, OUTPUT);
         digitalWrite(STATUS_DOOR_PIN, LOW); // initial state, LOW == door closed or wall panel connected
         sw_serial.begin(9600, SWSERIAL_8N1, UART_RX_PIN, UART_TX_PIN, true, 32);
@@ -652,6 +656,7 @@ void setup_comms()
     else
     {
         ESP_LOGI(TAG, "=== Setting up comms for dry contact protocol");
+#ifdef ESP32
         // Using low-level GPIO configuration to ensure that the pins are correctly initialized with pull-downs and output levels
         gpio_config_t io_conf = {
             .pin_bit_mask = (1ULL << UART_TX_PIN),
@@ -661,15 +666,19 @@ void setup_comms()
             .intr_type = GPIO_INTR_DISABLE};
         gpio_config(&io_conf);
         gpio_set_level(UART_TX_PIN, 0);
-        pinMode(UART_TX_PIN, OUTPUT);
         io_conf.pin_bit_mask = (1ULL << DISCRETE_OPEN_PIN);
         gpio_config(&io_conf);
         gpio_set_level(DISCRETE_OPEN_PIN, 0);
-        pinMode(DISCRETE_OPEN_PIN, OUTPUT);
         io_conf.pin_bit_mask = (1ULL << DISCRETE_CLOSE_PIN);
         gpio_config(&io_conf);
         gpio_set_level(DISCRETE_CLOSE_PIN, 0);
+#endif
+        pinMode(UART_TX_PIN, OUTPUT);
+        digitalWrite(UART_TX_PIN, LOW);
+        pinMode(DISCRETE_OPEN_PIN, OUTPUT);
+        digitalWrite(DISCRETE_OPEN_PIN, LOW);
         pinMode(DISCRETE_CLOSE_PIN, OUTPUT);
+        digitalWrite(DISCRETE_CLOSE_PIN, LOW);
     }
     force_recover.push_count = 0;
     force_recover.enable = true;
@@ -1091,35 +1100,6 @@ void update_door_state(GarageDoorCurrentState current_state)
     case GarageDoorCurrentState::CURR_STOPPED:
         // If timer that checks door completely opens/closes is active, cancel it.
         checkDoorCompleted.detach();
-        if (stopSentClosePending || stopSentOpenPending)
-        {
-            // One or other of these will always be zero...
-            // It can take up to two seconds for us to get stopped state from Sec+1.0 doors.
-            if (_millis() - (stopSentClosePending + stopSentOpenPending) < 2000)
-            {
-                // We sent a stop command, and have received a response from the GDO. So now will followup with the close or open command.
-                if (stopSentOpenPending)
-                {
-                    door_command_open();
-                    // Sec+2.0 doors seem to require the command to be sent twice immediately after a stop
-                    if (doorControlType == DOOR_CONTROL_SEC_PLUS_V2)
-                        door_command_open();
-                }
-                else if (stopSentClosePending)
-                {
-                    door_command_close();
-                    // Sec+2.0 doors seem to require the command to be sent twice immediately after a stop
-                    if (doorControlType == DOOR_CONTROL_SEC_PLUS_V2)
-                        door_command_close();
-                }
-            }
-            else
-            {
-                ESP_LOGI(TAG, "Door did not respond to our stop command in time (2 seconds), do not send door command");
-            }
-            stopSentClosePending = 0;
-            stopSentOpenPending = 0;
-        }
         break;
     default:
         // We logged an error in the previous switch()
@@ -1200,6 +1180,26 @@ void update_door_state(GarageDoorCurrentState current_state)
         if (!wpDisconnectOnTx && (doorControlType != DOOR_CONTROL_DRY_CONTACT))
             digitalWrite(STATUS_DOOR_PIN, current_state == GarageDoorCurrentState::CURR_CLOSED ? LOW : HIGH);
         notify_homekit_target_door_state_change(target_state);
+    }
+    // A follow-up command must observe the stopped state just reported above.
+    if (current_state == GarageDoorCurrentState::CURR_STOPPED &&
+        (stopSentClosePending || stopSentOpenPending))
+    {
+        const _millis_t stopTime = stopSentClosePending + stopSentOpenPending;
+        const bool reverseOpen = stopSentOpenPending != 0;
+        stopSentClosePending = 0;
+        stopSentOpenPending = 0;
+        if (_millis() - stopTime < 2000)
+        {
+            if (reverseOpen)
+                door_command_open();
+            else
+                door_command_close();
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Door did not respond to our stop command in time (2 seconds), do not send door command");
+        }
     }
 }
 
@@ -2576,12 +2576,12 @@ bool process_PacketAction(PacketAction &pkt_ac)
     return false;
 }
 
-void door_command(DoorAction action)
+bool door_command(DoorAction action)
 {
     if (pendingDoorCommand)
     {
         ESP_LOGW(TAG, "Pending door command exists, dropping new command");
-        return;
+        return false;
     }
 
     if (doorControlType != DOOR_CONTROL_DRY_CONTACT)
@@ -2600,7 +2600,7 @@ void door_command(DoorAction action)
         if (!txQueuePush(&pkt_ac))
         {
             ESP_LOGE(TAG, "packet queue full, dropping door command pressed pkt");
-            return;
+            return false;
         }
 
         /* Removing this section as testing with 398LM (a 0x37 wall panel) was never successful.
@@ -2621,7 +2621,7 @@ void door_command(DoorAction action)
         if (!txQueuePush(&pkt_ac))
         {
             ESP_LOGE(TAG, "packet queue full, dropping door command release pkt");
-            return;
+            return false;
         }
         pendingDoorCommand = true;
 
@@ -2631,7 +2631,8 @@ void door_command(DoorAction action)
             if (!txQueuePush(&pkt_ac))
             {
                 ESP_LOGE(TAG, "packet queue full, dropping door command release pkt");
-                return;
+                // The press and first release were already queued.
+                return true;
             }
         }
         send_get_status();
@@ -2646,12 +2647,12 @@ void door_command(DoorAction action)
         if (action == DoorAction::Open && garage_door.current_state == GarageDoorCurrentState::CURR_OPEN)
         {
             ESP_LOGW(TAG, "The door is already open. Ignoring request to open.");
-            return;
+            return false;
         }
         if (action == DoorAction::Close && garage_door.current_state == GarageDoorCurrentState::CURR_CLOSED)
         {
             ESP_LOGW(TAG, "The door is already closed. Ignoring request to close.");
-            return;
+            return false;
         }
 
         if (action == DoorAction::Open)
@@ -2677,6 +2678,7 @@ void door_command(DoorAction action)
         toggleTimer.once_ms(500, []()
                             { digitalWrite(UART_TX_PIN, LOW); });
     }
+    return true;
 }
 
 #endif // not USE_GDOLIB
@@ -2692,22 +2694,26 @@ void door_command_close()
     if ((doorControlType == DOOR_CONTROL_DRY_CONTACT) || (garage_door.pinModeObstructionSensor && !userConfig->getUseToggle()))
     {
         ESP_LOGD(TAG, "Closing door");
-        door_command(DoorAction::Close);
+        if (!door_command(DoorAction::Close))
+            return;
     }
     else
     {
         ESP_LOGD(TAG, "Toggle from current state: %s, target state: %s", DOOR_STATE(garage_door.current_state), DOOR_STATE(garage_door.target_state));
         if (garage_door.current_state == GarageDoorCurrentState::CURR_OPEN)
         {
-            door_command(DoorAction::Toggle);
+            if (!door_command(DoorAction::Toggle))
+                return;
         }
         else if (garage_door.current_state == GarageDoorCurrentState::CURR_STOPPED)
         {
-            door_command(DoorAction::Toggle);
+            if (!door_command(DoorAction::Toggle))
+                return;
         }
         else
         {
             ESP_LOGI(TAG, "Ignoring close request for current and target state");
+            return;
         }
     }
 
