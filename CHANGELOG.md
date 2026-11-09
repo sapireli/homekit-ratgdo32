@@ -4,6 +4,10 @@
 
 All notable changes to `homekit-ratgdo32` will be documented in this file. This project tries to adhere to [Semantic Versioning](http://semver.org/).
 
+## v1.4.9 (unreleased)
+
+* Add a network link watchdog. The device could stay associated to the access point while its link stopped passing traffic (45-100% packet loss, multi-second latency), and nothing recovered it until the scheduled reboot. It now pings the gateway every 30 seconds; after about two minutes of 30% or worse loss it reconnects WiFi, and if the link is still degraded after that, it reboots. Each step is logged with loss and RSSI. The watchdog stays inactive until the gateway has answered at least once.
+
 ## v1.4.8 (unreleased)
 
 * Load saved logs without waiting for the live event stream to connect.
