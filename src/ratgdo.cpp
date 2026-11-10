@@ -656,15 +656,10 @@ static void link_watchdog_loop(_millis_t current_millis)
         switch (r.action)
         {
         case LINK_RECONNECT:
-            ESP_LOGW(TAG, "Link degraded: %u%% gateway ping loss over %lus, RSSI %d dBm. Reconnecting WiFi",
-                     r.lossPct, windowSecs, WiFi.RSSI());
+            ESP_LOGW(TAG, "Link degraded: %u%% gateway ping loss over %lus, RSSI %d dBm. Reconnecting WiFi (next reconnect no sooner than %lus)",
+                     r.lossPct, windowSecs, WiFi.RSSI(), r.holdWindows * windowSecs);
             // HomeSpan sees the disconnect and reconnects through wifiBegin().
             WiFi.disconnect();
-            break;
-        case LINK_REBOOT:
-            ESP_LOGE(TAG, "Link still degraded after WiFi reconnect: %u%% gateway ping loss over %lus, RSSI %d dBm. Rebooting",
-                     r.lossPct, windowSecs, WiFi.RSSI());
-            sync_and_restart();
             break;
         case LINK_RECOVERED:
             ESP_LOGW(TAG, "Link recovered by WiFi reconnect (healthy %lus), RSSI %d dBm",

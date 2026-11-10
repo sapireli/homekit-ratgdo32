@@ -2,11 +2,16 @@
  * Network link watchdog decision logic (no platform dependencies).
  *
  * The device can stay associated to the access point while its link stops
- * passing traffic (observed: 45-100% loss, multi-second RTT, cleared only by
- * reboot). Nothing raises a disconnect event in that state, so nothing
- * recovers it. The caller pings the gateway periodically and feeds each
- * ping session's sent/received counts here. A sustained-loss window first
- * forces a WiFi reconnect; a second bad window after that reboots.
+ * passing traffic (observed: 45-100% loss, multi-second RTT). Nothing raises a
+ * disconnect event in that state, so nothing recovers it. The caller pings the
+ * gateway periodically and feeds each ping session's sent/received counts here.
+ *
+ * A degraded window forces a WiFi reconnect, which cleared every device-side
+ * episode in the field. When the cause is the radio environment (e.g. a
+ * congested channel) nothing local helps, so reconnects that did not fix the
+ * link are spaced out exponentially instead of escalating. Rebooting is never
+ * used: it cleared none of the field episodes and costs a HomeKit outage each
+ * time. The scheduled reboot remains the backstop for a wedged device.
  */
 #pragma once
 #include <stdint.h>
@@ -17,12 +22,13 @@
 #define LINK_WINDOW_CHECKS 4               // sessions per evaluation window (~2 min)
 #define LINK_BAD_LOSS_PCT 30               // window loss that counts as degraded
 #define LINK_RECOVERED_WINDOWS 5           // healthy windows after reconnect to call it recovered
+#define LINK_BACKOFF_FIRST_WINDOWS 2       // windows between reconnects at first (~4 min)
+#define LINK_BACKOFF_MAX_WINDOWS 16        // backoff cap (~32 min)
 
 enum LinkAction : uint8_t
 {
     LINK_NONE,
     LINK_RECONNECT,
-    LINK_REBOOT,
     LINK_RECOVERED,
 };
 
@@ -33,6 +39,8 @@ struct LinkWatch
     bool skipWindow = false;  // discard the window that spans our own reconnect
     uint8_t checks = 0;
     uint8_t healthyWindows = 0;
+    uint8_t holdWindows = 0;                           // windows left before another reconnect
+    uint8_t backoffWindows = LINK_BACKOFF_FIRST_WINDOWS; // hold applied after the next reconnect
     uint16_t sent = 0;
     uint16_t lost = 0;
 };
@@ -40,13 +48,14 @@ struct LinkWatch
 struct LinkResult
 {
     LinkAction action;
-    bool evaluated;   // a window completed on this call
-    uint8_t lossPct;  // loss of the completed window
+    bool evaluated;      // a window completed on this call
+    uint8_t lossPct;     // loss of the completed window
+    uint8_t holdWindows; // after LINK_RECONNECT: windows until another one is allowed
 };
 
 static inline LinkResult link_watch_step(LinkWatch &w, uint32_t sent, uint32_t received)
 {
-    LinkResult r = {LINK_NONE, false, 0};
+    LinkResult r = {LINK_NONE, false, 0, 0};
     if (received > sent)
         received = sent;
     if (received > 0)
@@ -65,6 +74,8 @@ static inline LinkResult link_watch_step(LinkWatch &w, uint32_t sent, uint32_t r
     w.checks = 0;
     w.sent = 0;
     w.lost = 0;
+    if (w.holdWindows > 0)
+        w.holdWindows--;
 
     if (w.skipWindow)
     {
@@ -76,21 +87,23 @@ static inline LinkResult link_watch_step(LinkWatch &w, uint32_t sent, uint32_t r
     if (r.lossPct >= LINK_BAD_LOSS_PCT)
     {
         w.healthyWindows = 0;
-        if (!w.reconnected)
+        if (w.holdWindows == 0)
         {
             w.reconnected = true;
             w.skipWindow = true;
+            w.holdWindows = w.backoffWindows;
+            if (w.backoffWindows < LINK_BACKOFF_MAX_WINDOWS)
+                w.backoffWindows *= 2;
             r.action = LINK_RECONNECT;
-        }
-        else
-        {
-            r.action = LINK_REBOOT;
+            r.holdWindows = w.holdWindows;
         }
     }
     else if (w.reconnected && ++w.healthyWindows >= LINK_RECOVERED_WINDOWS)
     {
         w.reconnected = false;
         w.healthyWindows = 0;
+        w.holdWindows = 0;
+        w.backoffWindows = LINK_BACKOFF_FIRST_WINDOWS;
         r.action = LINK_RECOVERED;
     }
     return r;
