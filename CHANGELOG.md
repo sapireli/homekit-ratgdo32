@@ -6,6 +6,7 @@ All notable changes to `homekit-ratgdo32` will be documented in this file. This 
 
 ## v1.4.9 (unreleased)
 
+* Merge upstream ratgdo/homekit-ratgdo32 v3.5.6. The only new change for this branch is a `/healthcheck` endpoint that returns `OK`; the log ring, IPv4 refresh, auto-reversal, ESP8266 and Wi-Fi scan fixes in that release were already included.
 * Add a network link watchdog. The device could stay associated to the access point while its link stopped passing traffic (45-100% packet loss, multi-second latency), and nothing recovered it until the scheduled reboot. It now pings the gateway every 30 seconds and, after about two minutes of 30% or worse loss, reconnects WiFi. If the link stays degraded (for example a congested channel, which no local action can fix), further reconnects back off to 4, 8, 16 and then 32 minutes apart, and the backoff resets once the link has been healthy for 10 minutes. The watchdog never reboots: in field testing reboots cleared none of the degraded episodes and each one cost a HomeKit outage; the scheduled reboot remains the backstop. Each step is logged with loss and RSSI. The watchdog stays inactive until the gateway has answered at least once.
 
 ## v1.4.8 (unreleased)
