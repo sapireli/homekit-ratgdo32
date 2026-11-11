@@ -114,7 +114,7 @@ void add_dynamic_mdns();
 bool retainedBySSE(int fd);
 #endif
 
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT) && defined(RATGDO_RUNTIME_DIAGNOSTICS)
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
 void handle_http_lifecycle();
 #endif
 
@@ -122,7 +122,7 @@ void handle_http_lifecycle();
 const char restEvents[] = "/rest/events/";
 const std::unordered_map<std::string, std::pair<const HTTPMethod, void (*)()>> builtInUri = {
     {"/status.json", {HTTP_GET, handle_status}},
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT) && defined(RATGDO_RUNTIME_DIAGNOSTICS)
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
     {"/diag/http.json", {HTTP_GET, handle_http_lifecycle}},
 #endif
     {"/reset", {HTTP_POST, handle_reset}},
@@ -186,7 +186,6 @@ _millis_t httpOwnedNow = 0, httpOwnedPolledAt = 0;
 uint32_t httpOwnedPayload = 0;
 // Main-only evidence: never read callback-owned entries/payload from a handler.
 uint32_t httpOwnedCurrentPayload = 0, httpOwnedLastPayload = 0;
-#ifdef RATGDO_RUNTIME_DIAGNOSTICS
 constexpr size_t HTTP_OWNED_JSON_SIZE = 384;
 
 int httpOwnedEvidence(char *json, size_t capacity)
@@ -204,8 +203,6 @@ int httpOwnedEvidence(char *json, size_t capacity)
                     static_cast<unsigned long>(httpOwnedCurrentPayload),
                     static_cast<unsigned long>(httpOwnedLastPayload));
 }
-
-#endif
 
 // Core callback: no application logging, sockets, owner methods or pointer
 // retention beyond the retained owner. Main cannot touch owners while pending.
@@ -1246,7 +1243,7 @@ static bool requestAuthenticated()
     return true;
 }
 
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT) && defined(RATGDO_RUNTIME_DIAGNOSTICS)
+#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
 void handle_http_lifecycle()
 {
     if (!requestAuthenticated())
