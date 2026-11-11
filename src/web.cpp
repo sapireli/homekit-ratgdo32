@@ -112,9 +112,6 @@ void add_dynamic_mdns();
 
 #if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
 bool retainedBySSE(int fd);
-#endif
-
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
 void handle_http_lifecycle();
 #endif
 
