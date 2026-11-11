@@ -8,6 +8,9 @@ All notable changes to `homekit-ratgdo32` will be documented in this file. This 
 
 * Merge upstream ratgdo/homekit-ratgdo32 v3.5.6. The only new change for this branch is a `/healthcheck` endpoint that returns `OK`; the log ring, IPv4 refresh, auto-reversal, ESP8266 and Wi-Fi scan fixes in that release were already included.
 * Includes the v1.4.9 network link watchdog below.
+* Validate firmware upload size and MD5 strictly before stopping any services, reject uploads larger than the free space without arithmetic underflow, and keep a failed or abandoned upload's recovery from closing a web response that is still being inspected.
+* Report `/diag/http.json` delivery and cleanup counters whenever bounded HTTP response handling is enabled.
+* Keep shared fixes identical to the matching upstream pull requests (ratgdo/homekit-ratgdo32 #208, #210, #211, #216, #217, #218, #231, #234, #235).
 
 ## v1.4.9 (unreleased)
 
