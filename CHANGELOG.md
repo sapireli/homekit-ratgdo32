@@ -4,6 +4,16 @@
 
 All notable changes to `homekit-ratgdo32` will be documented in this file. This project tries to adhere to [Semantic Versioning](http://semver.org/).
 
+## v1.4.11 (unreleased)
+
+* Match the shared fixes to the upstream review (ratgdo/homekit-ratgdo32 #208, #217, #218, #234, #236, #237):
+  * Firmware uploads read size and MD5 the way upstream does again; the stricter checks from 1.4.10 are gone. The recovery restart uses wrap-safe timing.
+  * The panic handler pulls the transmitter low. The larger startup/shutdown transmitter code and its IRAM check are removed; normal restarts already pull it low.
+  * Security+ 1.0 still reads each echoed byte within 20 ms, now proposed upstream as #237.
+  * Logs written while the network stack holds its lock reach the serial port instead of being dropped.
+  * `freeHeap`, `minHeap` and the new `maxAllocHeap` describe byte-addressable internal heap, and `minHeap` is the exact low point. The separate `*Internal8Bit` status fields are removed.
+  * The link watchdog moved into `ratgdo.cpp`; its behavior is unchanged.
+
 ## v1.4.10 (unreleased)
 
 * Merge upstream ratgdo/homekit-ratgdo32 v3.5.6. The only new change for this branch is a `/healthcheck` endpoint that returns `OK`; the log ring, IPv4 refresh, auto-reversal, ESP8266 and Wi-Fi scan fixes in that release were already included.
