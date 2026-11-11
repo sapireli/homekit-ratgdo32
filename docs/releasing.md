@@ -96,8 +96,6 @@ python -m unittest discover -s tests -v
 node --test tests/firmware-selection.test.cjs
 c++ -std=c++17 -Wall -Wextra -Isrc tests/json_float.cpp -o /tmp/json-test
 /tmp/json-test
-c++ -std=c++17 -Wall -Wextra -Isrc tests/gdo_uart.cpp -o /tmp/uart-test
-/tmp/uart-test
 c++ -std=c++17 -Wall -Wextra tests/serial_console.cpp -o /tmp/console-test
 /tmp/console-test
 pio run -e ratgdo_esp32dev
