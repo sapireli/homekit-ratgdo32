@@ -4,6 +4,15 @@
 
 All notable changes to `homekit-ratgdo32` will be documented in this file. This project tries to adhere to [Semantic Versioning](http://semver.org/).
 
+## v1.5.0 (unreleased)
+
+* Live updates no longer stall the device when a browser stops reading (ratgdo/homekit-ratgdo32 #239 and #240, which replace #210):
+  * On ESP32 each SSE event goes out in one nonblocking write. A stalled stream is closed instead of blocking for seconds; the log viewer drops a line when its connection is backed up instead of disconnecting.
+  * A lock guards the SSE subscriptions between the main loop and tasks that log. Heartbeats are sent from the main loop and during firmware uploads, so the update page keeps its progress on long uploads.
+  * A stream request for another or an empty id can't take over a subscription, and a subscription is only counted once when it is removed.
+  * #210's separate cleanup of failed streams under the HTTP lifecycle experiment is gone; a failed stream is closed directly, as upstream does.
+* Take upstream's logger cleanup with its follow-up (ratgdo/homekit-ratgdo32 #238): the logger writes straight to the UART, and a line that can't get the logger lock is no longer printed while serial logging is off. On Rev1 serial logging still stays off while I2C holds the UART pins.
+
 ## v1.4.11 (unreleased)
 
 * Match the shared fixes to the upstream review (ratgdo/homekit-ratgdo32 #208, #217, #218, #234, #236, #237):
