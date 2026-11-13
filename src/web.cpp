@@ -19,6 +19,10 @@
 #include <tuple>
 #include <unordered_map>
 #include <time.h>
+#ifndef ESP8266
+#include <atomic>
+#include <cstdint>
+#endif
 #ifdef ESP32
 #include <shared_mutex>
 #include <mutex>
@@ -26,8 +30,6 @@
 
 // Third-party sensor libraries
 #include <DHT.h>
-#include <atomic>
-#include <cstdint>
 
 // ESP system includes
 #include <Ticker.h>
@@ -106,11 +108,11 @@ char *test_str = NULL;
 void handle_update();
 void handle_firmware_upload();
 void SSEHandler(uint32_t channel);
+static void sendSSEHeartbeats();
 void add_static_mdns();
 void add_dynamic_mdns();
 
 #if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
-bool retainedBySSE(int fd);
 void handle_http_lifecycle();
 #endif
 
@@ -166,7 +168,6 @@ struct HttpOwnedResponse {
     ip_addr_t localIP{}, remoteIP{};
     uint16_t localPort = 0, remotePort = 0;
     bool initialized = false, reported = false;
-    bool discardQueued = false;
     _millis_t lastProgress = 0;
 };
 struct HttpOwnedCounters {
@@ -284,11 +285,7 @@ void httpOwnedInspect(void *)
             entry.lastAck = pcb->lastack;
             entry.lastProgress = httpOwnedNow;
         }
-        // Retired streams have no active consumer. Discard their queued tail
-        // immediately after verifying ownership, rather than retaining up to
-        // eight send buffers through serial HTTP timeout windows.
-        if ((entry.discardQueued && (retained != 0 || truncated)) ||
-            (!truncated && httpOwnedNow - entry.lastProgress >= HTTP_MAX_SEND_WAIT))
+        if (!truncated && httpOwnedNow - entry.lastProgress >= HTTP_MAX_SEND_WAIT)
         {
             // tcp_abort frees queues/PCB and invokes the original netconn
             // err_tcp callback. Never dereference pcb after this call.
@@ -426,7 +423,7 @@ void setupHttpOwnedExperiment()
         // stay excluded too: existing dispatch converts them with atoi().
         const bool eventStream = web.method() == HTTP_GET &&
                                  uri.startsWith("/rest/events/") && uri != "/rest/events/subscribe";
-        if (uri == "/update" || uri == "/reboot" || uri == "/reset")
+        if (eventStream || uri == "/update" || uri == "/reboot" || uri == "/reset")
             return next();
         HttpOwnedResponse *slot = nullptr;
         for (auto &entry : httpOwned)
@@ -436,11 +433,6 @@ void setupHttpOwnedExperiment()
         NetworkClient retained = web.client(); // Strong reference before handler.
         const bool handled = next();
         const int fd = retained.fd(); // A failed write may already have stopped it.
-        // Successful streams, including failed headers awaiting retirement,
-        // retain their owner in the subscription. Invalid/rejected stream
-        // requests produce ordinary responses and still need bounded cleanup.
-        if (eventStream && fd >= 0 && retainedBySSE(fd))
-            return handled;
         if (fd >= 0)
         {
             slot->owner = retained;
@@ -547,145 +539,30 @@ constexpr char gitTaggedURL[] = "https://raw.githubusercontent.com/" _GITUSER "/
 // Just reloading page causes register on new channel.  So we need a reasonable number
 // to accommodate "extra" until old one is detected as disconnected.
 #define SSE_MAX_CHANNELS 8
-// SSE lifecycle helpers are local to the HTTP implementation.
-// Claim removal before cleanup or diagnostics, either of which may log and
-// synchronously reenter the broadcaster. Only the winning caller owns cleanup.
-template <typename Cleanup, typename Notify>
-bool retireSSESubscription(std::atomic<bool> &active,
-                           std::atomic<uint32_t> &count,
-                           Cleanup cleanup, Notify notify)
-{
-    if (!active.exchange(false))
-        return false;
-    const uint32_t remaining = count.fetch_sub(1) - 1;
-    cleanup();
-    notify(remaining);
-    return true;
-}
-
-// Ticker callbacks never touch clients or wait for the lifecycle lock.
-inline void requestSSEHeartbeat(std::atomic<bool> &pending) { pending.store(true); }
-inline bool takeSSEHeartbeat(std::atomic<bool> &pending) { return pending.exchange(false); }
-
-// The caller holds the lifecycle lock while checking and assigning the client.
-template <typename UUID, typename Client>
-bool bindSSEClient(bool active, const UUID &registeredUUID,
-                   const UUID &requestedUUID, Client &current, const Client &incoming)
-{
-    if (!active || registeredUUID != requestedUUID)
-        return false;
-    current = incoming;
-    return true;
-}
-
 struct SSESubscription
 {
     IPAddress clientIP;
     WiFiClient client;
     Ticker heartbeatTimer;
-    std::atomic<bool> heartbeatPending{false};
     uint32_t heartbeatInterval;
-    std::atomic<bool> active{false};
     bool SSEconnected;
     int SSEfailCount;
     String clientUUID;
     bool logViewer;
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
-    bool retiring = false;
+    // Set by heartbeatTimer, sent from the main loop by sendSSEHeartbeats().
+#ifdef ESP8266
+    volatile bool heartbeatDue;
+#else
+    std::atomic<bool> heartbeatDue;
 #endif
 };
-void SSEheartbeat(SSESubscription *s);
 SSESubscription subscription[SSE_MAX_CHANNELS];
 // During firmware update note which subscribed client is updating
-std::atomic<SSESubscription *> firmwareUpdateSub{nullptr};
-std::atomic<uint32_t> subscriptionCount{0};
+SSESubscription *firmwareUpdateSub = NULL;
+uint32_t subscriptionCount = 0;
 
-// All subscription fields and clients are protected by this lock. Logger
-// broadcasts must never wait: callers can hold the logger's own mutex.
-#ifdef ESP8266
-static bool sseLocked = false;
-#else
-static SemaphoreHandle_t sseMutex = NULL;
-#endif
-class SSELock
-{
-public:
-    explicit SSELock(bool tryOnly = false)
-    {
-#ifdef ESP8266
-        (void)tryOnly;
-        acquired = !sseLocked;
-        if (acquired) sseLocked = true;
-#else
-        acquired = sseMutex && xSemaphoreTake(sseMutex, tryOnly ? 0 : portMAX_DELAY) == pdTRUE;
-#endif
-    }
-    ~SSELock()
-    {
-        if (!acquired) return;
-#ifdef ESP8266
-        sseLocked = false;
-#else
-        xSemaphoreGive(sseMutex);
-#endif
-    }
-    explicit operator bool() const { return acquired; }
-private:
-    bool acquired;
-};
-
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
-bool retainedBySSE(int fd)
-{
-    SSELock lock;
-    if (!lock) return false;
-    for (const auto &s : subscription)
-        if ((s.active || s.retiring) && s.client.fd() == fd)
-            return true;
-    return false;
-}
-
-// Main only. Retiring clients remain strongly owned by their existing SSE
-// slots until one of the two HTTP retirement slots is available. No close or
-// replacement can orphan their queued payload while waiting for handoff.
-bool drainRetiredSSE()
-{
-    if (httpOwnedPending)
-        return false;
-    SSELock lock;
-    if (!lock) return false;
-    bool waiting = false;
-    for (auto &s : subscription)
-    {
-        if (!s.retiring)
-            continue;
-        const int fd = s.client.fd();
-        if (fd >= 0)
-        {
-            HttpOwnedResponse *slot = nullptr;
-            for (auto &entry : httpOwned)
-                if (entry.state == HttpOwnedState::Empty) { slot = &entry; break; }
-            if (!slot)
-            {
-                waiting = true;
-                continue;
-            }
-            slot->owner = s.client; // Retain first, then detach the SSE alias.
-            slot->fd = fd;
-            slot->generation = ++httpOwnedCounters.tracked;
-            slot->lastProgress = static_cast<uint32_t>(_millis());
-            slot->discardQueued = true;
-            slot->state = HttpOwnedState::Active;
-        }
-        s.client = WiFiClient(); // Never stop() an alias of the retained owner.
-        s.clientIP = INADDR_NONE;
-        s.clientUUID.clear();
-        s.retiring = false;
-    }
-    return !waiting && httpOwnedRoom();
-}
-#endif
-
+// Performance management - removed redundant connection tracking
+#define MIN_REQUEST_INTERVAL_MS 100
 
 // Performance monitoring
 static uint32_t request_count = 0;
@@ -704,6 +581,30 @@ static SemaphoreHandle_t jsonMutex = NULL;
 #define GIVE_MUTEX() \
     if (jsonMutex)   \
     xSemaphoreGive(jsonMutex)
+#endif
+
+// Serializes the SSE subscriptions between the main loop and tasks that log.
+// Take it after the JSON mutex. It is recursive, so SSE code can log and that
+// line still reaches the log viewer.
+#ifdef ESP8266
+struct SSELock
+{
+    explicit SSELock(bool = true) {}
+    explicit operator bool() const { return true; }
+};
+#else
+static SemaphoreHandle_t sseMutex = NULL;
+struct SSELock
+{
+    const bool held;
+    explicit SSELock(bool wait = true) : held(xSemaphoreTakeRecursive(sseMutex, wait ? portMAX_DELAY : 0) == pdTRUE) {}
+    ~SSELock()
+    {
+        if (held)
+            xSemaphoreGiveRecursive(sseMutex);
+    }
+    explicit operator bool() const { return held; }
+};
 #endif
 
 // mDNS update management... re-announcing every 2 minutes.
@@ -727,61 +628,40 @@ int activeRequestCount = 0;
 
 #define CLIENT_WRITE_TIMEOUT 500
 static char writeBuffer[512];
-bool clientWrite(WiFiClient client, const char *data)
-{
-    const size_t len = strlen(data);
-    if (len == 0)
-        return true;
-#ifdef ESP32
-    // NetworkClient::write() retries select() for seconds even when its stream
-    // timeout is short. Never let a stalled browser block the GDO/HTTP loop,
-    // the timer task, or a HomeKit task emitting a log message.
-    if (send(client.fd(), data, len, MSG_DONTWAIT) == static_cast<ssize_t>(len))
-        return true;
-    client.stop();
-    return false;
-#else
-    if (client.write(data, len) == len)
-        return true;
-    client.stop();
-    return false;
-#endif
-}
-
-// Callers hold SSELock across the whole event, so its spans cannot interleave
-// with another broadcaster. Borrow the existing strings rather than allocating
-// a temporary frame or sharing writeBuffer with status/redirect handlers.
-static bool sendSSEEvent(WiFiClient client, const char *event, const char *data)
+// Send one SSE event. On failure the client is stopped, and the next
+// heartbeat or broadcast removes the subscription. With dropIfFull, a full
+// send buffer only loses this event (for the log viewer, which can afford it).
+static bool sendSSEEvent(WiFiClient &client, const char *event, const char *data, bool dropIfFull = false)
 {
 #ifdef ESP32
-    // One gathered nonblocking write avoids a separate TCP send for each span.
-    // lwIP copies these borrowed bytes before returning; no frame is allocated.
+    // NetworkClient::write() can retry select() for 10 seconds on a stalled
+    // browser. Send the whole event in one nonblocking call instead, straight
+    // from the caller's strings (lwIP copies them before returning).
     struct iovec parts[] = {
-        {const_cast<char *>("event: "), 7},
-        {const_cast<char *>(event), strlen(event)},
-        {const_cast<char *>("\ndata: "), 7},
-        {const_cast<char *>(data), strlen(data)},
-        {const_cast<char *>("\n\n"), 2}};
-    size_t length = 0;
-    for (const auto &part : parts)
-        length += part.iov_len;
+        {(char *)"event: ", 7},
+        {(char *)event, strlen(event)},
+        {(char *)"\ndata: ", 7},
+        {(char *)data, strlen(data)},
+        {(char *)"\n\n", 2}};
     struct msghdr message = {};
     message.msg_iov = parts;
-    message.msg_iovlen = sizeof(parts) / sizeof(parts[0]);
-    if (sendmsg(client.fd(), &message, MSG_DONTWAIT) == static_cast<ssize_t>(length))
+    message.msg_iovlen = 5;
+    const ssize_t sent = sendmsg(client.fd(), &message, MSG_DONTWAIT);
+    if (sent == (ssize_t)(16 + parts[1].iov_len + parts[3].iov_len))
         return true;
-#if !defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
-    client.stop();
-#endif
-    return false;
+    if (dropIfFull && sent < 0 && errno == EWOULDBLOCK)
+        return false; // nothing was written, the stream is still intact
 #else
-    // Preserve the existing ESP8266 behavior: finish earlier queued output
-    // before beginning a new event. Do not flush between pieces of one event.
-    client.flush();
-    return clientWrite(client, "event: ") && clientWrite(client, event) &&
-           clientWrite(client, "\ndata: ") && clientWrite(client, data) &&
-           clientWrite(client, "\n\n");
+    (void)dropIfFull; // ESP8266 writes wait until sent or timed out
+    client.flush(); // make sure previous data all sent.
+    size_t length = snprintf_P(writeBuffer, sizeof(writeBuffer), PSTR("event: %s\ndata: %s\n\n"), event, data);
+    if (length < sizeof(writeBuffer) ? client.write(writeBuffer, length) == length
+                                     : client.printf("event: %s\ndata: %s\n\n", event, data) == length)
+        return true;
 #endif
+    client.stop();
+    ESP_LOGW(TAG, "Failed writing SSE %s event, connection closed.", event);
+    return false;
 }
 
 // Helper functions for connection throttling
@@ -861,29 +741,14 @@ void web_loop()
     if (!web_setup_done)
         return;
 #if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
-    const bool ownedRoom = httpOwnedPoll();
-    const bool mayHandleClient = drainRetiredSSE() && ownedRoom;
+    const bool mayHandleClient = httpOwnedPoll();
 #endif
     if (recoverStoppedOTAServices())
         return;
 
-    // Timer callbacks only signal work; client access stays in the web loop.
-    for (uint32_t i = 0; i < SSE_MAX_CHANNELS; ++i)
-    {
-        if (takeSSEHeartbeat(subscription[i].heartbeatPending))
-        {
-            TAKE_MUTEX(); // JSON must always precede the SSE lock.
-            {
-                SSELock lock;
-                if (lock && subscription[i].active)
-                    SSEheartbeat(&subscription[i]);
-            }
-            GIVE_MUTEX();
-        }
-    }
-
     static char *json = status_json;
     _millis_t upTime = _millis();
+    static _millis_t last_request_time = 0;
 
     // manage frequency of mDNS updates
     if (mdnsUpdatePending)
@@ -1072,6 +937,7 @@ void web_loop()
         mdnsUpdatePending = true;
     }
     GIVE_MUTEX();
+    sendSSEHeartbeats();
     static time_t mdnsDoorUpdateAt = 0;
     if (lastDoorUpdateAt && !mdnsDoorUpdateAt)
     {
@@ -1079,12 +945,19 @@ void web_loop()
         mdnsDoorUpdateAt = lastDoorUpdateAt;
         mdnsUpdatePending = true;
     }
-    // WebServer::handleClient() advances a connection state machine. Delaying
-    // every step adds latency even to an idle server; it is not request limiting.
+    // Rate limiting - minimum interval between requests
+    _millis_t current_time = _millis();
+    if (current_time - last_request_time < MIN_REQUEST_INTERVAL_MS)
+    {
+        return; // Skip this cycle to enforce rate limit
+    }
+
 #if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
     if (mayHandleClient)
 #endif
         server.handleClient();
+    // Update last request time after handling client
+    last_request_time = current_time;
 }
 
 void setup_web()
@@ -1110,7 +983,7 @@ void setup_web()
 #ifndef ESP8266
     // We allocated json as a global block.  We are on dual core CPU.  We need to serialize access to the resource.
     jsonMutex = xSemaphoreCreateMutex();
-    sseMutex = xSemaphoreCreateMutex();
+    sseMutex = xSemaphoreCreateRecursiveMutex();
 #endif
     last_reported_paired = homekit_is_paired();
 
@@ -1854,7 +1727,6 @@ bool helperUpdateUnderway(const std::string &key, const char *value, configSetti
     strlcpy(firmwareMD5, md5, sizeof(firmwareMD5));
     firmwareSize = (size_t)atoi(size);
     SSELock lock;
-    if (!lock) return false;
     for (uint32_t channel = 0; channel < SSE_MAX_CHANNELS; channel++)
     {
         if (subscription[channel].SSEconnected && subscription[channel].clientUUID == uuid && subscription[channel].client.connected())
@@ -2035,24 +1907,16 @@ void handle_setgdo()
 
 void removeSSEsubscription(SSESubscription *s)
 {
-    retireSSESubscription(s->active, subscriptionCount, [&]() {
-        // Retire before any call that can log and reenter SSEBroadcastState.
-        SSESubscription *expected = s;
-        firmwareUpdateSub.compare_exchange_strong(expected, nullptr);
-        s->SSEconnected = false;
-        s->heartbeatTimer.detach();
-        s->heartbeatPending = false;
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
-        s->retiring = s->client.fd() >= 0;
-        if (s->retiring)
-            return; // Reserve this slot and its owner until main hands it off.
-#endif
-        s->client.stop();
-        s->clientIP = INADDR_NONE;
-        s->clientUUID.clear();
-    }, [&](uint32_t remaining) {
-        ESP_LOGD(TAG, "Remove SSE subscription. Total subscribed: %d", remaining);
-    });
+    if (s->clientIP == IPAddress(INADDR_NONE))
+        return; // Already removed
+    if (subscriptionCount > 0)
+        subscriptionCount--; // Prevent negative count
+    s->heartbeatTimer.detach();
+    ESP_LOGD(TAG, "Remove SSE subscription. Total subscribed: %d", subscriptionCount);
+    s->client.stop();
+    s->clientIP = INADDR_NONE;
+    s->clientUUID.clear();
+    s->SSEconnected = false;
 }
 
 void SSEheartbeat(SSESubscription *s)
@@ -2114,23 +1978,36 @@ void SSEheartbeat(SSESubscription *s)
 #endif
         JSON_END();
         JSON_REMOVE_NL(json);
-        // retry needed to before event:
-        if (!sendSSEEvent(s->client, "message", json))
-            removeSSEsubscription(s);
-        YIELD();
+        sendSSEEvent(s->client, "message", json);
     }
     else
     {
         ESP_LOGD(TAG, "Client %s (%s) not listening (heartbeat), remove SSE subscription", s->clientIP.toString().c_str(), s->clientUUID.c_str());
         removeSSEsubscription(s);
+    }
+}
+
+// Called from the main loop, and during a firmware upload, which runs inside
+// a single handleClient() call.
+static void sendSSEHeartbeats()
+{
+    for (uint32_t i = 0; i < SSE_MAX_CHANNELS; i++)
+    {
+        if (!subscription[i].heartbeatDue)
+            continue;
+        subscription[i].heartbeatDue = false;
+        TAKE_MUTEX();
+        {
+            SSELock lock;
+            SSEheartbeat(&subscription[i]);
+        }
+        GIVE_MUTEX();
         YIELD();
     }
 }
 
 void SSEHandler(uint32_t channel)
 {
-    SSELock lock;
-    if (!lock) return;
     if (server.args() != 1)
     {
         ESP_LOGE(TAG, "Sending %s, for: %s", response400missing, server.uri().c_str());
@@ -2138,45 +2015,25 @@ void SSEHandler(uint32_t channel)
         return;
     }
 
+    SSELock lock;
     SSESubscription &s = subscription[channel];
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
-    if (s.active && s.clientUUID == server.arg(0) && s.client.fd() >= 0)
-    {
-        // Retire the previous stream before replacing its strong owner.
-        // The browser resubscribes after this ordinary error response.
-        removeSSEsubscription(&s);
-        server.send(503, type_txt, "Previous event stream is retiring; resubscribe");
-        return;
-    }
-#endif
-    if (!bindSSEClient(s.active, s.clientUUID, server.arg(0), s.client, server.client()))
+    if (server.arg(0).isEmpty() || s.clientUUID != server.arg(0))
     {
         ESP_LOGE(TAG, "Client %s (%s) tries to listen for SSE but not subscribed", server.client().remoteIP().toString().c_str(), server.arg(0).c_str());
         return handle_notfound();
     }
+    s.client = server.client(); // capture SSE server client connection
     s.client.setNoDelay(true);
     s.client.setTimeout(CLIENT_WRITE_TIMEOUT);       // default is 5000ms which is way too long (Watchdog will fire)
     server.setContentLength(CONTENT_LENGTH_UNKNOWN); // the payload can go on forever
-    const char *headers = PSTR("HTTP/1.1 200 OK\nContent-Type: text/event-stream;\nConnection: keep-alive\nCache-Control: no-cache\nAccess-Control-Allow-Origin: *\n\n");
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
-    // NetworkClient::write may close its shared handle on failure. Keep the
-    // stream owner until verified retirement instead.
-    const size_t headerLength = strlen(headers);
-    if (send(s.client.fd(), headers, headerLength, MSG_DONTWAIT) != static_cast<ssize_t>(headerLength))
-    {
-        removeSSEsubscription(&s);
-        return;
-    }
-#else
-    server.sendContent_P(headers);
-#endif
+    server.sendContent_P(PSTR("HTTP/1.1 200 OK\nContent-Type: text/event-stream;\nConnection: keep-alive\nCache-Control: no-cache\nAccess-Control-Allow-Origin: *\n\n"));
     s.SSEconnected = true;
     s.SSEfailCount = 0;
     if (s.heartbeatInterval)
     {
-        s.heartbeatTimer.attach_ms(s.heartbeatInterval * 1000, [&s] {
-            requestSSEHeartbeat(s.heartbeatPending);
-        });
+        // Runs on the timer task, so only flag it for sendSSEHeartbeats().
+        s.heartbeatTimer.attach_ms(s.heartbeatInterval * 1000, [&s]
+                                   { s.heartbeatDue = true; });
     }
     ESP_LOGD(TAG, "Client %s (%s) listening for SSE events on channel %d", s.client.remoteIP().toString().c_str(), s.clientUUID.c_str(), channel);
 }
@@ -2184,14 +2041,13 @@ void SSEHandler(uint32_t channel)
 void handle_subscribe()
 {
     SSELock lock;
-    if (!lock) return;
     uint32_t channel;
     IPAddress clientIP = server.client().remoteIP(); // get IP address of client
     std::string SSEurl = restEvents;
 
     if (subscriptionCount == SSE_MAX_CHANNELS)
     {
-        ESP_LOGE(TAG, "Client %s SSE Subscription declined, subscription count: %d", clientIP.toString().c_str(), subscriptionCount.load());
+        ESP_LOGE(TAG, "Client %s SSE Subscription declined, subscription count: %d", clientIP.toString().c_str(), subscriptionCount);
         for (channel = 0; channel < SSE_MAX_CHANNELS; channel++)
         {
             ESP_LOGD(TAG, "Client %d: %s at %s", channel, subscription[channel].clientUUID.c_str(), subscription[channel].clientIP.toString().c_str());
@@ -2227,15 +2083,17 @@ void handle_subscribe()
         else if (server.argName(i).equals("heartbeat"))
             heartbeatIntervalArgIdx = i;
     }
+    if (server.arg(id).isEmpty())
+    {
+        ESP_LOGE(TAG, "Sending %s, for: %s", response400missing, server.uri().c_str());
+        server.send_P(400, type_txt, response400missing);
+        return;
+    }
 
     // check if we already have a subscription for this UUID
     bool foundExisting = false;
     for (channel = 0; channel < SSE_MAX_CHANNELS; channel++)
     {
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
-        if (subscription[channel].retiring)
-            continue;
-#endif
         if (subscription[channel].clientUUID == server.arg(id))
         {
             if (subscription[channel].SSEconnected)
@@ -2259,11 +2117,7 @@ void handle_subscribe()
     {
         // Need to allocate a new slot
         for (channel = 0; channel < SSE_MAX_CHANNELS; channel++)
-            if (subscription[channel].clientIP == IPAddress(INADDR_NONE)
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
-                && !subscription[channel].retiring
-#endif
-            )
+            if (subscription[channel].clientIP == IPAddress(INADDR_NONE))
                 break;
     }
 
@@ -2316,23 +2170,17 @@ void handle_subscribe()
 
     // Safe assignment with validation
     subscription[channel].clientIP = clientIP;
-#if defined(ESP32) && defined(RATGDO_HTTP_LIFECYCLE_EXPERIMENT)
-    // The ordinary HTTP registry owns the subscription response. Do not
-    // duplicate that owner in a slot reserved for the future event stream.
-    subscription[channel].client = WiFiClient();
-#else
     subscription[channel].client = client;
-#endif
     subscription[channel].heartbeatTimer = Ticker();
+    subscription[channel].heartbeatDue = false;
     subscription[channel].SSEconnected = false;
     subscription[channel].SSEfailCount = 0;
     subscription[channel].clientUUID = server.arg(id);
     subscription[channel].logViewer = logViewer;
     subscription[channel].heartbeatInterval = heartbeatInterval;
-    subscription[channel].active = true;
 
     SSEurl += std::to_string(channel);
-    ESP_LOGD(TAG, "Client %s (%s) SSE subscription: %s, Total: %d, Heartbeat: %d, Log: %d", clientIP.toString().c_str(), server.arg(id).c_str(), SSEurl.c_str(), subscriptionCount.load(), heartbeatInterval, (int)logViewer);
+    ESP_LOGD(TAG, "Client %s (%s) SSE subscription: %s, Total: %d, Heartbeat: %d, Log: %d", clientIP.toString().c_str(), server.arg(id).c_str(), SSEurl.c_str(), subscriptionCount, heartbeatInterval, (int)logViewer);
     server.sendHeader(F("Cache-Control"), F("no-cache, no-store"));
     server.send_P(200, type_txt, SSEurl.c_str());
 }
@@ -2408,9 +2256,6 @@ void SSEBroadcastState(const char *data, BroadcastType type)
     if (!web_setup_done)
         return;
 
-    SSELock lock(type == LOG_MESSAGE);
-    if (!lock) return;
-
     // Flash LED to signal activity
     // led.flash(FLASH_MS);
 
@@ -2418,9 +2263,17 @@ void SSEBroadcastState(const char *data, BroadcastType type)
     if (subscriptionCount == 0)
         return;
 
+    // A log line can come from any task, and the logger holds its own lock,
+    // so it never waits. It is skipped in the log viewer if SSE is busy.
+    SSELock lock(type != LOG_MESSAGE);
+    if (!lock)
+        return;
+
     for (uint32_t i = 0; i < SSE_MAX_CHANNELS; i++)
     {
-        YIELD(); // yield between each SSE client
+#ifdef ESP8266
+        YIELD(); // yield between each SSE client (ESP8266 writes can wait)
+#endif
         if (subscription[i].SSEconnected)
         {
             if (subscription[i].client.connected())
@@ -2428,18 +2281,14 @@ void SSEBroadcastState(const char *data, BroadcastType type)
                 if (type == LOG_MESSAGE)
                 {
                     if (subscription[i].logViewer)
-                    {
-                        if (!sendSSEEvent(subscription[i].client, "logger", data))
-                            removeSSEsubscription(&subscription[i]);
-                    }
+                        sendSSEEvent(subscription[i].client, "logger", data, true);
                 }
                 else if (type == RATGDO_STATUS)
                 {
                     ESP_LOGV(TAG, "Client %s (%s) send status SSE on channel %d, data: %s",
                              IPAddress(subscription[i].clientIP).toString().c_str(),
                              subscription[i].clientUUID.c_str(), i, data);
-                    if (!sendSSEEvent(subscription[i].client, "message", data))
-                        removeSSEsubscription(&subscription[i]);
+                    sendSSEEvent(subscription[i].client, "message", data, subscription[i].logViewer);
                 }
             }
             else
@@ -2518,6 +2367,9 @@ void handle_firmware_upload()
     // Use the same mutex as homeSpanPAUSE, retaining it across upload callbacks.
     static std::shared_lock<std::shared_mutex> homekitUpdateLock(homeSpan.getMutex(), std::defer_lock);
 #endif
+
+    if (upload.status == UPLOAD_FILE_WRITE)
+        sendSSEHeartbeats(); // web_loop() doesn't run until the upload ends
 
     if (upload.status == UPLOAD_FILE_START)
     {
@@ -2616,24 +2468,20 @@ void handle_firmware_upload()
                 ESP_LOGI(TAG, "%s progress: %d", verify ? "Verify" : "Update", uploadPercent);
                 nextPrintPercent += 5;
                 // Report percentage to browser client if it is listening
+                TAKE_MUTEX();
                 {
-                    static char *json = status_json;
-                    TAKE_MUTEX();
+                    SSELock lock;
+                    if (firmwareUpdateSub && firmwareUpdateSub->client.connected())
                     {
-                        SSELock lock;
-                        SSESubscription *updateSub = firmwareUpdateSub.load();
-                        if (lock && updateSub && updateSub->active && updateSub->client.connected())
-                        {
-                            JSON_START(json);
-                            JSON_ADD_INT("uploadPercent", uploadPercent);
-                            JSON_END();
-                            JSON_REMOVE_NL(json);
-                            if (!sendSSEEvent(updateSub->client, "uploadStatus", json))
-                                removeSSEsubscription(updateSub);
-                        }
+                        static char *json = status_json;
+                        JSON_START(json);
+                        JSON_ADD_INT("uploadPercent", uploadPercent);
+                        JSON_END();
+                        JSON_REMOVE_NL(json);
+                        sendSSEEvent(firmwareUpdateSub->client, "uploadStatus", json);
                     }
-                    GIVE_MUTEX();
                 }
+                GIVE_MUTEX();
             }
         }
         if (!verify)

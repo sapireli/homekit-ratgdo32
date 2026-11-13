@@ -69,7 +69,7 @@ int main() {
         recovery = source[source.index("static bool otaServicesStopped"):
                           source.index("// Common HTTP responses")]
         loop_start = source.index("void web_loop()\n{")
-        loop_prefix = source[loop_start:source.index("// Timer callbacks only signal work", loop_start)] + "}\n"
+        loop_prefix = source[loop_start:source.index("    static char *json = status_json;", loop_start)] + "}\n"
         harness = r'''
 #include <cassert>
 #include <atomic>
@@ -153,16 +153,18 @@ bool streamConnected=false, sendOk=true;
 unsigned retiredStreams=0;
 struct Client { bool connected() { return streamConnected; } };
 struct SSESubscription { Client client; bool active=false; };
-std::atomic<SSESubscription *> firmwareUpdateSub{nullptr};
+SSESubscription *firmwareUpdateSub=nullptr;
 struct SSELock { explicit operator bool() const { return true; } };
 char statusStorage[256]{}, *status_json=statusStorage, writeBuffer[512]{};
 void clientWrite(Client,const char *) {}
 bool sendSSEEvent(Client,const char *,const char *) { return sendOk; }
+unsigned heartbeatSends=0;
+void sendSSEHeartbeats() { ++heartbeatSends; }
 void removeSSEsubscription(SSESubscription *s) {
     s->active=false;
     ++retiredStreams;
     SSESubscription *expected=s;
-    firmwareUpdateSub.compare_exchange_strong(expected,nullptr);
+    if (firmwareUpdateSub==expected) firmwareUpdateSub=nullptr;
 }
 struct FlashUpdate {
     bool beginOk=true, writeOk=true, endOk=true, active=false;
@@ -194,7 +196,8 @@ int main() {
     // A pause survives returns from the real callback between upload chunks.
     assert(pollCanRun()); start(); assert(!pollCanRun());
     assert(Update.checksum=="0123456789abcdef0123456789abcdef");
-    event(UPLOAD_FILE_WRITE); assert(!pollCanRun());
+    // web_loop() can't run during the upload, so each chunk sends due heartbeats.
+    event(UPLOAD_FILE_WRITE); assert(!pollCanRun() && heartbeatSends==1);
     event(UPLOAD_FILE_END); assert(pollCanRun());
     event(UPLOAD_FILE_END); assert(pollCanRun());
     assert(suspend_service_loop && !vehicle_setup_done && !commsRunning);
@@ -221,16 +224,6 @@ int main() {
     httpOwnedPending=false; assert(recoverStoppedOTAServices());
     assert(restarts==2);
 
-    // A failed progress stream retires without interrupting flash writes.
-    start();
-    SSESubscription stream; stream.active=true;
-    firmwareUpdateSub=&stream; streamConnected=true; sendOk=false;
-    event(UPLOAD_FILE_WRITE);
-    assert(!stream.active && firmwareUpdateSub==nullptr && retiredStreams==1);
-    assert(!pollCanRun());
-    event(UPLOAD_FILE_END); assert(pollCanRun());
-    streamConnected=false; sendOk=true;
-
     // Re-entering START is idempotent; aborted and repeated uploads can recover.
     start(); start(); assert(!pollCanRun());
     event(UPLOAD_FILE_ABORTED); assert(pollCanRun());
@@ -241,6 +234,8 @@ int main() {
     Update.beginOk=false; start(); assert(!pollCanRun());
     event(UPLOAD_FILE_END); assert(pollCanRun()); Update.beginOk=true;
     Update.writeOk=false; start(); event(UPLOAD_FILE_WRITE);
+    // Chunks drained after a flash error still keep the browser's stream alive.
+    { const unsigned sent=heartbeatSends; event(UPLOAD_FILE_WRITE); assert(heartbeatSends==sent+1); }
     event(UPLOAD_FILE_END); assert(pollCanRun()); Update.writeOk=true;
     Update.endOk=false; start(); event(UPLOAD_FILE_END);
     assert(pollCanRun()); Update.endOk=true;
