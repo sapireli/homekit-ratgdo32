@@ -55,6 +55,9 @@
 #ifdef USE_DHT22
 #include "temperature.h"
 #endif
+#ifdef USE_AHT20
+#include "aht20.h"
+#endif
 
 // Logger tag
 static const char *TAG = "ratgdo-main";
@@ -283,6 +286,11 @@ void setup()
 #endif
 #ifdef RATGDO32_DISCO
     setup_vehicle();
+#endif
+#ifdef USE_AHT20
+    // A DHT22 is read instead when its pin is set
+    if (dht22Pin < 0)
+        setup_aht20();
 #endif
 #ifndef USE_GDOLIB
     setup_drycontact();

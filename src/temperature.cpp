@@ -20,6 +20,7 @@
 #include "config.h"
 #include "homekit.h"
 #include "temperature.h"
+#include "aht20.h"
 
 #define TEMPERATURE_READ_INTERVAL (60 * 1000) // 60 seconds
 
@@ -29,15 +30,28 @@ float humidity = NAN;
 
 void temperature_loop()
 {
-    if (dht22Pin < 0)
+    if (dht22Pin < 0 && !aht20_detected)
         return;
 
+#ifdef USE_AHT20
+    // An AHT20 measurement is read on a later pass than the one that started it
+    if (aht20_read(temperature, humidity) && !isnan(temperature) && !isnan(humidity))
+        notify_homekit_temperature_humidity(temperature, humidity);
+#endif
     static _millis_t lastRead = 0;
     _millis_t currentMillis = _millis();
     // Read sensor initially (lastRead == 0) or after 60 seconds
     if (lastRead == 0 || (currentMillis - lastRead >= TEMPERATURE_READ_INTERVAL))
     {
         lastRead = currentMillis;
+#ifdef USE_AHT20
+        // Without a DHT22, start an AHT20 measurement instead
+        if (dht22Pin < 0)
+        {
+            aht20_start();
+            return;
+        }
+#endif
         // Constructed on first use, only when a pin is set
         static DHT dht(dht22Pin, DHT22);
         dht.begin();

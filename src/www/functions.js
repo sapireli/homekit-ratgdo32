@@ -511,6 +511,7 @@ function setElementsFromStatus(status) {
                 break;
             case "degrees":
                 document.getElementById("temperatureRow").style.display = "table-row";
+                document.getElementById("celsiusRow").style.display = "table-row"; // also for an AHT20, with no pin
                 document.getElementById(key).innerHTML = (serverStatus.celsius) ? value.toFixed(1) + "&deg;C" : (value * 9 / 5 + 32).toFixed(1) + "&deg;F";
                 break;
             case "humidity":

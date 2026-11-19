@@ -55,6 +55,7 @@ void homekit_loop();
 #ifndef HOMEKIT_AID_TEMP_HUMIDITY
 #define HOMEKIT_AID_TEMP_HUMIDITY 12
 #endif
+static_assert(HOMEKIT_AID_TEMP_HUMIDITY != HOMEKIT_AID_STOP, "Stop and temperature accessories need different IDs");
 
 enum Light_t : uint8_t
 {

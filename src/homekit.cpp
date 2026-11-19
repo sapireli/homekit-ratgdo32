@@ -32,6 +32,9 @@
 #ifdef RATGDO32_DISCO
 #include "vehicle.h"
 #endif
+#ifdef USE_DHT22
+#include "aht20.h"
+#endif
 #ifdef USE_GDOLIB
 #include "gdo.h"
 #else
@@ -1026,8 +1029,8 @@ void setup_homekit()
     // Create a stop service if enabled in settings
     enable_service_homekit_stop(userConfig->getStopDoorHomeKit());
 #ifdef USE_DHT22
-    // Create a temperature and humidity sensor if a DHT22 pin is set
-    if (dht22Pin >= 0)
+    // Create a temperature and humidity sensor if a DHT22 pin is set or an AHT20 was found
+    if (dht22Pin >= 0 || aht20_detected)
     {
         new SpanAccessory(HOMEKIT_AID_TEMP_HUMIDITY);
         new DEV_Info("Temperature Sensor");
